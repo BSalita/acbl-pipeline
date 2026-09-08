@@ -20,7 +20,9 @@ import re
 import sys
 import threading
 import time
+import unicodedata
 from datetime import date, datetime
+from difflib import SequenceMatcher
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import duckdb
@@ -158,7 +160,7 @@ WRITE_CACHE_DIR = (
 
 _PLAYER_INFO_CANDIDATES = (
     os.environ.get("ACBL_PLAYER_INFO_PARQUET"),
-    str(_SRC_DIR / "bridgestats" / "data" / "acbl_player_info.parquet"),
+    str(_SRC_DIR / "bridgestats-acbl" / "data" / "acbl_player_info.parquet"),
     str(_APP_DIR / "data" / "acbl_player_info.parquet"),
 )
 
@@ -3081,6 +3083,55 @@ def club_list(query: Optional[str] = None, limit: Optional[int] = None, refresh:
     )
 
 
+def _normalize_fuzzy_text(value: object) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(character for character in text if not unicodedata.combining(character))
+    return re.sub(r"[^a-z0-9]+", " ", text.casefold()).strip()
+
+
+def _fuzzy_text_score(candidate: object, query: object) -> float:
+    haystack = _normalize_fuzzy_text(candidate)
+    needle = _normalize_fuzzy_text(query)
+    if not haystack or not needle:
+        return 0.0
+    if needle in haystack:
+        return 1.0
+    scores = [SequenceMatcher(None, needle, haystack).ratio()]
+    tokens = haystack.split()
+    width = max(1, len(needle.split()))
+    for start in range(len(tokens)):
+        window = " ".join(tokens[start : start + width])
+        scores.append(SequenceMatcher(None, needle, window).ratio())
+    return max(scores)
+
+
+def _rank_player_name_rows(
+    rows: List[Dict[str, Any]],
+    query: str,
+    *,
+    min_score: float = 0.72,
+    drop_below: bool = False,
+) -> List[Dict[str, Any]]:
+    ranked: List[tuple[float, int, int, Dict[str, Any]]] = []
+    needle = _normalize_fuzzy_text(query)
+    for row in rows:
+        name = str(row.get("player_name") or "")
+        score = _fuzzy_text_score(name, query)
+        last = _normalize_fuzzy_text(name).split()[-1] if name else ""
+        if drop_below and score < min_score and needle not in last:
+            continue
+        ranked.append(
+            (
+                score,
+                1 if last == needle else 0,
+                1 if needle and last.startswith(needle) else 0,
+                {**row, "match_score": round(score * 100.0, 1)},
+            )
+        )
+    ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], str(item[3].get("player_name") or "")))
+    return [item[3] for item in ranked]
+
+
 def _player_lookup_from_parquet(
     query: str, by_number: bool, club_id: Optional[str], limit: int
 ) -> List[Dict[str, Any]]:
@@ -3134,7 +3185,7 @@ def _player_lookup_from_parquet(
         if by_number or club_id:
             return []
         return _fuzzy_player_lookup_from_parquet(query, limit)
-    return [
+    rows = [
         {
             "player_number": rec.get("id_number"),
             "player_name": _given_name_first(rec.get("name")),
@@ -3147,6 +3198,9 @@ def _player_lookup_from_parquet(
         }
         for rec in df.to_dicts()
     ]
+    if by_number:
+        return rows
+    return _rank_player_name_rows(rows, query)
 
 
 def _fuzzy_player_lookup_from_parquet(
@@ -3191,31 +3245,22 @@ def _fuzzy_player_lookup_from_parquet(
     frame = _collect_retry(lazy)
     if frame is None or frame.is_empty():
         return []
-    query_for_score = " ".join(tokens)
     rows = []
     for rec in frame.to_dicts():
         player_number = str(rec.get("id_number") or "").strip()
         if not player_number.isdigit():
             continue
-        name = _given_name_first(rec.get("name"))
-        score = round(fuzz.WRatio(
-            query_for_score, str(name or "").lower()), 1)
-        if score < 55:
-            continue
         rows.append({
             "player_number": player_number,
-            "player_name": name,
+            "player_name": _given_name_first(rec.get("name")),
             "city": rec.get("city"),
             "state": rec.get("state"),
             "mp_total": rec.get("mp_total"),
             "club_sessions": rec.get("club_sessions"),
             "club_id": None,
-            "match_score": score,
             "source": "club_results_parquet_fuzzy",
         })
-    rows.sort(key=lambda row: (
-        -row["match_score"], str(row.get("player_name") or "")))
-    return rows[:limit]
+    return _rank_player_name_rows(rows, query, drop_below=True)[:limit]
 
 
 def _lookup_from_parquet(query: str, by_number: bool, limit: int) -> List[Dict[str, Any]]:

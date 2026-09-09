@@ -1,7 +1,7 @@
 """FastAPI service exposing unified ACBL club and tournament results.
 
 Scraping, cache, and table-building live here. The MCP server is a thin
-HTTP client of this API (see ../MortyBridgeBot).
+HTTP client of this API (see ../MortyBridgeMCP).
 
   python acbl_club_api_server.py
   GET http://127.0.0.1:8508/docs

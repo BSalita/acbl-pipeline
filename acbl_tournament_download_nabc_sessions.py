@@ -18,7 +18,9 @@ from dotenv import load_dotenv
 from acbl_tournament_download_sessions_using_sanctioned_events import (
     acblPath,
     audit_session_artifacts,
+    canonical_event_id,
     download_tournament_sessions,
+    expired_api_key_message,
 )
 
 
@@ -38,7 +40,7 @@ def nabc_sessions_from_sanctions(
     other: list[str] = []
     for fp in sorted(events_dir.glob("NABC*.sanction.json"), reverse=True):
         event = json.loads(fp.read_text(encoding="utf-8"))
-        event_id = str(event.get("id") or "").strip()
+        event_id = canonical_event_id(event)
         session_count = event.get("session_count")
         if not event_id or session_count is None:
             raise ValueError(f"invalid NABC sanction file: {fp}")
@@ -77,6 +79,10 @@ def main() -> int:
     api_key = os.getenv("ACBL_API_KEY")
     if not api_key:
         print("ERROR: ACBL_API_KEY environment variable not set", flush=True)
+        return 1
+    expiry_msg = expired_api_key_message(api_key)
+    if expiry_msg:
+        print(expiry_msg, flush=True)
         return 1
 
     events_dir = acblPath.joinpath(args.events_dir)

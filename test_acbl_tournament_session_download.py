@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import tempfile
 import unittest
@@ -15,8 +16,11 @@ from acbl_tournament_download_sessions_using_sanctioned_events import (
     DownloadStats,
     audit_session_artifacts,
     build_session_ids_from_sanctioned_events,
+    canonical_event_id,
     download_tournament_sessions,
+    expired_api_key_message,
     is_unavailable_http,
+    jwt_expiry_unix,
     session_request_timeout,
 )
 
@@ -45,6 +49,36 @@ class TournamentSessionDiscoveryTests(unittest.TestCase):
                     "NABC262-OSHL-1",
                 ],
             )
+
+    def test_rebuilds_truncated_hyphen_event_ids(self) -> None:
+        event = {
+            "id": "-0810",
+            "sanction": "1803020",
+            "event_code": "0810",
+            "session_count": 3,
+        }
+        self.assertEqual(canonical_event_id(event), "1803020-0810")
+        with tempfile.TemporaryDirectory() as tmp:
+            events_dir = Path(tmp)
+            (events_dir / "-0810.sanction.json").write_text(
+                json.dumps(event),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                build_session_ids_from_sanctioned_events(events_dir),
+                ["1803020-0810-3", "1803020-0810-2", "1803020-0810-1"],
+            )
+
+    def test_expired_jwt_is_detected(self) -> None:
+        payload = json.dumps({"exp": 1_000_000_000}).encode()
+        padded = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+        token = f"eyJhbGciOiJub25lIn0.{padded}.sig"
+        self.assertEqual(jwt_expiry_unix(token), 1_000_000_000)
+        self.assertIsNotNone(
+            expired_api_key_message(token, now=1_000_000_000 + 120)
+        )
+        self.assertIsNone(expired_api_key_message(token, now=1_000_000_000))
+        self.assertIsNone(expired_api_key_message("not-a-jwt"))
 
     def test_audit_reports_only_sessions_without_json_or_sql(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -134,6 +168,27 @@ class TournamentSessionDiscoveryTests(unittest.TestCase):
             self.assertEqual(stats.unavailable_ids, ["NABC262-SPIN-1"])
             self.assertFalse(stats.failed())
             self.assertFalse((output_dir / "NABC262-SPIN-1.session.json").exists())
+
+    def test_download_401_aborts_without_trying_remaining_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            response = Mock()
+            response.status_code = 401
+            response.headers = {}
+            with patch(
+                "acbl_tournament_download_sessions_using_sanctioned_events.requests.get",
+                return_value=response,
+            ) as get:
+                stats = download_tournament_sessions(
+                    session_ids=["2608313-3-1", "2608313-3-2"],
+                    api_key="test-key",
+                    output_dir=output_dir,
+                    max_attempts=4,
+                )
+            get.assert_called_once()
+            self.assertEqual(stats.errors, 1)
+            self.assertTrue(stats.aborted)
+            self.assertTrue(stats.failed())
 
     def test_download_exhausted_timeout_is_hard_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

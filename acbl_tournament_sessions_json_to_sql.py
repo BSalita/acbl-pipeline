@@ -13,13 +13,16 @@ High-level pipeline:
   1) Read `*.session.json` files
   2) Convert JSON to SQL statements (via `mlBridge.mlBridgeAcblLib`)
   3) Write a `*.session.sql` file next to each JSON
-  4) Execute all `*.session.sql` scripts into SQLite using `executescript()`
+  4) Execute `*.session.sql` scripts into SQLite in batched transactions
 
 Notes:
   - The schema is defined by `acbl_tournament_sessions_schema.sql`.
   - Some rare session files may fail due to schema drift (e.g. bracketed events).
     This script matches the notebook behavior: it deletes the offending `.sql`
     and continues.
+  - Load uses heap tables (no PK/FK), bulk-import PRAGMAs, and batched
+    BEGIN/COMMIT. Unique indexes are created after all session scripts run.
+    Bare executescript() plus in-memory PK upserts get slower as the DB grows.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
 import time
 import traceback
 from collections import defaultdict
@@ -38,10 +42,120 @@ import sqlalchemy_utils
 rootPath = pathlib.Path("e:/bridge/data")
 acblPath = rootPath.joinpath("acbl")
 
+# One transaction per this many session scripts (or this many bytes of SQL).
+DEFAULT_LOAD_BATCH_FILES = 250
+DEFAULT_LOAD_BATCH_BYTES = 32 * 1024 * 1024
+_ON_CONFLICT_RE = re.compile(
+    r"\s*ON CONFLICT\([^)]+\)\s+DO UPDATE SET.*?;",
+    re.IGNORECASE | re.DOTALL,
+)
+_TRAILING_COMMA_BEFORE_CLOSE_RE = re.compile(
+    r",(?P<tail>(?:\s*--[^\n]*)*\s*)\)",
+)
+# Negative cache_size is KiB. 4 GiB is cheap on a 512 GiB machine and keeps
+# the growing B-trees in the pager cache during the bulk load.
+LOAD_CACHE_SIZE_KIB = 4 * 1024 * 1024
+
 
 def _iter_files_sorted(paths: Iterable[pathlib.Path]) -> list[pathlib.Path]:
     # Deterministic ordering for reproducible runs.
     return sorted(paths, key=lambda p: p.as_posix())
+
+
+def _schema_sql_without_wal(schema_text: str) -> str:
+    """Drop journal_mode=WAL from schema so bulk load can use journal_mode=OFF."""
+    lines = []
+    for line in schema_text.splitlines():
+        if line.strip().upper().startswith("PRAGMA JOURNAL_MODE"):
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _schema_sql_for_bulk_load(schema_text: str) -> str:
+    """Heap tables: no WAL, no PRIMARY KEY, no FOREIGN KEY.
+
+    Random VARCHAR PK upserts are why the load rate falls as the DB grows.
+    Indexes are created once after all session scripts have been inserted.
+    """
+    lines = []
+    for line in _schema_sql_without_wal(schema_text).splitlines():
+        if line.strip().upper().startswith("FOREIGN KEY"):
+            continue
+        line = re.sub(r"\s+PRIMARY KEY\b", "", line, flags=re.IGNORECASE)
+        lines.append(line)
+    return _TRAILING_COMMA_BEFORE_CLOSE_RE.sub(r"\g<tail>)", "\n".join(lines))
+
+
+def _strip_upserts(sql_script: str) -> str:
+    """Turn ON CONFLICT DO UPDATE into a plain INSERT (heap tables have no unique index)."""
+    return _ON_CONFLICT_RE.sub(";", sql_script)
+
+
+def _pragma(conn, sql: str) -> None:
+    result = conn.execute(sql)
+    fetchone = getattr(result, "fetchone", None)
+    if fetchone is not None:
+        fetchone()
+
+
+def _set_page_size(conn) -> None:
+    """page_size only sticks on an empty DB; VACUUM applies it after create_database()."""
+    _pragma(conn, "PRAGMA page_size=32768;")
+    conn.execute("VACUUM")
+    commit = getattr(conn, "commit", None)
+    if commit is not None:
+        commit()
+
+
+def _apply_bulk_load_pragmas(conn) -> None:
+    """Match the club parquet→SQLite fast path. Must run before schema + inserts."""
+    _pragma(conn, "PRAGMA foreign_keys=OFF;")
+    # journal_mode returns a row; fetch it so SQLite actually switches modes.
+    _pragma(conn, "PRAGMA journal_mode=OFF;")
+    _pragma(conn, "PRAGMA synchronous=OFF;")
+    _pragma(conn, "PRAGMA temp_store=MEMORY;")
+    _pragma(conn, f"PRAGMA cache_size=-{LOAD_CACHE_SIZE_KIB};")
+    _pragma(conn, "PRAGMA locking_mode=EXCLUSIVE;")
+    _pragma(conn, "PRAGMA mmap_size=8589934592;")  # 8 GiB; no-op for :memory:
+
+
+def _restore_runtime_pragmas(conn) -> None:
+    _pragma(conn, "PRAGMA journal_mode=WAL;")
+    _pragma(conn, "PRAGMA synchronous=NORMAL;")
+    _pragma(conn, "PRAGMA foreign_keys=ON;")
+
+
+def _transactional_script(sql_script: str) -> str:
+    # executescript() COMMITs first, then sqlite3_exec auto-commits every
+    # statement unless the script itself opens a transaction.
+    return "BEGIN;\n" + sql_script + "\nCOMMIT;\n"
+
+
+def _finalize_unique_indexes(conn) -> None:
+    """Add UNIQUE(id) after the heap load so lookups still have a primary key."""
+    result = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    )
+    tables = [row[0] for row in result.fetchall()]
+    t0 = time.time()
+    for i, table in enumerate(tables, 1):
+        idx = f"ux_{table}_id"
+        print(f"Creating unique index on {table} ({i}/{len(tables)})...", flush=True)
+        try:
+            conn.execute(f'CREATE UNIQUE INDEX IF NOT EXISTS "{idx}" ON "{table}"("id")')
+        except Exception as exc:
+            print(f"  duplicates in {table} ({type(exc).__name__}); keeping first id")
+            conn.execute(
+                f'DELETE FROM "{table}" WHERE rowid NOT IN '
+                f'(SELECT MIN(rowid) FROM "{table}" GROUP BY "id")'
+            )
+            conn.execute(f'CREATE UNIQUE INDEX IF NOT EXISTS "{idx}" ON "{table}"("id")')
+        commit = getattr(conn, "commit", None)
+        if commit is not None:
+            commit()
+    print(f"Unique indexes ready in {time.time() - t0:.1f}s", flush=True)
 
 
 class ACBLTournamentSessionSqliteBuilder:
@@ -171,6 +285,8 @@ class ACBLTournamentSessionSqliteBuilder:
         create_tables: bool = True,
         perform_integrity_checks: bool = False,
         delete_bad_sql: bool = True,
+        load_batch_files: int = DEFAULT_LOAD_BATCH_FILES,
+        load_batch_bytes: int = DEFAULT_LOAD_BATCH_BYTES,
     ) -> int:
         """
         Execute all `.session.sql` scripts into SQLite.
@@ -179,10 +295,68 @@ class ACBLTournamentSessionSqliteBuilder:
             total_scripts_executed
         """
         def _create_tables(raw_connection) -> None:
-            print(f"Creating tables from:{self.schema_file.as_posix()}")
+            print(f"Creating heap tables (indexes after load) from:{self.schema_file.as_posix()}")
             with open(self.schema_file, "r", encoding="utf-8") as f:
-                create_sql = f.read()
+                create_sql = _schema_sql_for_bulk_load(f.read())
             raw_connection.executescript(create_sql)
+            # Schema may have toggled journal_mode; keep the bulk-load setting.
+            _apply_bulk_load_pragmas(raw_connection)
+
+        def _handle_script_error(sql_file: pathlib.Path, exc: Exception) -> bool:
+            """Retry once on missing session table. Returns True if retry worked."""
+            msg = str(exc)
+            if not (
+                "no such table" in msg
+                and ("session" in msg or "Session" in msg)
+                and create_tables
+            ):
+                return False
+            print("Detected missing table; recreating schema and retrying once.")
+            _create_tables(raw_connection)
+            return True
+
+        def _report_bad_sql(sql_file: pathlib.Path, exc: Exception) -> None:
+            print(f"Error: {type(exc).__name__} while processing file:{sql_file.as_posix()}")
+            print(traceback.format_exc())
+            if delete_bad_sql:
+                print(f"Removing {sql_file.as_posix()}")
+                sql_file.unlink(missing_ok=True)
+
+        def _execute_one(sql_file: pathlib.Path, sql_script: str) -> bool:
+            try:
+                raw_connection.executescript(_transactional_script(sql_script))
+                return True
+            except Exception as e:
+                if _handle_script_error(sql_file, e):
+                    try:
+                        raw_connection.executescript(_transactional_script(sql_script))
+                        return True
+                    except Exception as retry_exc:
+                        _report_bad_sql(sql_file, retry_exc)
+                        return False
+                _report_bad_sql(sql_file, e)
+                return False
+
+        def _flush_batch(batch_files: list[pathlib.Path], batch_scripts: list[str]) -> int:
+            if not batch_scripts:
+                return 0
+            if len(batch_scripts) == 1:
+                return 1 if _execute_one(batch_files[0], batch_scripts[0]) else 0
+            try:
+                raw_connection.executescript(_transactional_script("\n".join(batch_scripts)))
+                return len(batch_scripts)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                print(
+                    f"Batch of {len(batch_scripts)} scripts failed ({type(e).__name__}); "
+                    "retrying each file."
+                )
+                return sum(
+                    1
+                    for sql_file, sql_script in zip(batch_files, batch_scripts)
+                    if _execute_one(sql_file, sql_script)
+                )
 
         if recreate_db and sqlalchemy_utils.functions.database_exists(self.db_file_connection_string):
             print(f"Deleting db:{self.db_file_connection_string}")
@@ -204,6 +378,15 @@ class ACBLTournamentSessionSqliteBuilder:
         raw_connection = engine.raw_connection()
 
         try:
+            _apply_bulk_load_pragmas(raw_connection)
+            if create_tables:
+                _set_page_size(raw_connection)
+            print(
+                f"Bulk-load PRAGMAs: journal_mode=OFF synchronous=OFF "
+                f"page_size=32KiB cache_size={LOAD_CACHE_SIZE_KIB // 1024}MiB "
+                f"heap_tables={create_tables} "
+                f"batch_files={load_batch_files} batch_bytes={load_batch_bytes // (1024 * 1024)}MiB"
+            )
             if create_tables:
                 _create_tables(raw_connection)
 
@@ -211,59 +394,98 @@ class ACBLTournamentSessionSqliteBuilder:
             if ending_nfile == 0:
                 ending_nfile = len(urls)
             filtered_urls = urls[starting_nfile:ending_nfile]
+            file_sizes = [sql_file.stat().st_size for sql_file in filtered_urls]
+            total_sql_bytes = sum(file_sizes)
+            print(
+                f"SQL payload: {len(filtered_urls):,} files, "
+                f"{total_sql_bytes / 1e9:.2f} GB. Later years are much larger "
+                f"per file; watch MB/s, not files/s."
+            )
 
             total_scripts_executed = 0
             start_time = time.time()
             canceled = False
+            batch_files: list[pathlib.Path] = []
+            batch_scripts: list[str] = []
+            batch_bytes = 0
+            batch_limit = max(1, int(load_batch_files))
+            bytes_limit = max(1, int(load_batch_bytes))
+            done_bytes = 0
+            last_mark_n = 0
+            last_mark_t = start_time
+            last_mark_bytes = 0
 
-            for nfile, url in enumerate(filtered_urls):
-                sql_file = url
+            for nfile, sql_file in enumerate(filtered_urls):
                 if nfile % 1000 == 0:
+                    now = time.time()
+                    elapsed = max(now - start_time, 1e-6)
+                    interval_t = max(now - last_mark_t, 1e-6)
+                    interval_n = nfile - last_mark_n
+                    interval_b = done_bytes - last_mark_bytes
+                    interval_mbs = (interval_b / 1e6) / interval_t
+                    cum_mbs = (done_bytes / 1e6) / elapsed
+                    remain_b = max(total_sql_bytes - done_bytes, 0)
+                    eta_s = remain_b / (interval_b / interval_t) if interval_b else 0
                     print(
                         f"Executing SQL script ({nfile}/{len(filtered_urls)}): "
-                        f"total_time:{round(time.time() - start_time, 1)} file:{sql_file.as_posix()}"
+                        f"total_time:{round(elapsed, 1)} "
+                        f"last1000:{interval_n / interval_t:.1f}/s {interval_b / 1e6:.1f}MB {interval_mbs:.1f}MB/s "
+                        f"cum:{nfile / elapsed:.1f}/s {done_bytes / 1e9:.2f}GB {cum_mbs:.1f}MB/s "
+                        f"eta:{eta_s / 60:.0f}m "
+                        f"file:{sql_file.as_posix()}",
+                        flush=True,
                     )
+                    last_mark_n = nfile
+                    last_mark_t = now
+                    last_mark_bytes = done_bytes
 
                 try:
-                    with open(sql_file, "r", encoding="utf-8") as f:
-                        sql_script = f.read()
-                    raw_connection.executescript(sql_script)
+                    sql_script = sql_file.read_text(encoding="utf-8")
+                    if create_tables:
+                        sql_script = _strip_upserts(sql_script)
                 except KeyboardInterrupt:
                     print(f"KeyboardInterrupt while processing file:{sql_file.as_posix()}")
                     canceled = True
                     break
                 except Exception as e:
-                    # If schema wasn't created (or got dropped by a script), recreate and retry once.
-                    msg = str(e)
-                    if (
-                        isinstance(e, Exception)
-                        and "no such table" in msg
-                        and ("session" in msg or "Session" in msg)
-                        and create_tables
-                    ):
-                        try:
-                            print("Detected missing table; recreating schema and retrying once.")
-                            _create_tables(raw_connection)
-                            raw_connection.executescript(sql_script)
-                            total_scripts_executed += 1
-                            continue
-                        except Exception:
-                            # Fall through to normal error handling below.
-                            pass
-                    print(f"Error: {type(e).__name__} while processing file:{sql_file.as_posix()}")
-                    print(traceback.format_exc())
-                    if delete_bad_sql:
-                        print(f"Removing {sql_file.as_posix()}")
-                        sql_file.unlink(missing_ok=True)
+                    _report_bad_sql(sql_file, e)
                     continue
-                else:
-                    total_scripts_executed += 1
 
+                batch_files.append(sql_file)
+                batch_scripts.append(sql_script)
+                batch_bytes += len(sql_script)
+                done_bytes += file_sizes[nfile]
+                if len(batch_scripts) >= batch_limit or batch_bytes >= bytes_limit:
+                    try:
+                        total_scripts_executed += _flush_batch(batch_files, batch_scripts)
+                    except KeyboardInterrupt:
+                        print(f"KeyboardInterrupt while processing file:{sql_file.as_posix()}")
+                        canceled = True
+                        batch_files = []
+                        batch_scripts = []
+                        break
+                    batch_files = []
+                    batch_scripts = []
+                    batch_bytes = 0
+
+            if not canceled and batch_scripts:
+                try:
+                    total_scripts_executed += _flush_batch(batch_files, batch_scripts)
+                except KeyboardInterrupt:
+                    print("KeyboardInterrupt while flushing final batch")
+                    canceled = True
+
+            elapsed = max(time.time() - start_time, 1e-6)
             print(
                 f"SQL scripts executed ({total_scripts_executed}/{len(filtered_urls)}/{len(urls)}): "
-                f"total changes:{raw_connection.total_changes} total time:{round(time.time() - start_time, 2)}: "
-                f"avg script execution time:{round((time.time() - start_time) / max(1, total_scripts_executed), 1)}"
+                f"total changes:{raw_connection.total_changes} total time:{round(elapsed, 2)}: "
+                f"avg script execution time:{round(elapsed / max(1, total_scripts_executed), 3)} "
+                f"rate:{total_scripts_executed / elapsed:.1f}/s"
             )
+
+            if not canceled and create_tables:
+                print("Building unique indexes after heap load...")
+                _finalize_unique_indexes(raw_connection)
 
             if not canceled and perform_integrity_checks:
                 # Warning: these can take a long time on large DBs.
@@ -274,11 +496,16 @@ class ACBLTournamentSessionSqliteBuilder:
                 print("Performing integrity_check")
                 raw_connection.execute("PRAGMA integrity_check;")
 
+            if not canceled and self.write_direct_to_disk:
+                print("Restoring WAL / normal synchronous after bulk load")
+                _restore_runtime_pragmas(raw_connection)
+
             if not canceled and not self.write_direct_to_disk:
                 print(f"Writing memory db to file:{self.db_file_connection_string}")
                 engine_file = sqlalchemy.create_engine(self.db_file_connection_string)
                 raw_connection_file = engine_file.raw_connection()
                 raw_connection.backup(raw_connection_file.driver_connection)
+                _restore_runtime_pragmas(raw_connection_file)
                 raw_connection_file.close()
                 engine_file.dispose()
 
@@ -310,9 +537,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--write-direct-to-disk",
-        action="store_true",
-        default=False,
-        help="Execute scripts directly against the DB file (slower; default: False)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Write into the DB file during load (default: True). "
+            "Use --no-write-direct-to-disk for an in-memory DB then backup "
+            "(slows down as the DB grows past a few GB)."
+        ),
     )
     parser.add_argument(
         "--echo",
@@ -414,6 +645,15 @@ def main() -> int:
         dest="delete_bad_sql",
         help="Keep SQL scripts that fail to execute",
     )
+    parser.add_argument(
+        "--load-batch-size",
+        type=int,
+        default=DEFAULT_LOAD_BATCH_FILES,
+        help=(
+            "Session SQL files per SQLite transaction "
+            f"(default: {DEFAULT_LOAD_BATCH_FILES})"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -455,6 +695,7 @@ def main() -> int:
             create_tables=args.create_tables,
             perform_integrity_checks=args.integrity_checks,
             delete_bad_sql=args.delete_bad_sql,
+            load_batch_files=args.load_batch_size,
         )
 
     print()

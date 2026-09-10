@@ -29,6 +29,11 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from dotenv import load_dotenv
 
+from acbl_tournament_download_sessions_using_sanctioned_events import (
+    AcblApiAuthError,
+    expired_api_key_message,
+)
+
 # Load environment variables
 load_dotenv()
 
@@ -121,6 +126,15 @@ def download_events(
                     response = requests.get(url, headers=headers, timeout=timeout)
                     
                     # Handle error codes
+                    if response.status_code in (401, 403):
+                        raise AcblApiAuthError(
+                            expired_api_key_message(api_key)
+                            or (
+                                f"ERROR: HTTP {response.status_code} from ACBL API; "
+                                "ACBL_API_KEY is invalid or expired."
+                            )
+                        )
+
                     if response.status_code in [400, 500, 504]:
                         print(f"  ERROR: HTTP {response.status_code} - skipping month")
                         error_count += 1
@@ -255,6 +269,10 @@ Environment:
         print("Or use --api-key argument")
         print("Get an API key at: https://api.acbl.org")
         return 1
+    expiry_msg = expired_api_key_message(api_key)
+    if expiry_msg:
+        print(expiry_msg)
+        return 1
     
     # Resolve output directory
     output_dir = acblPath.joinpath(args.output_dir)
@@ -273,15 +291,19 @@ Environment:
     program_start = print_started()
     print()
 
-    write_count = download_events(
-        api_key=api_key,
-        output_dir=output_dir,
-        start_date=args.start_date,
-        end_date=args.end_date,
-        limit=args.limit,
-        sleep_seconds=args.sleep,
-        page_size=args.page_size
-    )
+    try:
+        write_count = download_events(
+            api_key=api_key,
+            output_dir=output_dir,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            limit=args.limit,
+            sleep_seconds=args.sleep,
+            page_size=args.page_size
+        )
+    except AcblApiAuthError as exc:
+        print(exc)
+        return 1
 
     print()
     print("=" * 70)

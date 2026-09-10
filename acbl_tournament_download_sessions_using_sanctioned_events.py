@@ -22,11 +22,13 @@ Behavior:
   - 400/404 are unavailable (cancelled, unpublished, no boards) and do not
     fail the run; they are retried on the next invocation
   - Timeouts and 429/5xx are retried; exhausted attempts fail the run
+  - 401/403 abort immediately (invalid or expired ACBL_API_KEY)
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import pathlib
@@ -35,7 +37,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 import requests
 from dotenv import load_dotenv
@@ -46,6 +48,12 @@ acblPath = rootPath.joinpath("acbl")
 DEFAULT_TIMEOUT_SECONDS = 90
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 15
 UNAVAILABLE_HTTP_STATUSES = frozenset({400, 404})
+AUTH_HTTP_STATUSES = frozenset({401, 403})
+JWT_EXPIRY_LEEWAY_SECONDS = 60
+
+
+class AcblApiAuthError(RuntimeError):
+    """ACBL API rejected the bearer token (HTTP 401/403 or expired JWT)."""
 
 
 def _iter_files_sorted(paths: Iterable[pathlib.Path]) -> list[pathlib.Path]:
@@ -60,6 +68,57 @@ def _load_sanction_event_files(events_dir: pathlib.Path) -> list[pathlib.Path]:
         for path in events_dir.rglob("*.sanction.json")
         if not path.name.startswith(".")
     )
+
+
+def jwt_expiry_unix(api_key: str) -> int | None:
+    """Return the JWT ``exp`` claim, or None if the key is not a JWT."""
+    parts = (api_key or "").strip().split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        padded = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+        exp = payload.get("exp")
+        return int(exp) if exp is not None else None
+    except (ValueError, TypeError, json.JSONDecodeError, OSError):
+        return None
+
+
+def expired_api_key_message(
+    api_key: str,
+    *,
+    now: float | None = None,
+) -> str | None:
+    """If ``api_key`` is an expired JWT, return a user-facing error."""
+    exp = jwt_expiry_unix(api_key)
+    if exp is None:
+        return None
+    current = time.time() if now is None else now
+    if exp + JWT_EXPIRY_LEEWAY_SECONDS >= current:
+        return None
+    expired_at = datetime.fromtimestamp(exp, tz=timezone.utc).isoformat()
+    return (
+        f"ERROR: ACBL_API_KEY JWT expired at {expired_at}. "
+        "Get a new key at https://api.acbl.org and re-run."
+    )
+
+
+def canonical_event_id(event: Mapping[str, Any]) -> str:
+    """Return the session-id prefix for a sanctioned-event payload.
+
+    Prefer the event API's ``id``. Some older regional payloads store a
+    truncated id that is just ``-<event_code>`` (e.g. ``-0810``); rebuild
+    those from ``sanction`` + ``event_code``. Do not rebuild well-formed
+    ids — NABC live ids are ``NABC262-OSHL``, not ``2607001-OSHL``.
+    """
+    event_id = str(event.get("id") or "").strip()
+    sanction = str(event.get("sanction") or "").strip()
+    event_code = str(event.get("event_code") or "").strip()
+    if event_id.startswith("-") or not event_id:
+        if sanction and event_code:
+            return f"{sanction}-{event_code}"
+        return ""
+    return event_id
 
 
 def build_session_ids_from_sanctioned_events(events_dir: pathlib.Path) -> list[str]:
@@ -84,7 +143,7 @@ def build_session_ids_from_sanctioned_events(events_dir: pathlib.Path) -> list[s
             invalid_files.append(fp.as_posix())
             continue
 
-        event_id = str(event.get("id") or "").strip()
+        event_id = canonical_event_id(event)
         session_count = event.get("session_count")
         if not event_id or session_count is None:
             invalid_files.append(fp.as_posix())
@@ -245,6 +304,18 @@ def download_tournament_sessions(
             continue
         except_count = 0
 
+        if response.status_code in AUTH_HTTP_STATUSES:
+            stats.errors += 1
+            stats.aborted = True
+            print(
+                f"ERROR: HTTP {response.status_code} unauthorized/forbidden "
+                f"for {session_id}. ACBL_API_KEY is invalid or expired; stopping."
+            )
+            expiry_msg = expired_api_key_message(api_key)
+            if expiry_msg:
+                print(expiry_msg)
+            break
+
         if is_unavailable_http(response.status_code):
             stats.unavailable += 1
             stats.unavailable_ids.append(session_id)
@@ -256,10 +327,7 @@ def download_tournament_sessions(
 
         if response.status_code != 200:
             stats.errors += 1
-            print(
-                f"ERROR after {max_attempts} attempts: "
-                f"HTTP {response.status_code}: url:{url}"
-            )
+            print(f"ERROR: HTTP {response.status_code}: url:{url}")
             continue
 
         try:
@@ -407,6 +475,10 @@ def main() -> int:
     api_key = args.api_key or os.getenv("ACBL_API_KEY")
     if not api_key:
         print("ERROR: ACBL_API_KEY environment variable not set")
+        return 1
+    expiry_msg = expired_api_key_message(api_key)
+    if expiry_msg:
+        print(expiry_msg)
         return 1
 
     events_dir = acblPath.joinpath(args.events_dir)

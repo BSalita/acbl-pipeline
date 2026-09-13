@@ -305,6 +305,13 @@ def _parse_cli_args():
               "matches the current acbl_prediction_data.py default. Pass '' to "
               "read the legacy un-suffixed files."),
     )
+    parser.add_argument(
+        "--reuse-shards", action="store_true",
+        help=("If this model's shard_*.pt files and schema.json already exist, "
+              "skip schema regen and shard rewrite and train from the leftover "
+              "shards. Use after an OOM/reboot mid-5c. Later targets without "
+              "shards still rebuild as usual."),
+    )
     args = parser.parse_args()
     if not args.club and not args.tournament:
         modes = ["club", "tournament"]
@@ -315,11 +322,77 @@ def _parse_cli_args():
         if args.tournament:
             modes.append("tournament")
     targets = args.target if args.target else list(y_names)
-    return modes, targets, args.input_suffix
+    return modes, targets, args.input_suffix, args.reuse_shards
+
+
+def _reusable_shards(saved_models_path: pathlib.Path, model_name: str):
+    """Return (shard_paths, schema_path) if this model has a contiguous leftover shard set."""
+    schema_file = saved_models_path / f"{model_name}_schema.json"
+    shards = sorted(saved_models_path.glob(f"{model_name}_shard_*.pt"))
+    if not schema_file.exists() or len(shards) < 2:
+        return None, schema_file
+    prefix = f"{model_name}_shard_"
+    idxs = []
+    for p in shards:
+        try:
+            idxs.append(int(p.name[len(prefix):-3]))
+        except ValueError:
+            return None, schema_file
+    if idxs != list(range(len(idxs))):
+        return None, schema_file
+    return shards, schema_file
+
+
+SPLIT_INDICATOR_COLS = ['is_train_set', 'is_val_set', 'is_test_set']
+
+
+def _log_mem(label: str) -> None:
+    try:
+        import psutil
+        proc = psutil.Process()
+        mem = proc.memory_info()
+        vm = psutil.virtual_memory()
+        print(
+            f"[Memory - {label}] "
+            f"Process RSS={mem.rss / (1024**3):.1f}GB "
+            f"| System {vm.used / (1024**3):.1f}/{vm.total / (1024**3):.1f}GB "
+            f"({vm.percent}%)"
+        )
+    except Exception as exc:
+        print(f"[Memory - {label}] unavailable: {exc}")
+
+
+def _cast_enums_to_categorical(df: pl.DataFrame) -> pl.DataFrame:
+    enum_cols = [c for c, dt in df.schema.items() if isinstance(dt, pl.Enum)]
+    if not enum_cols:
+        return df
+    print(f"  Casting {len(enum_cols)} Enum -> Categorical for trainer compat: "
+          f"{enum_cols[:8]}{'...' if len(enum_cols) > 8 else ''}")
+    return df.with_columns(
+        [pl.col(c).cast(pl.String).cast(pl.Categorical) for c in enum_cols]
+    )
+
+
+def _prepare_target_frame(df: pl.DataFrame, y_name: str, *, for_training: bool) -> pl.DataFrame:
+    """Drop leakage targets / split indicators. One frame in, one frame out — no extra copies kept."""
+    other = [t for t in y_names if t != y_name and t in df.columns]
+    if other:
+        df = df.drop(other)
+    if y_name == 'Pct_NS':
+        df = prune_pct_ns_features(df, verbose=for_training)
+    if for_training:
+        missing = [c for c in SPLIT_INDICATOR_COLS if c not in df.columns]
+        for col in missing:
+            print(f"WARNING: Split indicator '{col}' not found in training frame")
+        present = [c for c in SPLIT_INDICATOR_COLS if c in df.columns]
+        if present:
+            print(f"Excluded {len(present)} split indicator columns from training features")
+            df = df.drop(present)
+    return df
 
 
 def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
-                      input_suffix: str = "_v2"):
+                      input_suffix: str = "_v2", reuse_shards: bool = False):
     """Train ACBL prediction models for the requested targets (default: all three).
 
     `targets` controls which y-variables are trained this run. Targets are still
@@ -332,8 +405,12 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
     t = time.time()
     selected_targets = [y for y in y_names if y in (targets or y_names)]
     print(f"\nProcessing {club_or_tournament} prediction training... "
-          f"targets={selected_targets}  input_suffix='{input_suffix}'")
+          f"targets={selected_targets}  input_suffix='{input_suffix}'"
+          f"  reuse_shards={reuse_shards}")
 
+    # Load train and test one at a time. Holding both club frames plus a
+    # working copy (~488 GB) plus a 24 GB shard is what froze the 512 GB box
+    # mid-5c on 2026-09-13.
     acbl_prediction_data_train_filename = f"acbl_{club_or_tournament}_prediction_data_train{input_suffix}.parquet"
     acbl_prediction_data_train_file = acblPath.joinpath(acbl_prediction_data_train_filename)
     if not acbl_prediction_data_train_file.exists():
@@ -343,34 +420,15 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
             f"--output-suffix '{input_suffix}', or pass --input-suffix to match an "
             f"existing file."
         )
-    model_df = pl.read_parquet(acbl_prediction_data_train_file)
-    print(f"Loaded {acbl_prediction_data_train_filename}: shape:{model_df.shape} size:{acbl_prediction_data_train_file.stat().st_size}")
-
     acbl_prediction_data_test_filename = f"acbl_{club_or_tournament}_prediction_data_test{input_suffix}.parquet"
     acbl_prediction_data_test_file = acblPath.joinpath(acbl_prediction_data_test_filename)
-    df_test = pl.read_parquet(acbl_prediction_data_test_file)
-    print(f"Loaded {acbl_prediction_data_test_filename}: shape:{df_test.shape} size:{acbl_prediction_data_test_file.stat().st_size}")
-
-    # â”€â”€ Enum -> Categorical compatibility shim (2026-04-21) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # acbl_prediction_data.py emits categorical features as pl.Enum (required
-    # for streaming-safe sink_parquet). The training stack in
-    # mlBridge/mlBridgeAiLib.py predates that switch and still assumes
-    # pl.Categorical in ~20 places (validate_training_dataframe_dtypes,
-    # _is_categorical_dtype, schema generators, prediction-code casts, etc.).
-    # Cast Enum back to Categorical at load time so the trainer is happy.
-    # See TODO.md "Training pipeline does not understand pl.Enum natively".
-    enum_cols = [c for c, dt in model_df.schema.items() if isinstance(dt, pl.Enum)]
-    if enum_cols:
-        print(f"  Casting {len(enum_cols)} Enum -> Categorical for trainer compat: "
-              f"{enum_cols[:8]}{'...' if len(enum_cols) > 8 else ''}")
-        model_df = model_df.with_columns(
-            [pl.col(c).cast(pl.String).cast(pl.Categorical) for c in enum_cols]
+    if not acbl_prediction_data_test_file.exists():
+        raise FileNotFoundError(
+            f"Test parquet not found: {acbl_prediction_data_test_file}. "
+            f"Re-run acbl_prediction_data.py --{club_or_tournament} "
+            f"--output-suffix '{input_suffix}', or pass --input-suffix to match an "
+            f"existing file."
         )
-        test_enum_cols = [c for c in enum_cols if c in df_test.columns]
-        if test_enum_cols:
-            df_test = df_test.with_columns(
-                [pl.col(c).cast(pl.String).cast(pl.Categorical) for c in test_enum_cols]
-            )
 
 
     # for y_name in y_names:
@@ -425,55 +483,10 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         # The upstream parquet (acbl_prediction_data.py, game_state=5) already restricts
         # columns to game-state levels 0â€“4 (board / deal / event / players / session), so
         # the only remaining results-leakage risk is the two classification targets.
-        targets_to_keep = {
-            'Declarer_Direction': [],
-            'Contract': [],
-            'Pct_NS': [],
-        }
-        keep = targets_to_keep.get(y_name, [])
-        other_targets = [t for t in y_names if t != y_name and t not in keep and t in model_df.columns]
-        if keep:
-            kept_in_df = [t for t in keep if t in model_df.columns]
-            print(f"Keeping {kept_in_df} as features for {y_name} (temporally prior)")
-
-        working_df = model_df.select(pl.exclude(other_targets))
-        working_test_df = df_test.select(pl.exclude(other_targets))
-
-        # Drop the noisy high-cardinality feature families for Pct_NS (per-card
-        # Booleans, fully-broken-out EV cube, per-(strain,level) Probs table).
-        # See `PCT_NS_DROP_PATTERNS` in acbl_hp_search_lib.py for the full
-        # rationale â€” based on the importance report from the first
-        # post-leakage-fix run, those ~4688 columns sat at the noise floor.
-        if y_name == 'Pct_NS':
-            working_df = prune_pct_ns_features(working_df, verbose=True)
-            working_test_df = prune_pct_ns_features(working_test_df, verbose=False)
-
-        # â”€â”€ OOF stacking is intentionally NOT applied for Pct_NS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        # Historically Pct_NS was trained with Declarer_Direction and Contract as input
-        # features, replaced at train time with OOF predictions to avoid train/serve
-        # skew. Pct_NS now uses only pre-auction information (see `targets_to_keep`),
-        # so neither the OOF replacement nor the classifier OOF generation block at the
-        # bottom of this loop runs. The `oof_classifier_preds` / `test_classifier_preds`
-        # caches remain available for future stacking experiments but are unused.
-
-        # CRITICAL: Define split indicator columns - these must be excluded from training
-        # to prevent data leakage. They are metadata columns for tracking which rows
-        # were used in train/val/test splits, useful for inference and analysis.
-        split_indicator_cols = ['is_train_set', 'is_val_set', 'is_test_set']
-
-        # Verify split indicators are present
-        for col in split_indicator_cols:
-            if col not in working_df.columns:
-                print(f"âš ï¸  WARNING: Split indicator '{col}' not found in working_df")
-
-        # Create training dataframe with split indicators EXCLUDED from features
-        # Split indicators will remain in the dataframe for metadata/tracking but won't be trained on
-        working_df_for_training = working_df.drop(split_indicator_cols, strict=False)
-        print(f"âœ… Excluded {len([c for c in split_indicator_cols if c in working_df.columns])} split indicator columns from training features")
-        print(f"   Training on {len(working_df_for_training.columns)} features (including target '{y_name}')")
-
         model_name = f"acbl_{club_or_tournament}_predicted_{y_name.lower()}_torch_model"
         print(f"{model_name=}")
+        working_df_for_training = None
+        working_test_df = None
 
         # takes 10m/
         # Define architecture first so it can be saved in schema
@@ -550,20 +563,42 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         # optimal_num_workers = 16
         # optimal_pin_memory = True
 
-        # CRITICAL: Use working_df_for_training (without split indicators) to generate schema
-        # This ensures split indicators are not included as features in the model
-        schema_d = generate_and_save_schema(
-            working_df_for_training,  # WITHOUT split indicators
-            savedModelsPath, 
-            model_name, 
-            y_name,
-            # ðŸ”§ SHARED PARAMETERS: Must match between training and inference
-            layers=optimal_layers,  # Network architecture
-            dropout=optimal_dropout,  # Dropout rate for model structure
-            apply_scaling_parameters=True,  # Enable feature scaling (targets are not scaled)
-            y_range=optimal_y_range,  # None today (no sigmoid bound); set to (lo,hi) to enable
-            verbose=True
-        )
+        import json
+        leftover_shards, leftover_schema = _reusable_shards(savedModelsPath, model_name)
+        reusing_shards = bool(reuse_shards and leftover_shards)
+        if reusing_shards:
+            shard_bytes = sum(p.stat().st_size for p in leftover_shards)
+            print(f"Reusing {len(leftover_shards)} leftover shards "
+                  f"({shard_bytes / (1024**3):.1f} GB) and {leftover_schema.name}")
+            with open(leftover_schema, "r", encoding="utf-8") as f:
+                schema_d = json.load(f)
+        else:
+            _log_mem(f"{club_or_tournament}/{y_name} before train load")
+            print(f"Loading {acbl_prediction_data_train_filename} for {y_name} shards...")
+            working_df_for_training = pl.read_parquet(acbl_prediction_data_train_file)
+            print(f"Loaded {acbl_prediction_data_train_filename}: "
+                  f"shape:{working_df_for_training.shape} "
+                  f"size:{acbl_prediction_data_train_file.stat().st_size}")
+            working_df_for_training = _cast_enums_to_categorical(working_df_for_training)
+            f64 = working_df_for_training.select(pl.col(pl.Float64)).columns
+            assert f64 == [], f"Float64 columns in train frame: {f64}"
+            working_df_for_training = _prepare_target_frame(
+                working_df_for_training, y_name, for_training=True
+            )
+            print(f"   Training on {len(working_df_for_training.columns)} features "
+                  f"(including target '{y_name}')")
+            _log_mem(f"{club_or_tournament}/{y_name} after train prepare")
+            schema_d = generate_and_save_schema(
+                working_df_for_training,
+                savedModelsPath,
+                model_name,
+                y_name,
+                layers=optimal_layers,
+                dropout=optimal_dropout,
+                apply_scaling_parameters=True,
+                y_range=optimal_y_range,
+                verbose=True
+            )
         model_type = schema_d['model_type']
         print(f"Model type detected: {model_type}")
         print(f"ðŸ—ï¸ Architecture saved in schema: {optimal_layers} (dropout={optimal_dropout}, y_range={optimal_y_range})")
@@ -574,30 +609,30 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         if schema_layers != optimal_layers:
             print(f"âš ï¸ WARNING: Schema layers don't match! Expected {optimal_layers}, got {schema_layers}")
 
-        # remove all shards to free up space.
-        print("Removing all shards to free up space...")
-        for p in savedModelsPath.glob("*model_shard_*.pt"):
-            if p.is_file():
-                p.unlink()
+        if not reusing_shards:
+            # remove all shards to free up space.
+            print("Removing all shards to free up space...")
+            for p in savedModelsPath.glob("*model_shard_*.pt"):
+                if p.is_file():
+                    p.unlink()
 
-        # takes 10m/?m
-        # Create shards from training data WITHOUT split indicators
-        # Ensure at least 2 shards so validation has data
-        import math
-        num_rows = len(working_df_for_training)
-        est_shards = math.ceil(num_rows / optimal_shard_rows_count) if optimal_shard_rows_count else 0
-        effective_shard_rows_count = optimal_shard_rows_count
-        if est_shards < 2 and num_rows > 0:
-            effective_shard_rows_count = max(1, num_rows // 2)
-            print(f"[shards] Adjusted shard_rows_count from {optimal_shard_rows_count:,} to {effective_shard_rows_count:,} to ensure a validation shard (rows={num_rows:,})")
-        shards_path = create_torch_shards(
-            working_df_for_training,  # WITHOUT split indicators
-            schema_d,
-            shard_rows_count=effective_shard_rows_count,
-            apply_scaling=True,  # Enable scaling of features
-        )
-        print(f"âœ… Feature scaling enabled for inputs; targets remain unscaled")
-        print(f"âœ… Split indicators excluded from training shards")
+            # Create shards from training data WITHOUT split indicators
+            # Ensure at least 2 shards so validation has data
+            import math
+            num_rows = len(working_df_for_training)
+            est_shards = math.ceil(num_rows / optimal_shard_rows_count) if optimal_shard_rows_count else 0
+            effective_shard_rows_count = optimal_shard_rows_count
+            if est_shards < 2 and num_rows > 0:
+                effective_shard_rows_count = max(1, num_rows // 2)
+                print(f"[shards] Adjusted shard_rows_count from {optimal_shard_rows_count:,} to {effective_shard_rows_count:,} to ensure a validation shard (rows={num_rows:,})")
+            create_torch_shards(
+                working_df_for_training,  # WITHOUT split indicators
+                schema_d,
+                shard_rows_count=effective_shard_rows_count,
+                apply_scaling=True,  # Enable scaling of features
+            )
+            print("Feature scaling enabled for inputs; targets remain unscaled")
+            print("Split indicators excluded from training shards")
 
         # takes 10m/12m
         # Remove old shards if they exist. Determine scale parameters, scale, create shard files.
@@ -615,13 +650,13 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         except Exception as e:
             print(f"[CUDA] diagnostic error: {e}")
 
-        # Check actual target distribution
-        if model_type == 'regression':
+        # Check actual target distribution (only while the train frame is still loaded)
+        if model_type == 'regression' and working_df_for_training is not None:
             target_stats = working_df_for_training[y_name].describe()
-            print(f"ðŸ“Š Target distribution: {target_stats}")
+            print(f"Target distribution: {target_stats}")
             actual_min = float(working_df_for_training[y_name].min())
             actual_max = float(working_df_for_training[y_name].max())
-            print(f"ðŸ“Š Actual range: {actual_min:.3f} to {actual_max:.3f}")
+            print(f"Actual range: {actual_min:.3f} to {actual_max:.3f}")
 
         # Class weights: disabled for both classifiers.
         # The hp search (acbl_hp_search_contract.py, 17 trials) showed that
@@ -637,12 +672,11 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         # + class_weights_from_counts in acbl_hp_search_lib.py.
         class_weights: Optional[List[float]] = None
 
-        # Free training features DataFrame; shards are on disk now
-        try:
-            del working_df_for_training
-        except Exception:
-            pass
+        # Free the train frame before shard training. Test is loaded only after
+        # epochs finish, so training peak is one 24 GB shard plus the model.
+        working_df_for_training = None
         gc.collect()
+        _log_mem(f"{club_or_tournament}/{y_name} before train_model_from_shards")
 
         # Adjust batch size for small dataset
         # optimal_bs = 512  # Smaller batch to add gradient noise
@@ -663,8 +697,18 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
             verbose=True
         )
 
-        # ðŸ” CAPTURE INPUT AND PREDICTIONS FOR DEBUGGING
-        print(f"ðŸ“Š Capturing input data for model: {model_name}")
+        _log_mem(f"{club_or_tournament}/{y_name} after train, before test load")
+        print(f"Loading {acbl_prediction_data_test_filename} for {y_name} eval...")
+        working_test_df = pl.read_parquet(acbl_prediction_data_test_file)
+        print(f"Loaded {acbl_prediction_data_test_filename}: "
+              f"shape:{working_test_df.shape} "
+              f"size:{acbl_prediction_data_test_file.stat().st_size}")
+        working_test_df = _cast_enums_to_categorical(working_test_df)
+        working_test_df = _prepare_target_frame(
+            working_test_df, y_name, for_training=False
+        )
+
+        print(f"Capturing input data for model: {model_name}")
 
         # Save input data for debugging
         input_capture_path = acblPath.joinpath(f"debug_input_{y_name.lower()}.parquet")
@@ -774,6 +818,7 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
             torch.cuda.empty_cache()
         except Exception:
             pass
+        working_test_df = None
         for _v in ['prediction_df', 'features_df', 'y_series', 'contract_df']:
             if _v in locals():
                 try:
@@ -781,8 +826,7 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
                 except Exception:
                     pass
         gc.collect()
-
-    assert model_df.select(pl.col(pl.Float64)).columns == [], model_df.select(pl.col(pl.Float64)).columns
+        _log_mem(f"{club_or_tournament}/{y_name} after eval freed")
 
     print(f"{club_or_tournament} elapsed time in seconds: {time.time()-t}")
     print("-" * 70, "\n")
@@ -795,10 +839,10 @@ if __name__ == "__main__":
     from mlBridge import print_started, print_ended
     program_start_time = print_started()
 
-    cli_modes, cli_targets, cli_suffix = _parse_cli_args()
+    cli_modes, cli_targets, cli_suffix, cli_reuse_shards = _parse_cli_args()
     for club_or_tournament in cli_modes:
         train_predictions(club_or_tournament, targets=cli_targets,
-                          input_suffix=cli_suffix)
+                          input_suffix=cli_suffix, reuse_shards=cli_reuse_shards)
 
     print_ended(program_start_time)
 

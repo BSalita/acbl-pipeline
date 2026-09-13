@@ -1,11 +1,13 @@
 @echo off
 setlocal EnableExtensions
-:: Resume acbl_all.bat after Stage 1 club ingest and the blocked
-:: tournament API downloads. Skips:
-::   1a, 1b  club JSON + club SQLite (already updated)
-::   1c, 1d  tournament events/sessions (need a fresh ACBL_API_KEY JWT)
-:: Starts at 1e (existing session JSON -> SQLite; no API) and runs
-:: through 5c so club + current tournament data finish the update.
+:: Resume after hardware reboot during 5c (OOM).
+:: Already done this run:
+::   5a  model data (2026-09-12 22:35)
+::   5b  prediction parquets (club 00:45, tournament 01:06 on 2026-09-13)
+:: 5c club Declarer_Direction: schema + 62 shards (~1.4 TB) written this
+:: morning; epochs 1-2 ran then the box died. No new .pth (still 2026-08-24).
+:: Restart 5c from club Declarer_Direction using leftover shards, then
+:: Contract, Pct_NS, and all three tournament targets.
 set "PY=%~dp0.venv\Scripts\python.exe"
 if not exist "%PY%" (
   echo *** FAILED: project venv not found: %PY%
@@ -16,9 +18,9 @@ set PYTHONUTF8=1
 set PYTHONIOENCODING=utf-8
 set "STEP_OK=%TEMP%\acbl_all_step.ok"
 echo ======================================================================
-echo  ACBL pipeline resume (skip 1a-1d)
-echo  Skipped: club download/SQL (1a-1b), tournament API (1c-1d, JWT)
-echo  Running: 1e, 2a, 2b, 3a, 3b, 3c, 4, 5a, 5b, 5c
+echo  ACBL pipeline resume (5c only, reuse leftover club DD shards)
+echo  Skipped: 1a-4, 5a, 5b
+echo  Running: 5c  acbl_prediction_train.py --reuse-shards
 echo ======================================================================
 echo.
 echo Using: %PY%
@@ -26,55 +28,9 @@ echo Start: %date% %time%
 echo.
 call :now PIPE_T0
 
-:: ---- 1e ----
-:: Existing tournaments/sessions/*.session.json -> .session.sql + sqlite.
-:: Does not call the ACBL API.
-echo   [1e] Loading tournament sessions into SQLite...
-call :pyrun 1e acbl_tournament_sessions_json_to_sql.py
-if errorlevel 1 goto :error
-
-echo.
-echo [Stage 2] Cleaning...
-echo   [2a] Cleaning hand records...
-call :pyrun 2a acbl_sql_to_hand_records_clean.py
-if errorlevel 1 goto :error
-
-echo   [2b] Cleaning board results...
-call :pyrun 2b acbl_sql_to_board_results_clean.py
-if errorlevel 1 goto :error
-
-echo.
-echo [Stage 3] Augmentation...
-echo   [3a] Augmenting hand records (DD + SD + Par)...
-call :pyrun 3a acbl_hand_records_augment.py
-if errorlevel 1 goto :error
-
-echo   [3b] Augmenting board results (step 1: contracts + vulnerability)...
-call :pyrun 3b acbl_board_results_augment_step1.py
-if errorlevel 1 goto :error
-
-echo   [3c] Augmenting board results (step 2: join hand records + full augmentation)...
-call :pyrun 3c acbl_board_results_augment_step2.py
-if errorlevel 1 goto :error
-
-echo.
-echo [Stage 4] Elo ratings...
-echo   [4] Computing Elo ratings (player + pair)...
-call :pyrun 4 acbl_elo_ratings_create.py
-if errorlevel 1 goto :error
-
-echo.
 echo [Stage 5] ML model pipeline...
-echo   [5a] Building model data...
-call :pyrun 5a acbl_model_data.py
-if errorlevel 1 goto :error
-
-echo   [5b] Preparing prediction data (train/test split)...
-call :pyrun 5b acbl_prediction_data.py
-if errorlevel 1 goto :error
-
-echo   [5c] Training prediction models...
-call :pyrun 5c acbl_prediction_train.py
+echo   [5c] Training prediction models (reuse leftover shards)...
+call :pyrun 5c acbl_prediction_train.py --reuse-shards
 if errorlevel 1 goto :error
 
 echo.

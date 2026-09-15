@@ -27,6 +27,7 @@ echo      (~38 h Stage 3a + ~45 h Stage 5c + other stages).
 echo    Warm rerun (3a cache hits): ~55-57 h end-to-end
 echo      (~10-12 h Stages 1-5b + ~45 h Stage 5c).
 echo    Stage 5c current baseline: ~45 h for all 6 models (2026-08-23 -^> 08-26).
+echo    Stage 5d shows the prediction charts 5c no longer opens (close windows to finish).
 echo    Empirical bottlenecks per stage are noted as "TIME:" tags below.
 echo    Each step prints its own measured elapsed time as "TIME[step]: ..." lines.
 echo  Latest complete outputs: 2026-08-14 -^> 2026-08-26 (5c used resumed target runs).
@@ -228,8 +229,9 @@ if errorlevel 1 goto :error
 ::         acbl/SavedModels/{model_name}.pth                        -> Chatbot
 ::         acbl/SavedModels/*model_shard_*.pt                       (transient)
 ::         acbl/SavedModels/{model_name}_importance.csv
-::         acbl/debug_input_{y_name}.parquet
-::         acbl/debug_predictions_{y_name}.parquet
+::         acbl/debug_input_{club,tournament}_{target}.parquet
+::         acbl/debug_predictions_{club,tournament}_{target}.parquet
+::         Charts are not shown here (MPLBACKEND=Agg). Use 5d.
 :: TIME:   CURRENT BASELINE ~45 h for all 6 models, 20 epochs each.
 ::         Reconstructed from successful target-specific runs on
 ::         2026-08-23 -> 2026-08-26; a clean uninterrupted run avoids duplicate
@@ -263,7 +265,21 @@ if errorlevel 1 goto :error
 ::         next target, so only one target's shard set should exist at a time.
 ::         Run this step alone (not via acbl_all.bat) when iterating on models.
 echo   [5c] Training prediction models...
+set MPLBACKEND=Agg
 call :pyrun 5c acbl_prediction_train.py
+if errorlevel 1 goto :error
+
+:: ---- 5d ----
+:: READS:  acbl/debug_predictions_{club,tournament}_{target}.parquet
+::         (fallback: acbl/debug_predictions_{target}.parquet)
+::         acbl/SavedModels/acbl_{club,tournament}_predicted_{target}_torch_model_importance.csv
+:: WRITES: (none; interactive matplotlib windows)
+:: TIME:   user-bound; close the figure windows to continue.
+::         Charts were removed from 5c (Agg backend) after a GUI close
+::         on a leftover figure killed tournament Pct_NS (2026-09-15).
+echo   [5d] Showing prediction charts (close the figure windows to finish)...
+set "MPLBACKEND="
+call :pyrun 5d acbl_prediction_charts.py
 if errorlevel 1 goto :error
 
 :: ====================================================================

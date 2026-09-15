@@ -15,6 +15,12 @@ import os
 # Silence GT 1030 / multi-GPU mismatch warnings by only exposing the primary GPU (index 0).
 # Set BEFORE importing torch. Override by exporting CUDA_VISIBLE_DEVICES yourself.
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+# Confusion/bar charts are matplotlib windows on this same python.exe. Clicking
+# their close box while the next target is training does not run the GUI loop,
+# so the window paints as hung and Windows logs AppHangTransient (2026-09-15
+# 08:31, killed tournament Pct_NS at epoch 7). Use Agg unless the caller
+# already chose a backend. Override with MPLBACKEND if you really want GUI.
+os.environ.setdefault("MPLBACKEND", "Agg")
 
 import sys
 # Windows powershell defaults to cp1252; force UTF-8 so the various status-line
@@ -682,6 +688,12 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         # optimal_bs = 512  # Smaller batch to add gradient noise
         # print(f"ðŸ”§ Adjusting batch size from 32768 to {optimal_bs} for dataset size {len(working_df)}")
 
+        try:
+            import matplotlib.pyplot as plt
+            plt.close('all')
+        except Exception:
+            pass
+        target_started = time.time()
         model, model_path, stats = train_model_from_shards(
             schema_d,
             # Training-only parameters (do not affect inference)
@@ -696,6 +708,11 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
             class_weights=class_weights,
             verbose=True
         )
+        pth = pathlib.Path(model_path) if model_path else savedModelsPath / f"{model_name}.pth"
+        if not pth.is_file() or pth.stat().st_mtime < target_started - 1:
+            raise RuntimeError(
+                f"Training did not write a fresh model for {model_name}: {pth}"
+            )
 
         _log_mem(f"{club_or_tournament}/{y_name} after train, before test load")
         print(f"Loading {acbl_prediction_data_test_filename} for {y_name} eval...")
@@ -711,7 +728,9 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         print(f"Capturing input data for model: {model_name}")
 
         # Save input data for debugging
-        input_capture_path = acblPath.joinpath(f"debug_input_{y_name.lower()}.parquet")
+        input_capture_path = acblPath.joinpath(
+            f"debug_input_{club_or_tournament}_{y_name.lower()}.parquet"
+        )
         working_test_df.write_parquet(input_capture_path)
         print(f"âœ… Input data saved to: {input_capture_path}")
         print(f"   Shape: {working_test_df.shape}")
@@ -771,7 +790,9 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
             prediction_df = prediction_df.with_columns([y_series.alias(y_name)])
 
         # Save predictions for debugging
-        predictions_capture_path = acblPath.joinpath(f"debug_predictions_{y_name.lower()}.parquet")
+        predictions_capture_path = acblPath.joinpath(
+            f"debug_predictions_{club_or_tournament}_{y_name.lower()}.parquet"
+        )
         prediction_df.write_parquet(predictions_capture_path)
         print(f"âœ… Predictions saved to: {predictions_capture_path}")
         print(f"   Shape: {prediction_df.shape}")
@@ -789,9 +810,9 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
                     pl.col(y_name).cast(pl.Utf8).str.slice(0, 2).cast(pl.Categorical).alias('Level_Strain'),
                     pl.col(f'{y_name}_Pred').cast(pl.Utf8).str.slice(0, 2).cast(pl.Categorical).alias('Level_Strain_Pred'),
                 ])
-                analyze_prediction_results(contract_df, 'Level_Strain')
+                analyze_prediction_results(contract_df, 'Level_Strain', create_plots=False)
             case _:
-                analyze_prediction_results(prediction_df, y_name)
+                analyze_prediction_results(prediction_df, y_name, create_plots=False)
 
         fi = display_feature_importances(savedModelsPath, model_name, top_n=50, bottom_n=50, return_df=False)
         print(fi.head(10))
@@ -839,10 +860,14 @@ if __name__ == "__main__":
     from mlBridge import print_started, print_ended
     program_start_time = print_started()
 
-    cli_modes, cli_targets, cli_suffix, cli_reuse_shards = _parse_cli_args()
-    for club_or_tournament in cli_modes:
-        train_predictions(club_or_tournament, targets=cli_targets,
-                          input_suffix=cli_suffix, reuse_shards=cli_reuse_shards)
+    try:
+        cli_modes, cli_targets, cli_suffix, cli_reuse_shards = _parse_cli_args()
+        for club_or_tournament in cli_modes:
+            train_predictions(club_or_tournament, targets=cli_targets,
+                              input_suffix=cli_suffix, reuse_shards=cli_reuse_shards)
+    except KeyboardInterrupt:
+        print("Interrupted during training", file=sys.stderr, flush=True)
+        sys.exit(130)
 
     print_ended(program_start_time)
 

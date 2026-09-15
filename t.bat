@@ -1,13 +1,13 @@
 @echo off
 setlocal EnableExtensions
-:: Resume after hardware reboot during 5c (OOM).
+:: Resume after 5c stopped mid tournament Pct_NS (2026-09-15 08:31).
 :: Already done this run:
-::   5a  model data (2026-09-12 22:35)
-::   5b  prediction parquets (club 00:45, tournament 01:06 on 2026-09-13)
-:: 5c club Declarer_Direction: schema + 62 shards (~1.4 TB) written this
-:: morning; epochs 1-2 ran then the box died. No new .pth (still 2026-08-24).
-:: Restart 5c from club Declarer_Direction using leftover shards, then
-:: Contract, Pct_NS, and all three tournament targets.
+::   1e-4, 5a, 5b
+::   5c club DD / Contract / Pct_NS
+::   5c tournament DD / Contract
+:: Tournament Pct_NS: schema + 16 shards written 08:16-08:25; epochs 1-7
+:: ran then the process exited. .pth is still 2026-08-26. Restart that
+:: target only, reusing the leftover shards (epochs restart from 1).
 set "PY=%~dp0.venv\Scripts\python.exe"
 if not exist "%PY%" (
   echo *** FAILED: project venv not found: %PY%
@@ -16,11 +16,15 @@ if not exist "%PY%" (
 )
 set PYTHONUTF8=1
 set PYTHONIOENCODING=utf-8
+set PYTHONUNBUFFERED=1
+set MPLBACKEND=Agg
 set "STEP_OK=%TEMP%\acbl_all_step.ok"
+set "PTH_CHECK=e:\bridge\data\acbl\SavedModels\acbl_tournament_predicted_pct_ns_torch_model.pth"
 echo ======================================================================
-echo  ACBL pipeline resume (5c only, reuse leftover club DD shards)
-echo  Skipped: 1a-4, 5a, 5b
-echo  Running: 5c  acbl_prediction_train.py --reuse-shards
+echo  ACBL pipeline resume (5c tournament Pct_NS only)
+echo  Skipped: 1a-4, 5a, 5b, club 5c, tournament DD/Contract
+echo  Running: 5c  acbl_prediction_train.py --reuse-shards --tournament --target Pct_NS
+echo           5d  acbl_prediction_charts.py  (interactive charts; close windows to finish)
 echo ======================================================================
 echo.
 echo Using: %PY%
@@ -29,8 +33,17 @@ echo.
 call :now PIPE_T0
 
 echo [Stage 5] ML model pipeline...
-echo   [5c] Training prediction models (reuse leftover shards)...
-call :pyrun 5c acbl_prediction_train.py --reuse-shards
+echo   [5c] Training tournament Pct_NS (reuse leftover shards)...
+call :pyrun 5c acbl_prediction_train.py --reuse-shards --tournament --target Pct_NS
+if errorlevel 1 goto :error
+call :freshpth "%PTH_CHECK%" %PIPE_T0%
+if errorlevel 1 goto :error
+
+:: 5d: same as acbl_all.bat. Shows every completed model's charts
+:: (club + tournament, all targets that have artifacts), not just Pct_NS.
+echo   [5d] Showing prediction charts (close the figure windows to finish)...
+set "MPLBACKEND="
+call :pyrun 5d acbl_prediction_charts.py
 if errorlevel 1 goto :error
 
 echo.
@@ -60,6 +73,12 @@ exit /b 0
 
 :now
 for /f %%t in ('powershell -NoProfile -Command "[DateTimeOffset]::Now.ToUnixTimeSeconds()"') do set "%~1=%%t"
+goto :eof
+
+:freshpth
+:: Fail if %1 does not exist or its mtime is older than unix seconds %2.
+powershell -NoProfile -Command "$p='%~1'; $t0=[int64]'%~2'; if (-not (Test-Path -LiteralPath $p)) { Write-Host ('*** FAILED: missing model {0}' -f $p); exit 1 }; $u=[DateTimeOffset](Get-Item -LiteralPath $p).LastWriteTime.ToUniversalTime(); if ($u.ToUnixTimeSeconds() -lt $t0) { Write-Host ('*** FAILED: stale model {0}' -f $p); exit 1 }; Write-Host ('Verified fresh model: {0}' -f $p); exit 0"
+if errorlevel 1 exit /b 1
 goto :eof
 
 :toc

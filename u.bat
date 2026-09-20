@@ -1,5 +1,5 @@
-rem Publish ACBL club/tournament parquets to X1 elo\data\_wslc_host\acbl-stage.
-rem Production containers mount that tree (postmortem ACBL_CLUB_* and
+rem Publish ACBL club/tournament parquets to X1 src\data\_wslc_host\acbl-stage.
+rem Production containers mount src\data (postmortem ACBL_CLUB_* and
 rem BridgeStats extra-data). OneDrive does not sync this; copy over UNC
 rem unless this script is already running on X1.
 rem Do not copy into this repo's club_results_parquet or club-results-recent.
@@ -11,13 +11,16 @@ rem Recent session-details JSON (last 30 days) is the archive tier so results
 rem are served without live Cloudflare scrapes.
 
 set "SRC=e:\bridge\data\acbl"
-set "STAGE=\\X1-pro-470-1tb\c\sw\bridge\ML-Contract-Bridge\src\elo\data\_wslc_host\acbl-stage"
+set "STAGE=\\X1-pro-470-1tb\c\sw\bridge\ML-Contract-Bridge\src\data\_wslc_host\acbl-stage"
 if /i "%COMPUTERNAME%"=="X1-PRO-470-1TB" (
-    set "STAGE=%~dp0..\elo\data\_wslc_host\acbl-stage"
+    set "STAGE=%~dp0..\data\_wslc_host\acbl-stage"
 )
 if not exist "%STAGE%\" (
-    echo *** FAILED: _wslc_host acbl-stage not found: %STAGE%
-    exit /b 1
+    mkdir "%STAGE%"
+    if errorlevel 1 (
+        echo *** FAILED: could not create _wslc_host acbl-stage: %STAGE%
+        exit /b 1
+    )
 )
 
 if not exist "%STAGE%\club_results_parquet\" (

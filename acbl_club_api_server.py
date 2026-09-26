@@ -13,6 +13,7 @@ import os
 from typing import Optional
 
 from fastapi import FastAPI, Query, Response
+from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -304,6 +305,17 @@ def get_session_sql(
         refresh=refresh,
         allow_live=allow_live,
     )
+
+
+class BrowserHandoffBody(BaseModel):
+    url: str
+    html: str = Field(min_length=1, max_length=svc.HANDOFF_MAX_CHARS)
+
+
+@app.post("/handoff")
+def post_browser_handoff(body: BrowserHandoffBody) -> dict:
+    """Cache a my.acbl.org page loaded in the caller's browser."""
+    return svc.ingest_browser_handoff(body.url, body.html)
 
 
 @app.get("/sessions/{session_id}")

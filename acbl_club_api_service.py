@@ -44,6 +44,7 @@ from mlBridge.mlBridgeAcblLib import (  # noqa: E402
     _run_in_thread_with_new_loop,
     create_acbl_browser_context,
     create_club_dfs,
+    extract_json_from_var_data,
     get_club_results_details_data_playwright,
     parse_acbl_events_from_html,
     resolve_acbl_browser_profile_dir,
@@ -63,7 +64,16 @@ GAP_SCRAPE_LIMIT = 50
 CLOUDFLARE_HINT = (
     "my.acbl.org is behind Cloudflare. Warm the persistent Chrome profile "
     "(ACBL_BROWSER_PROFILE_DIR) with solve_acbl_postmortem.ps1 or "
-    "python acbl_solve_challenge.py, then retry."
+    "python acbl_solve_challenge.py, then retry. Or open the page in a "
+    "normal browser and POST the HTML to /handoff."
+)
+# A page the user's browser loaded. Prefer it over a headless refetch so a
+# Cloudflare block does not throw away the listing they just retrieved.
+HANDOFF_TTL_S = 6 * 60 * 60
+HANDOFF_MAX_CHARS = 12_000_000
+_HANDOFF_URL_RE = re.compile(
+    r"^https://my\.acbl\.org/club-results/(?:(?P<kind>my-results|details)/)?(?P<id>\d+)/?$",
+    re.IGNORECASE,
 )
 
 _CHATBOT_CACHE = _SRC_DIR / "postmortem-acbl" / "club-results"
@@ -714,6 +724,277 @@ def _count_detail_links(html: str) -> int:
     return len(set(re.findall(r"/club-results/details/(\d+)", html)))
 
 
+def _handoff_is_fresh(path: pathlib.Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        age = time.time() - path.stat().st_mtime
+    except OSError:
+        return False
+    return age <= HANDOFF_TTL_S
+
+
+def _fresh_handoff_html(path: pathlib.Path) -> Optional[str]:
+    if not _handoff_is_fresh(path):
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if len(text) < 200:
+        return None
+    return text
+
+
+def _club_handoff_path(club_id: str) -> pathlib.Path:
+    return CACHE_DIR / str(club_id) / f"{club_id}.handoff.html"
+
+
+def _player_handoff_path(player_id: str) -> pathlib.Path:
+    return CACHE_DIR / "_players" / f"{player_id}.handoff.html"
+
+
+def _session_handoff_marker(session_id: str) -> pathlib.Path:
+    return CACHE_DIR / "_handoff" / f"{session_id}.session"
+
+
+def _fresh_session_handoff_path(session_id: str) -> Optional[pathlib.Path]:
+    marker = _session_handoff_marker(session_id)
+    if not _handoff_is_fresh(marker):
+        return None
+    try:
+        club_id = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not club_id:
+        return None
+    path = CACHE_DIR / club_id / "details" / f"{session_id}.data.json"
+    return path if path.is_file() else None
+
+
+def html_is_cloudflare_challenge(html: str) -> bool:
+    """True when the body is the interstitial, not a loaded results page."""
+    sample = html[:12000].lower()
+    return any(
+        marker in sample
+        for marker in (
+            "just a moment",
+            "checking your browser",
+            "cf-challenge",
+            "_cf_chl_opt",
+        )
+    )
+
+
+def classify_handoff_url(url: str) -> Tuple[str, str, str]:
+    """Return kind, id, canonical URL for a club, player, or session page."""
+    raw = str(url or "").strip().split("#", 1)[0].split("?", 1)[0]
+    match = _HANDOFF_URL_RE.match(raw)
+    if not match:
+        raise ClubApiError(
+            "url must be a my.acbl.org club, player, or session results page",
+            status_code=400,
+        )
+    ident = match.group("id")
+    token = (match.group("kind") or "").lower()
+    if token == "my-results":
+        kind = "player"
+        canonical = f"{ACBL_ORIGIN}/club-results/my-results/{ident}"
+    elif token == "details":
+        kind = "session"
+        canonical = f"{ACBL_ORIGIN}/club-results/details/{ident}"
+    else:
+        kind = "club"
+        canonical = f"{ACBL_ORIGIN}/club-results/{ident}"
+    return kind, ident, canonical
+
+
+def session_details_from_html(html: str) -> Optional[Dict[str, Any]]:
+    """Session JSON embedded in a details page, without launching a browser."""
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in (
+        "result-details-combined-section",
+        "result-details",
+        "team-result-details",
+    ):
+        node = soup.find(tag)
+        if node is None:
+            continue
+        raw = node.get("v-bind:data")
+        if isinstance(raw, str) and raw:
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+    parsed = extract_json_from_var_data(html)
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _club_games_from_handoff(
+    club_id: str,
+    parquet_rows: List[Dict[str, Any]],
+    *,
+    start_date: Optional[str],
+    end_date: Optional[str],
+    cap: int,
+) -> Optional[Dict[str, Any]]:
+    html = _fresh_handoff_html(_club_handoff_path(club_id))
+    if html is None:
+        return None
+    info, live_rows = parse_club_page(html, club_id)
+    if not live_rows:
+        return None
+    for row in live_rows:
+        row["listing_source"] = "browser handoff"
+    rows = _filter_games_by_date(
+        _merge_game_rows(live_rows, parquet_rows), start_date, end_date
+    )
+    return rows_to_table(
+        rows,
+        limit=cap,
+        meta={
+            "source_url": f"{ACBL_ORIGIN}/club-results/{club_id}",
+            "source": "browser-handoff",
+            "cached": False,
+            "complete": bool(parquet_rows),
+            "fetched_at": _now_iso(),
+            "club": info,
+        },
+    )
+
+
+def _player_games_from_handoff(
+    player_id: str,
+    parquet_rows: List[Dict[str, Any]],
+    cap: int,
+) -> Optional[Dict[str, Any]]:
+    html = _fresh_handoff_html(_player_handoff_path(player_id))
+    if html is None:
+        return None
+    live_rows = parse_player_games_html(html, player_id)
+    if not live_rows:
+        return None
+    rows = _merge_game_rows(live_rows, parquet_rows)
+    return rows_to_table(
+        rows,
+        limit=cap,
+        meta={
+            "source_url": f"{ACBL_ORIGIN}/club-results/my-results/{player_id}",
+            "source": "browser-handoff",
+            "cached": False,
+            "complete": bool(parquet_rows),
+            "fetched_at": _now_iso(),
+        },
+    )
+
+
+def ingest_browser_handoff(url: str, html: str) -> Dict[str, Any]:
+    """Cache a results page loaded in the user's browser."""
+    if not isinstance(html, str) or not html.strip():
+        raise ClubApiError("html is empty", status_code=400)
+    if len(html) > HANDOFF_MAX_CHARS:
+        raise ClubApiError("html is too large", status_code=413)
+    kind, ident, canonical = classify_handoff_url(url)
+    if html_is_cloudflare_challenge(html):
+        raise ClubApiError(
+            "That page is still the Cloudflare challenge.",
+            status_code=409,
+            hint=(
+                "Wait until the games or results are visible, then send "
+                "the page again."
+            ),
+        )
+    if kind == "club":
+        return _ingest_club_handoff(ident, canonical, html)
+    if kind == "player":
+        return _ingest_player_handoff(ident, canonical, html)
+    return _ingest_session_handoff(ident, canonical, html)
+
+
+def _ingest_club_handoff(club_id: str, url: str, html: str) -> Dict[str, Any]:
+    info, rows = parse_club_page(html, club_id)
+    if not rows:
+        raise ClubApiError(
+            f"No club games found in the page for club {club_id}",
+            status_code=422,
+            hint="Send the page after the game table is visible.",
+        )
+    for row in rows:
+        row["listing_source"] = "browser handoff"
+    path = _club_handoff_path(club_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(html, encoding="utf-8")
+    _save_json(
+        CACHE_DIR / club_id / f"{club_id}.games.json",
+        {"info": info, "games": rows, "complete": False, "handoff": True},
+    )
+    name = info.get("club_name") or club_id
+    return {
+        "ok": True,
+        "kind": "club",
+        "url": url,
+        "id": club_id,
+        "rows": len(rows),
+        "club_name": info.get("club_name"),
+        "message": f"Saved {len(rows)} games for {name}. Ask again to use them.",
+    }
+
+
+def _ingest_player_handoff(player_id: str, url: str, html: str) -> Dict[str, Any]:
+    rows = parse_player_games_html(html, player_id)
+    if not rows:
+        raise ClubApiError(
+            f"No club games found in the page for player {player_id}",
+            status_code=422,
+            hint="Send the page after the game table is visible.",
+        )
+    path = _player_handoff_path(player_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(html, encoding="utf-8")
+    _save_json(
+        CACHE_DIR / "_players" / f"{player_id}.games.json",
+        {"games": rows, "complete": False, "handoff": True},
+    )
+    return {
+        "ok": True,
+        "kind": "player",
+        "url": url,
+        "id": player_id,
+        "rows": len(rows),
+        "message": (
+            f"Saved {len(rows)} games for player {player_id}. Ask again to use them."
+        ),
+    }
+
+
+def _ingest_session_handoff(session_id: str, url: str, html: str) -> Dict[str, Any]:
+    data = session_details_from_html(html)
+    if not data:
+        raise ClubApiError(
+            f"No session results were embedded in the page for {session_id}",
+            status_code=422,
+            hint="Send the page after the board results are visible.",
+        )
+    club_id = str(data.get("club_id_number") or data.get("club_id") or "unknown")
+    path = CACHE_DIR / club_id / "details" / f"{session_id}.data.json"
+    _save_json(path, data)
+    marker = _session_handoff_marker(session_id)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(club_id, encoding="utf-8")
+    label = data.get("event_name") or data.get("name") or session_id
+    return {
+        "ok": True,
+        "kind": "session",
+        "url": url,
+        "id": session_id,
+        "club_id": club_id,
+        "rows": 1,
+        "message": f"Saved session {session_id} ({label}). Ask again to use it.",
+    }
+
+
 def parse_club_page(html: str, club_id: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Club header plus game rows from a club-results HTML listing."""
     soup = BeautifulSoup(html, "html.parser")
@@ -1029,6 +1310,15 @@ def club_games(
     info: Dict[str, Any] = {"club_id": cid}
 
     parquet_rows = _club_games_from_parquet(cid)
+    handed = _club_games_from_handoff(
+        cid,
+        parquet_rows,
+        start_date=start_date,
+        end_date=end_date,
+        cap=cap,
+    )
+    if handed is not None:
+        return handed
     if parquet_rows:
         rows = parquet_rows
         info["club_name"] = parquet_rows[0].get("club_name")
@@ -1207,6 +1497,9 @@ def player_games(
     refresh_attempts: List[Dict[str, Any]] = []
 
     parquet_rows = _player_games_from_parquet(pid)
+    handed = _player_games_from_handoff(pid, parquet_rows, cap)
+    if handed is not None:
+        return handed
     if parquet_rows:
         rows = parquet_rows
         source = "parquet"
@@ -1308,6 +1601,9 @@ def _fetch_session_json(
     sid = str(session_id).strip()
     if not sid.isdigit():
         raise ClubApiError("session_id must be a numeric club event id", status_code=400)
+    handoff_path = _fresh_session_handoff_path(sid)
+    if handoff_path is not None:
+        return _load_json(handoff_path), True, handoff_path
     cached_path = find_session_cache(sid)
     if cached_path is not None and not refresh:
         return _load_json(cached_path), True, cached_path

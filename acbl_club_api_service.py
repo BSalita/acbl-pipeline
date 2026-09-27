@@ -181,6 +181,11 @@ _SESSION_DF_MAX = 8
 _AUGMENTED_SESSION_CACHE: Dict[Tuple[str, float], bytes] = {}
 _AUGMENTED_SESSION_LOCK = threading.Lock()
 _AUGMENTED_SESSION_MAX = 8
+# Sessions absent from the monolith, keyed like the cache so a rebuilt file
+# is rescanned. One report fires dozens of calls for the same session.
+_AUGMENTED_SESSION_MISSES: Dict[Tuple[str, float], bool] = {}
+_AUGMENTED_SESSION_MISSES_MAX = 256
+_AUGMENTED_SESSION_SCAN_LOCKS: Dict[Tuple[str, float], threading.Lock] = {}
 _POSTMORTEM_BUILD_LOCK = threading.Lock()
 _POSTMORTEM_CACHE_VERSION = 2
 _TOURNAMENT_PARQUET_HITS = 0
@@ -1668,6 +1673,35 @@ def _session_kind(session_id: str) -> str:
     return "club" if str(session_id).isdigit() else "tournament"
 
 
+def _scan_historical_session(
+    path: pathlib.Path, kind: str, sid: str
+) -> Optional[bytes]:
+    """One session's rows from the monolith as parquet bytes; None if absent."""
+    lazy = pl.scan_parquet(path)
+    id_column = "event_id" if kind == "club" else "session_id"
+    schema = lazy.collect_schema()
+    if id_column not in schema.names():
+        raise ClubApiError(
+            f"{path.name} does not contain {id_column}",
+            status_code=500,
+        )
+    # Preserve Parquet predicate pushdown. Casting the 81 GiB monolith's
+    # event_id to String forced a full scan before applying the filter.
+    id_value: Any = int(sid) if schema[id_column].is_integer() else sid
+    frame = _collect_retry(lazy.filter(pl.col(id_column) == id_value))
+    if frame is None:
+        raise ClubApiError(
+            f"Could not read historical postmortem {sid}",
+            status_code=503,
+            hint="The augmented parquet may be updating; retry shortly.",
+        )
+    if frame.is_empty():
+        return None
+    output = io.BytesIO()
+    frame.write_parquet(output, compression="zstd")
+    return output.getvalue()
+
+
 def _historical_augmented_parquet(
     session_id: str,
 ) -> Optional[Tuple[bytes, Dict[str, Any]]]:
@@ -1684,40 +1718,37 @@ def _historical_augmented_parquet(
     key = (f"{path}:{sid}", path.stat().st_mtime)
     with _AUGMENTED_SESSION_LOCK:
         cached = _AUGMENTED_SESSION_CACHE.get(key)
+        missing = key in _AUGMENTED_SESSION_MISSES
+        scan_lock = _AUGMENTED_SESSION_SCAN_LOCKS.setdefault(
+            key, threading.Lock())
+    if cached is None and not missing:
+        with scan_lock:
+            with _AUGMENTED_SESSION_LOCK:
+                cached = _AUGMENTED_SESSION_CACHE.get(key)
+                missing = key in _AUGMENTED_SESSION_MISSES
+            if cached is None and not missing:
+                try:
+                    cached = _scan_historical_session(path, kind, sid)
+                finally:
+                    with _AUGMENTED_SESSION_LOCK:
+                        _AUGMENTED_SESSION_SCAN_LOCKS.pop(key, None)
+                with _AUGMENTED_SESSION_LOCK:
+                    if cached is None:
+                        if len(_AUGMENTED_SESSION_MISSES) >= _AUGMENTED_SESSION_MISSES_MAX:
+                            _AUGMENTED_SESSION_MISSES.pop(
+                                next(iter(_AUGMENTED_SESSION_MISSES)))
+                        _AUGMENTED_SESSION_MISSES[key] = True
+                    else:
+                        if len(_AUGMENTED_SESSION_CACHE) >= _AUGMENTED_SESSION_MAX:
+                            _AUGMENTED_SESSION_CACHE.pop(
+                                next(iter(_AUGMENTED_SESSION_CACHE)))
+                        _AUGMENTED_SESSION_CACHE[key] = cached
     if cached is None:
-        lazy = pl.scan_parquet(path)
-        id_column = "event_id" if kind == "club" else "session_id"
-        schema = lazy.collect_schema()
-        if id_column not in schema.names():
-            raise ClubApiError(
-                f"{path.name} does not contain {id_column}",
-                status_code=500,
-            )
-        # Preserve Parquet predicate pushdown. Casting the 81 GiB monolith's
-        # event_id to String forced a full scan before applying the filter.
-        id_value: Any = int(sid) if schema[id_column].is_integer() else sid
-        frame = _collect_retry(
-            lazy.filter(pl.col(id_column) == id_value))
-        if frame is None:
-            raise ClubApiError(
-                f"Could not read historical postmortem {session_id}",
-                status_code=503,
-                hint="The augmented parquet may be updating; retry shortly.",
-            )
-        if frame.is_empty():
-            if kind == "tournament":
-                _record_tournament_parquet_query(sid, False)
-            else:
-                _record_club_parquet_query(sid, False)
-            return None
-        output = io.BytesIO()
-        frame.write_parquet(output, compression="zstd")
-        cached = output.getvalue()
-        with _AUGMENTED_SESSION_LOCK:
-            if len(_AUGMENTED_SESSION_CACHE) >= _AUGMENTED_SESSION_MAX:
-                _AUGMENTED_SESSION_CACHE.pop(
-                    next(iter(_AUGMENTED_SESSION_CACHE)))
-            _AUGMENTED_SESSION_CACHE[key] = cached
+        if kind == "tournament":
+            _record_tournament_parquet_query(sid, False)
+        else:
+            _record_club_parquet_query(sid, False)
+        return None
     if kind == "tournament":
         _record_tournament_parquet_query(sid, True)
     else:
@@ -2282,7 +2313,11 @@ def session_augmented_parquet(
         raise ClubApiError(
             f"Session {sid} is absent from historical augmented parquet and API cache",
             status_code=404,
-            hint="MCP postmortem requests do not scrape or build sessions live.",
+            hint=(
+                "MCP postmortem requests do not scrape or build club sessions "
+                f"live. POST {ACBL_ORIGIN}/club-results/details/{sid} HTML to "
+                "/handoff, then retry."
+            ),
         )
 
     with _POSTMORTEM_BUILD_LOCK:
@@ -2407,6 +2442,9 @@ def _historical_postmortem_lazy(
     )
     if not path.is_file():
         return None
+    with _AUGMENTED_SESSION_LOCK:
+        if (f"{path}:{sid}", path.stat().st_mtime) in _AUGMENTED_SESSION_MISSES:
+            return None
     lazy = pl.scan_parquet(path)
     id_column = "event_id" if kind == "club" else "session_id"
     schema = lazy.collect_schema()
@@ -2566,7 +2604,10 @@ def postmortem_dataframe(
         session_id,
         player_id=player_id,
         refresh=refresh,
-        allow_build=_session_kind(session_id) == "tournament",
+        allow_build=(
+            _session_kind(session_id) == "tournament"
+            or _fresh_session_handoff_path(str(session_id)) is not None
+        ),
     )
     frame = _normalize_postmortem_frame(
         pl.read_parquet(io.BytesIO(payload)))

@@ -158,3 +158,41 @@ class AcblBrowserHandoffTests(unittest.TestCase):
         self.assertTrue(cached)
         self.assertEqual(data["event_name"], "Friday Open")
         self.assertEqual(path.name, "993420.data.json")
+
+    def test_session_page_lets_a_club_postmortem_build(self) -> None:
+        seen = {}
+
+        def augmented(session_id, player_id=None, refresh=False, allow_build=True):
+            seen["allow_build"] = allow_build
+            raise svc.ClubApiError("stop", status_code=418)
+
+        with patch.object(svc, "session_augmented_parquet", side_effect=augmented):
+            with self.assertRaises(svc.ClubApiError):
+                svc.postmortem_dataframe("993420", "2663279")
+            self.assertFalse(seen["allow_build"])
+            svc.ingest_browser_handoff(
+                "https://my.acbl.org/club-results/details/993420",
+                SESSION_HTML,
+            )
+            with self.assertRaises(svc.ClubApiError):
+                svc.postmortem_dataframe("993420", "2663279")
+        self.assertTrue(seen["allow_build"])
+
+
+class HistoricalSessionMissTests(unittest.TestCase):
+    def test_absent_session_is_scanned_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monolith = Path(tmp) / "augmented.parquet"
+            monolith.write_bytes(b"x")
+            with (
+                patch.object(svc, "AUGMENTED_PARQUET_FILE", monolith),
+                patch.object(svc, "_AUGMENTED_SESSION_MISSES", {}),
+                patch.object(svc, "_record_club_parquet_query"),
+                patch.object(
+                    svc, "_scan_historical_session", return_value=None
+                ) as scan,
+            ):
+                self.assertIsNone(svc._historical_augmented_parquet("777"))
+                self.assertIsNone(svc._historical_augmented_parquet("777"))
+                self.assertIsNone(svc._historical_postmortem_lazy("777"))
+        self.assertEqual(scan.call_count, 1)

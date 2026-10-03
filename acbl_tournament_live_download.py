@@ -709,6 +709,9 @@ def download_events_from_web(
     events_dir.mkdir(parents=True, exist_ok=True)
     start_dt, end_dt = _bounded(start_date, end_date)
     written = 0
+    skipped = 0
+    seen = 0
+    started = time.time()
     try:
         for kind in TOURNAMENT_LIST_TYPES:
             page = 1
@@ -721,10 +724,14 @@ def download_events_from_web(
                     payload["end"] = end_date
                 encoded = urllib.parse.quote(json.dumps(payload, separators=(",", ":")), safe="")
                 url = f"{LIVE_ORIGIN}/ajax/tourn-list/{encoded}?perPage=100&page={page}"
-                print(f"[web] {kind} page {page}: {url}")
+                print(f"[web] {kind} page {page}/{max_page}: {url}")
                 page_html = fetcher(url)
                 tournaments, reported_max = parse_tournament_list(page_html)
                 max_page = max(max_page, reported_max)
+                print(
+                    f"[web] {kind} page {page}/{max_page}: "
+                    f"{len(tournaments)} tournaments"
+                )
                 if not tournaments:
                     break
                 for tournament in tournaments:
@@ -738,20 +745,37 @@ def download_events_from_web(
                     if limit is not None and written >= limit:
                         return written
                     sanction = tournament["sanction"]
-                    print(f"  events {sanction} {tournament.get('name')}")
+                    seen += 1
+                    rate = (time.time() - started) / seen
+                    print(
+                        f"  [{seen}] rate:{rate:.1f}s/tourn "
+                        f"written:{written} skipped:{skipped} "
+                        f"{sanction} {tournament.get('name')}"
+                    )
+                    t_tourn = time.time()
                     events_html = fetcher(tournament["href"])
                     if sleep_seconds:
                         time.sleep(sleep_seconds)
+                    new_here = 0
+                    saved_here = 0
                     for event in parse_events_page(events_html, sanction, tournament.get("name") or ""):
                         if limit is not None and written >= limit:
                             return written
                         path = events_dir / f"{event['id']}.sanction.json"
                         sql_path = events_dir / f"{event['id']}.sanction.sql"
                         if path.exists() or sql_path.exists():
+                            skipped += 1
+                            saved_here += 1
                             continue
                         path.write_text(json.dumps(event, indent=2, ensure_ascii=False), encoding="utf-8")
                         written += 1
+                        new_here += 1
                         print(f"  [{written}] Writing: {path.name} sessions:{event['session_count']}")
+                    print(
+                        f"  [{seen}] {sanction} done in {time.time() - t_tourn:.1f}s "
+                        f"new:{new_here} already_saved:{saved_here} "
+                        f"written:{written} skipped:{skipped}"
+                    )
                 page += 1
                 if sleep_seconds:
                     time.sleep(sleep_seconds)

@@ -339,10 +339,10 @@ def _parquet_file(name: str) -> Optional[pathlib.Path]:
 
 
 def _parquet_scan(name: str) -> Optional[pl.LazyFrame]:
-    path = _parquet_file(name)
-    if path is None:
-        return None
-    return pl.scan_parquet(path)
+    """Stage-1b table plus the recent store. Recent rows replace the same id."""
+    from acbl_recent_update import scan_with_recent
+
+    return scan_with_recent(_parquet_file(name), name)
 
 
 def _collect_retry(lazy: pl.LazyFrame) -> Optional[pl.DataFrame]:
@@ -1609,6 +1609,15 @@ def _fetch_session_json(
     cached_path = find_session_cache(sid)
     if cached_path is not None and not refresh:
         return _load_json(cached_path), True, cached_path
+    if cached_path is not None and _parquet_scan("events") is not None:
+        known = _collect_retry(
+            _parquet_scan("events")
+            .filter(pl.col("id").cast(pl.Utf8) == sid)
+            .select("id")
+            .head(1)
+        )
+        if known is not None and not known.is_empty():
+            return _load_json(cached_path), True, cached_path
     if not allow_live:
         raise ClubApiError(
             f"Raw tables for session {sid} are absent from normalized session parquets and JSON archive",
@@ -1639,6 +1648,12 @@ def _fetch_session_json(
     club_id = str(data.get("club_id_number") or data.get("club_id") or "unknown")
     path = _session_cache_path(club_id, sid)
     _save_json(path, data)
+    try:
+        from acbl_recent_update import remember_session_json
+
+        remember_session_json(path)
+    except Exception as exc:
+        print(f"[recent] could not store session {sid}: {exc}", flush=True)
     return data, False, path
 
 

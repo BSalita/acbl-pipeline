@@ -49,6 +49,10 @@ DEFAULT_ARCHIVE = pathlib.Path(r"e:/bridge/data/acbl/club-results")
 DEFAULT_SESSIONS = pathlib.Path(
     r"e:/bridge/data/acbl/club_results_parquet/sessions.parquet"
 )
+DEFAULT_PARQUET_DIR = DEFAULT_SESSIONS.parent
+DEFAULT_AUGMENTED = pathlib.Path(
+    r"e:/bridge/data/acbl/acbl_club_board_results_augmented.parquet"
+)
 
 
 def coverage_start(
@@ -65,6 +69,12 @@ def coverage_start(
     return min(historical_max + timedelta(days=1), lookback)
 
 
+def _date_from_stat(value: object) -> Optional[date]:
+    if value is None or str(value).strip() == "":
+        return None
+    return date.fromisoformat(str(value)[:10])
+
+
 def historical_max_date(path: pathlib.Path) -> Optional[date]:
     """Newest game_date in the stage-1b sessions parquet, if that file exists."""
     if not path.is_file():
@@ -72,9 +82,18 @@ def historical_max_date(path: pathlib.Path) -> Optional[date]:
     value = (
         pl.scan_parquet(path).select(pl.col("game_date").max()).collect().item()
     )
-    if value is None or str(value).strip() == "":
+    return _date_from_stat(value)
+
+
+def augmented_max_date(path: pathlib.Path) -> Optional[date]:
+    """Newest Date in the augmented board-results parquet, if that file exists."""
+    if not path.is_file():
         return None
-    return date.fromisoformat(str(value)[:10])
+    schema = pl.scan_parquet(path).collect_schema()
+    if "Date" not in schema.names():
+        return None
+    value = pl.scan_parquet(path).select(pl.col("Date").max()).collect().item()
+    return _date_from_stat(value)
 
 
 def next_club_batch(
@@ -212,6 +231,253 @@ def upsert_tables(
     return pl.scan_parquet(events_path).select(pl.len()).collect().item()
 
 
+def scan_with_recent(
+    historical: Optional[pathlib.Path],
+    table: str,
+    recent_dir: pathlib.Path = DEFAULT_RECENT_DIR,
+) -> Optional[pl.LazyFrame]:
+    """Scan a stage-1b table with recent rows of the same name overlaid on ``id``."""
+    frames: List[pl.LazyFrame] = []
+    if historical is not None and historical.is_file():
+        frames.append(pl.scan_parquet(historical))
+    recent = recent_dir / f"{table}.parquet"
+    if recent.is_file():
+        frames.append(pl.scan_parquet(recent))
+    if not frames:
+        return None
+    if len(frames) == 1:
+        return frames[0]
+    historical_lf, recent_lf = frames
+    hist_names = set(historical_lf.collect_schema().names())
+    recent_names = set(recent_lf.collect_schema().names())
+    if "id" in hist_names and "id" in recent_names:
+        historical_lf = historical_lf.join(
+            recent_lf.select(pl.col("id").cast(pl.Utf8)),
+            left_on=pl.col("id").cast(pl.Utf8),
+            right_on="id",
+            how="anti",
+        )
+    return pl.concat([historical_lf, recent_lf], how="diagonal_relaxed")
+
+
+def remember_session_json(
+    path: pathlib.Path,
+    recent_dir: pathlib.Path = DEFAULT_RECENT_DIR,
+) -> int:
+    """Upsert one downloaded session JSON into the recent store."""
+    tables = stamped_tables(path)
+    if not tables:
+        return 0
+    return upsert_tables(recent_dir, [tables], historical_max=None)
+
+
+def prune_recent(
+    recent_dir: pathlib.Path,
+    absorbed_through: Optional[date],
+) -> int:
+    """Drop recent rows whose game_date is already in the augmented parquet."""
+    if absorbed_through is None or not recent_dir.is_dir():
+        return 0
+    cutoff = absorbed_through.isoformat()
+    removed = 0
+    for path in recent_dir.glob("*.parquet"):
+        frame = pl.read_parquet(path)
+        if "game_date" not in frame.columns:
+            continue
+        kept = frame.filter(
+            (pl.col("game_date") == "") | (pl.col("game_date") > cutoff)
+        )
+        removed += frame.height - kept.height
+        if kept.height == frame.height:
+            continue
+        if kept.is_empty():
+            path.unlink()
+        else:
+            _atomic_parquet(kept, path)
+    return removed
+
+
+def _ids(frame: pl.DataFrame, column: str) -> List[str]:
+    if frame.is_empty() or column not in frame.columns:
+        return []
+    return frame[column].cast(pl.Utf8).drop_nulls().unique().to_list()
+
+
+def _stamp_gap(
+    frame: pl.DataFrame, event_dates: pl.DataFrame
+) -> pl.DataFrame:
+    stamped = frame.with_columns(pl.col("event_id").cast(pl.Utf8))
+    return stamped.join(event_dates, on="event_id", how="left").with_columns(
+        pl.col("game_date").cast(pl.Utf8)
+    )
+
+
+def backfill_stage1b(
+    parquet_dir: pathlib.Path,
+    recent_dir: pathlib.Path,
+    absorbed_through: Optional[date],
+) -> int:
+    """Copy stage-1b rows newer than the augmented parquet into the recent store.
+
+    The scheduled download skips JSON that stage 1b already saved. Those games
+    still have to stay in the recent store until stage 3c absorbs them.
+    """
+    sessions_path = parquet_dir / "sessions.parquet"
+    if absorbed_through is None or not sessions_path.is_file():
+        return 0
+    cutoff = absorbed_through.isoformat()
+    gap = (
+        pl.scan_parquet(sessions_path)
+        .select(
+            pl.col("id").cast(pl.Utf8).alias("session_id"),
+            pl.col("event_id").cast(pl.Utf8),
+            pl.col("game_date").cast(pl.Utf8).str.slice(0, 10).alias("game_date"),
+        )
+        .filter(pl.col("game_date") > cutoff)
+        .unique(subset=["event_id"])
+        .collect()
+    )
+    if gap.is_empty():
+        return 0
+    events_path = recent_dir / "events.parquet"
+    if events_path.is_file():
+        have = pl.read_parquet(events_path, columns=["event_id"]).select(
+            pl.col("event_id").cast(pl.Utf8)
+        )
+        gap = gap.join(have, on="event_id", how="anti")
+    if gap.is_empty():
+        return 0
+    event_ids = gap["event_id"].to_list()
+    event_dates = gap.select("event_id", "game_date")
+    session_ids = gap["session_id"].to_list()
+
+    def _take(name: str, column: str, values: Sequence[str]) -> pl.DataFrame:
+        path = parquet_dir / f"{name}.parquet"
+        if not path.is_file() or not values:
+            return pl.DataFrame()
+        frame = (
+            pl.scan_parquet(path)
+            .filter(pl.col(column).cast(pl.Utf8).is_in(values))
+            .collect()
+        )
+        if "event_id" not in frame.columns or "game_date" in frame.columns:
+            if "event_id" in frame.columns:
+                return frame.with_columns(pl.col("event_id").cast(pl.Utf8))
+            return frame
+        return _stamp_gap(frame, event_dates)
+
+    sessions = _take("sessions", "event_id", event_ids)
+    if sessions.is_empty():
+        return 0
+    if "game_date" in sessions.columns:
+        sessions = sessions.with_columns(
+            pl.col("game_date").cast(pl.Utf8).str.slice(0, 10)
+        )
+    events = _take("events", "id", event_ids)
+    if not events.is_empty() and "event_id" not in events.columns:
+        events = events.with_columns(pl.col("id").cast(pl.Utf8).alias("event_id"))
+        events = events.join(event_dates, on="event_id", how="left")
+    sections = _take("sections", "session_id", session_ids)
+    section_ids = _ids(sections, "id")
+    if sections.height and "event_id" not in sections.columns:
+        link = sessions.select(
+            pl.col("id").cast(pl.Utf8).alias("session_id"),
+            pl.col("event_id").cast(pl.Utf8),
+            pl.col("game_date").cast(pl.Utf8),
+        )
+        sections = sections.with_columns(pl.col("session_id").cast(pl.Utf8)).join(
+            link, on="session_id", how="left"
+        )
+    boards = _take("boards", "section_id", section_ids)
+    board_ids = _ids(boards, "id")
+    if boards.height and "event_id" not in boards.columns and sections.height:
+        link = sections.select(
+            pl.col("id").cast(pl.Utf8).alias("section_id"),
+            pl.col("event_id").cast(pl.Utf8),
+            pl.col("game_date").cast(pl.Utf8),
+        )
+        boards = boards.with_columns(pl.col("section_id").cast(pl.Utf8)).join(
+            link, on="section_id", how="left"
+        )
+    board_results = _take("board_results", "board_id", board_ids)
+    if board_results.height and "event_id" not in board_results.columns and boards.height:
+        link = boards.select(
+            pl.col("id").cast(pl.Utf8).alias("board_id"),
+            pl.col("event_id").cast(pl.Utf8),
+            pl.col("game_date").cast(pl.Utf8),
+        )
+        board_results = board_results.with_columns(
+            pl.col("board_id").cast(pl.Utf8)
+        ).join(link, on="board_id", how="left")
+    pairs = _take("pair_summaries", "section_id", section_ids)
+    if pairs.height and "event_id" not in pairs.columns and sections.height:
+        link = sections.select(
+            pl.col("id").cast(pl.Utf8).alias("section_id"),
+            pl.col("event_id").cast(pl.Utf8),
+            pl.col("game_date").cast(pl.Utf8),
+        )
+        pairs = pairs.with_columns(pl.col("section_id").cast(pl.Utf8)).join(
+            link, on="section_id", how="left"
+        )
+    pair_ids = _ids(pairs, "id")
+    players = _take("players", "pair_summary_id", pair_ids)
+    if players.height and "event_id" not in players.columns and pairs.height:
+        link = pairs.select(
+            pl.col("id").cast(pl.Utf8).alias("pair_summary_id"),
+            pl.col("event_id").cast(pl.Utf8),
+            pl.col("game_date").cast(pl.Utf8),
+        )
+        players = players.with_columns(pl.col("pair_summary_id").cast(pl.Utf8)).join(
+            link, on="pair_summary_id", how="left"
+        )
+    tables = {
+        "events": events,
+        "sessions": sessions,
+        "sections": sections,
+        "boards": boards,
+        "board_results": board_results,
+        "pair_summaries": pairs,
+        "players": players,
+    }
+    _upsert_frames(recent_dir, tables, absorbed_through)
+    return gap.height
+
+
+def _upsert_frames(
+    recent_dir: pathlib.Path,
+    tables: Dict[str, pl.DataFrame],
+    absorbed_through: Optional[date],
+) -> None:
+    recent_dir.mkdir(parents=True, exist_ok=True)
+    cutoff = absorbed_through.isoformat() if absorbed_through is not None else None
+    for name, incoming in tables.items():
+        if incoming.is_empty():
+            continue
+        path = recent_dir / f"{name}.parquet"
+        incoming = incoming.with_columns(
+            [pl.col(column).cast(pl.Utf8) for column in incoming.columns]
+        )
+        frames = [incoming]
+        event_ids: List[str] = []
+        if "event_id" in incoming.columns:
+            event_ids = incoming["event_id"].drop_nulls().unique().to_list()
+        if path.is_file():
+            old = pl.read_parquet(path)
+            if event_ids and "event_id" in old.columns:
+                old = old.filter(~pl.col("event_id").cast(pl.Utf8).is_in(event_ids))
+            frames.insert(0, old)
+        frame = _align_concat(frames)
+        if cutoff is not None and "game_date" in frame.columns:
+            frame = frame.filter(
+                (pl.col("game_date") == "") | (pl.col("game_date") > cutoff)
+            )
+        if frame.is_empty():
+            if path.is_file():
+                path.unlink()
+            continue
+        _atomic_parquet(frame, path)
+
+
 def files_to_ingest(
     club_ids: Sequence[int], archive: pathlib.Path, coverage: date
 ) -> List[pathlib.Path]:
@@ -276,6 +542,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--recent-dir", type=pathlib.Path, default=DEFAULT_RECENT_DIR)
     parser.add_argument("--archive", type=pathlib.Path, default=DEFAULT_ARCHIVE)
     parser.add_argument("--sessions-parquet", type=pathlib.Path, default=DEFAULT_SESSIONS)
+    parser.add_argument("--augmented-parquet", type=pathlib.Path, default=DEFAULT_AUGMENTED)
     parser.add_argument(
         "--club-batch",
         type=int,
@@ -298,13 +565,17 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parser().parse_args(argv)
-    historical_max = historical_max_date(args.sessions_parquet)
-    coverage = coverage_start(historical_max, args.every, args.today)
+    sessions_max = historical_max_date(args.sessions_parquet)
+    absorbed_through = augmented_max_date(args.augmented_parquet)
+    coverage = coverage_start(sessions_max, args.every, args.today)
     print(
         f"[recent] every={args.every} coverage_start={coverage.isoformat()} "
-        f"historical_max={historical_max.isoformat() if historical_max else 'none'}",
+        f"sessions_max={sessions_max.isoformat() if sessions_max else 'none'} "
+        f"augmented_max={absorbed_through.isoformat() if absorbed_through else 'none'}",
         flush=True,
     )
+    filled = backfill_stage1b(args.sessions_parquet.parent, args.recent_dir, absorbed_through)
+    print(f"[recent] backfilled {filled} stage-1b event(s) newer than augmented", flush=True)
     batch = args.club_batch
     if batch is None:
         batch = HOUR_CLUB_BATCH if args.every == "hour" else 0
@@ -362,13 +633,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         if tables:
             extracted.append(tables)
     event_count = upsert_tables(
-        args.recent_dir, extracted, historical_max=historical_max
+        args.recent_dir, extracted, historical_max=absorbed_through
     )
     _write_manifest(
         args.recent_dir,
         every=args.every,
         coverage=coverage,
-        historical_max=historical_max,
+        historical_max=absorbed_through,
         clubs=clubs,
         event_count=event_count,
     )

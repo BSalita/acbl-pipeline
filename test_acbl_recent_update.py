@@ -11,9 +11,11 @@ from pathlib import Path
 import polars as pl
 
 from acbl_recent_update import (
+    backfill_stage1b,
     coverage_start,
     files_to_ingest,
     next_club_batch,
+    scan_with_recent,
     stamped_tables,
     upsert_tables,
 )
@@ -46,6 +48,44 @@ class ClubBatchTests(unittest.TestCase):
         clubs, cursor = next_club_batch([1, 2], 1, 0)
         self.assertEqual(clubs, [1, 2])
         self.assertIsNone(cursor)
+
+
+class ScanTests(unittest.TestCase):
+    def test_recent_id_replaces_historical(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            historical = root / "events.parquet"
+            pl.DataFrame({"id": ["1"], "name": ["old"]}).write_parquet(historical)
+            recent = root / "recent"
+            recent.mkdir()
+            pl.DataFrame(
+                {"id": ["1"], "name": ["new"], "event_id": ["1"], "game_date": ["2026-10-02"]}
+            ).write_parquet(recent / "events.parquet")
+            frame = scan_with_recent(historical, "events", recent).collect()
+            self.assertEqual(frame["name"].to_list(), ["new"])
+
+
+class BackfillTests(unittest.TestCase):
+    def test_copies_games_newer_than_augmented(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            parquet = root / "parquet"
+            parquet.mkdir()
+            pl.DataFrame(
+                {
+                    "id": ["10"],
+                    "event_id": ["99"],
+                    "game_date": ["2026-10-02 00:00:00"],
+                }
+            ).write_parquet(parquet / "sessions.parquet")
+            pl.DataFrame(
+                {"id": ["99"], "name": ["Open"], "club_id_number": ["100"]}
+            ).write_parquet(parquet / "events.parquet")
+            count = backfill_stage1b(parquet, root / "recent", date(2026, 9, 9))
+            self.assertEqual(count, 1)
+            events = pl.read_parquet(root / "recent" / "events.parquet")
+            self.assertEqual(events["event_id"].to_list(), ["99"])
+            self.assertEqual(events["game_date"].to_list(), ["2026-10-02"])
 
 
 class UpsertTests(unittest.TestCase):

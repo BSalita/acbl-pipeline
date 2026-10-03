@@ -177,6 +177,15 @@ def augment_board_results_step2(club_or_tournament):
     else:
         raise ValueError(f"Invalid club_or_tournament: {club_or_tournament}")
 
+    if club_or_tournament == "club":
+        from acbl_recent_update import augmented_max_date, prune_recent
+
+        removed = prune_recent(
+            pathlib.Path(r"e:/bridge/data/acbl/recent"),
+            augmented_max_date(acbl_board_results_augmented_file),
+        )
+        print(f"Dropped {removed} recent rows now covered by the augmented parquet")
+
     return
 
 

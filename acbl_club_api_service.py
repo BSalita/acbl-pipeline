@@ -43,6 +43,7 @@ from mlBridge.mlBridgeAcblLib import (  # noqa: E402
     _goto_with_diagnostics,
     _run_in_thread_with_new_loop,
     create_acbl_browser_context,
+    wait_through_acbl_challenge,
     create_club_dfs,
     extract_json_from_var_data,
     get_club_results_details_data_playwright,
@@ -62,10 +63,10 @@ NAV_SLEEP_SECONDS = 2.0
 # boundary gap (games newer than the last stage-1b run) needs scraping.
 GAP_SCRAPE_LIMIT = 50
 CLOUDFLARE_HINT = (
-    "my.acbl.org is behind Cloudflare. Warm the persistent Chrome profile "
-    "(ACBL_BROWSER_PROFILE_DIR) with solve_acbl_postmortem.ps1 or "
-    "python acbl_solve_challenge.py, then retry. Or open the page in a "
-    "normal browser and POST the HTML to /handoff."
+    "my.acbl.org is behind Cloudflare. The fetch keeps a visible Chrome "
+    "window open, refreshes every 30 seconds, and waits up to six hours. "
+    "Complete the check in that window if it stays up. Or open the page in "
+    "a normal browser and POST the HTML to /handoff."
 )
 # A page the user's browser loaded. Prefer it over a headless refetch so a
 # Cloudflare block does not throw away the listing they just retrieved.
@@ -660,14 +661,7 @@ def _playwright_paginated_html(
             browser, context = create_acbl_browser_context(p, headless=True)
             page = context.new_page()
             try:
-                response = _goto_with_diagnostics(page, url, verbose=False)
-                if response is None or response.status != 200:
-                    status = getattr(response, "status", None)
-                    raise ClubApiError(
-                        f"Failed to load {url} (status {status})",
-                        status_code=502,
-                        hint=CLOUDFLARE_HINT,
-                    )
+                _goto_with_diagnostics(page, url, verbose=False)
                 page_num = 1
                 while True:
                     try:
@@ -698,12 +692,15 @@ def _playwright_paginated_html(
                             if "disabled" in class_attr:
                                 continue
                             next_button.click()
-                            page.wait_for_load_state("networkidle", timeout=60000)
+                            page.wait_for_load_state("domcontentloaded", timeout=90000)
+                            wait_through_acbl_challenge(page)
                             time.sleep(0.5)
                             page_num += 1
                             next_clicked = True
                             break
-                        except Exception:
+                        except Exception as exc:
+                            if type(exc).__name__ == "Forbidden403Error":
+                                raise
                             continue
                     if not next_clicked:
                         break

@@ -446,6 +446,8 @@ def dataset_info() -> Dict[str, Any]:
         if ARCHIVE_CACHE_DIR.is_dir()
         else 0
     )
+    from acbl_recent_update import recent_store_info
+
     info = {
         "cache_dir": str(CACHE_DIR),
         "cached_sessions": cached_session_count(),
@@ -469,10 +471,13 @@ def dataset_info() -> Dict[str, Any]:
         "write_cache_dir": str(WRITE_CACHE_DIR),
         "chrome_profile": str(profile) if profile else None,
         "player_info_parquet": str(parquet) if parquet else None,
+        "recent_store": recent_store_info(),
         "note": (
-            "Club and tournament postmortems resolve from historical augmented "
-            "parquets, then the API parquet cache, then a headless live build. "
-            "Both Streamlit and MCP clients use this API."
+            "Club listings read the stage-1b parquets and the recent store "
+            "together. A downloaded session is written into the recent store. "
+            "Stage 3c drops recent rows once the augmented parquet covers "
+            "their date. Postmortems still resolve from the augmented parquet, "
+            "then the API cache, then a live build."
         ),
     }
     _dataset_info_cache = (now, info)
@@ -508,8 +513,8 @@ def club_dataset_info() -> Dict[str, Any]:
         ),
         "note": (
             "Historical session tables and postmortems are projected from the "
-            "club augmented parquet. Raw JSON is only used for recent sessions "
-            "that are absent from that parquet."
+            "club augmented parquet. Club game lists also include the recent "
+            "store. Raw JSON is used for sessions that are absent from both."
         ),
     }
 

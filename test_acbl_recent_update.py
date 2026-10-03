@@ -15,6 +15,7 @@ from acbl_recent_update import (
     coverage_start,
     files_to_ingest,
     next_club_batch,
+    recent_store_info,
     scan_with_recent,
     stamped_tables,
     upsert_tables,
@@ -63,6 +64,13 @@ class ScanTests(unittest.TestCase):
             ).write_parquet(recent / "events.parquet")
             frame = scan_with_recent(historical, "events", recent).collect()
             self.assertEqual(frame["name"].to_list(), ["new"])
+
+    def test_store_info_reports_an_empty_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            info = recent_store_info(Path(tmp))
+            self.assertFalse(info["available"])
+            self.assertIsNone(info["events"])
+            self.assertIn("stage-1b", info["note"])
 
 
 class BackfillTests(unittest.TestCase):

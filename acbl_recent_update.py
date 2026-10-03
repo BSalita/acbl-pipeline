@@ -478,6 +478,35 @@ def _upsert_frames(
         _atomic_parquet(frame, path)
 
 
+def recent_store_info(
+    recent_dir: pathlib.Path = DEFAULT_RECENT_DIR,
+) -> Dict[str, Any]:
+    """Availability of the recent club store for dataset-info responses."""
+    events = recent_dir / "events.parquet"
+    manifest_path = recent_dir / "manifest.json"
+    manifest = None
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            manifest = None
+    event_count = None
+    if events.is_file():
+        event_count = pl.scan_parquet(events).select(pl.len()).collect().item()
+    return {
+        "recent_dir": str(recent_dir),
+        "available": events.is_file(),
+        "events": event_count,
+        "board_results": str(recent_dir / "board_results.parquet"),
+        "manifest": manifest,
+        "note": (
+            "Club listings overlay this store on the stage-1b parquets. "
+            "Rows remain until stage 3c absorbs their game date. "
+            "Elo ratings and double dummy stay on the historical files."
+        ),
+    }
+
+
 def files_to_ingest(
     club_ids: Sequence[int], archive: pathlib.Path, coverage: date
 ) -> List[pathlib.Path]:

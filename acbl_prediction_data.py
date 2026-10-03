@@ -421,6 +421,47 @@ def _stream_concat_shards(shards: list, out_path: pathlib.Path, label: str) -> N
     show_memory(f'after merge {label}')
 
 
+def _prediction_source_counts(src_paths, test_cutoff):
+    """One Date scan. Returns (date_min, date_max, {(year, is_test): row_count}).
+
+    is_test matches the train/test windows in the year loop: a year entirely
+    before test_cutoff is train, entirely on or after it is test, and a year
+    that contains the cutoff is split into those two groups.
+    """
+    grouped = (
+        pl.scan_parquet(src_paths)
+        .select(pl.col('Date').cast(pl.Date))
+        .filter(pl.col('Date').is_not_null())
+        .group_by(
+            pl.col('Date').dt.year().alias('year'),
+            (pl.col('Date') >= test_cutoff).alias('is_test'),
+        )
+        .agg(
+            pl.len().alias('n'),
+            pl.col('Date').min().alias('mn'),
+            pl.col('Date').max().alias('mx'),
+        )
+        .collect()
+    )
+    if grouped.is_empty():
+        raise RuntimeError("Source model data has no Date values")
+    lookup = {}
+    for row in grouped.iter_rows(named=True):
+        lookup[(int(row['year']), bool(row['is_test']))] = int(row['n'])
+    src_min = min(grouped['mn'].to_list())
+    src_max = max(grouped['mx'].to_list())
+    if isinstance(src_min, _dt.datetime):
+        src_min = src_min.date()
+    if isinstance(src_max, _dt.datetime):
+        src_max = src_max.date()
+    return src_min, src_max, lookup
+
+
+def _parquet_num_rows(path) -> int:
+    import pyarrow.parquet as pq
+    return pq.ParquetFile(str(path)).metadata.num_rows
+
+
 def prepare_prediction_data(
     club_or_tournament: str,
     *,
@@ -575,16 +616,14 @@ def prepare_prediction_data(
             print(f"  WARNING: --max-rows is ignored in chunk-years mode. "
                   f"Use --start-year / --end-year to limit the date range.")
 
-        # Determine year range from source Date column (cheap; uses parquet stats)
-        date_bounds = (
-            pl.scan_parquet(src_paths)
-            .select(
-                pl.col('Date').cast(pl.Date).min().alias('mn'),
-                pl.col('Date').cast(pl.Date).max().alias('mx'),
-            )
-            .collect()
-        )
-        src_min, src_max = date_bounds['mn'][0], date_bounds['mx'][0]
+        # Year range plus per-split row counts from one Date scan. The Elo
+        # joins are left joins on unique keys, so a year shard's footer row
+        # count equals this source count. A readable shard whose count still
+        # matches is unchanged; a month that gained rows will not.
+        print("Counting source rows per year/split (Date column only)...")
+        t_stats = time.time()
+        src_min, src_max, source_counts = _prediction_source_counts(src_paths, test_cutoff)
+        print(f"Source window stats in {time.time() - t_stats:.1f}s")
         year_lo = max(start_year, src_min.year) if start_year is not None else src_min.year
         year_hi = min(end_year,   src_max.year) if end_year   is not None else src_max.year
         print(f"Source Date range: [{src_min} .. {src_max}]; "
@@ -612,17 +651,30 @@ def prepare_prediction_data(
 
             for split, s_start, s_end in splits:
                 shard = shard_dir.joinpath(f"{split}_year={yr}.parquet")
+                src_n = source_counts.get((yr, split == 'test'), 0)
                 if shard.exists():
-                    # Only treat as resumable if the file is a valid parquet
-                    # (defends against partial writes from a killed run).
+                    # A readable parquet is not enough: the previous resume
+                    # kept 2026 shards whose Date max was still 2026-08-12
+                    # after the source had moved on. Rebuild unless the
+                    # footer row count still equals the source window.
                     try:
                         pl.read_parquet_schema(shard)
-                        print(f"\n[{yr}/{split}] shard already exists, skipping: {shard.name}")
-                        (train_shards if split == 'train' else test_shards).append(shard)
-                        continue
+                        shard_n = _parquet_num_rows(shard)
                     except Exception as e:
                         print(f"\n[{yr}/{split}] partial/invalid shard found "
                               f"({shard.name}: {e}); re-creating")
+                        try:
+                            shard.unlink()
+                        except OSError:
+                            pass
+                    else:
+                        if shard_n == src_n:
+                            print(f"\n[{yr}/{split}] shard matches source "
+                                  f"({src_n:,} rows), skipping: {shard.name}")
+                            (train_shards if split == 'train' else test_shards).append(shard)
+                            continue
+                        print(f"\n[{yr}/{split}] shard has {shard_n:,} rows but "
+                              f"source window has {src_n:,}; re-creating")
                         try:
                             shard.unlink()
                         except OSError:

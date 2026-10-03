@@ -24,15 +24,16 @@ echo  Approximate end-to-end wall time on the dev box
 echo  (512 GB RAM, 64-core CPU, NVMe E:/F:, RTX 5080, 1.8 TB K: pagefile):
 echo    Cold start (no caches, fresh DD/SD work): ~4.5-5 days
 echo      (~38 h Stage 3a + ~18 h Stage 3c + ~45 h Stage 5c + other stages).
-echo    Warm rerun (3a DD/SD cache hits; 3a/3c still rewrite full parquets): ~3.5 days
-echo      (Stages 2a-4 ~36 h + 5b ~2.5 h + 5c ~45 h; measured 2026-09-11 -^> 09-15).
+echo    Warm rewrite measured 2026-10-01 -^> 10-03 (log captured mid-5b):
+echo      1a 10h01m + 1b 7h56m + 3a 2h10m (DD/SD cache hit) + 3b 2m
+echo      + 3c 16h27m + 4 40m + 5a 4m (every shard skipped). 5b+ unfinished.
 echo    Stage 5c current baseline: ~45 h for all 6 models (2026-09-13 -^> 09-15).
 echo      club ~40 h, tournament ~5 h.
 echo    Stage 5d shows the prediction charts 5c no longer opens (close windows to finish).
 echo    Empirical bottlenecks per stage are noted as "TIME:" tags below.
 echo    Each step prints its own measured elapsed time as "TIME[step]: ..." lines.
-echo  Latest complete outputs: 2026-09-10 -^> 2026-09-15
-echo    (1c/1d skipped, expired JWT; 5c resumed after OOM and AppHang).
+echo  Latest measured stages: 2026-10-01 -^> 2026-10-03 (through 5a; 5b still running).
+echo    5c baseline remains 2026-09-13 -^> 09-15 (resumed after OOM and AppHang).
 echo  Model training results history: RESULTS.md (append an entry after each 5c run).
 echo ======================================================================
 echo.
@@ -49,9 +50,10 @@ echo [Stage 1] Data ingestion...
 :: ---- 1a ----
 :: READS:  (web scrape from my.acbl.org)
 :: WRITES: acbl/club-results/{club_id}/details/{session_id}.data.json
-:: TIME:   incremental; only fetches sessions not already on disk.
-::         Cold start (full ACBL backlog): many hours, network-bound.
-::         Daily incremental: ~minutes.
+:: TIME:   MEASURED 2026-10-01: 36066s (10h 1m), ended 22:44:56.
+::         1944 clubs, 7689 sessions extracted; last club 208 processed,
+::         2 already on disk, Failed: 0. Incremental, network-bound.
+::         A small daily catch-up is minutes; this pass was a full sweep.
 echo   [1a] Downloading club results to JSON...
 call :pyrun 1a acbl_club_download_to_json.py --sleep 2
 if errorlevel 1 goto :error
@@ -60,10 +62,11 @@ if errorlevel 1 goto :error
 :: READS:  acbl/club-results/*/details/*.data.json
 :: WRITES: acbl/club_results_parquet/*.parquet
 ::         acbl/acbl_club_results.sqlite   (same schema as legacy)
-:: TIME:   parallel JSON->Parquet->SQLite (option F). Cold rebuild target
-::         ~0.5-1.5 h on 64-core/512GB vs ~4 h legacy .data.sql path.
-::         Last run: parquet dir newest 2026-09-10 10:00, sqlite 18:00
-::         (138.7 GB). Use: python acbl_club_json_to_sql.py --legacy-sql-scripts
+:: TIME:   MEASURED 2026-10-01 22:45 -^> 10-02 06:40: 28533s (7h 56m).
+::         1,335,293 JSON files, err=0. Parquet merge 16m20s, sqlite
+::         preflight 6m44s, table load ~7h20m. Wrote acbl_club_results.sqlite
+::         139.34 GB. xmlFiles.parquet skipped (no schema table).
+::         Use: python acbl_club_json_to_sql.py --legacy-sql-scripts
 echo   [1b] Loading club JSON into SQLite (via Parquet)...
 call :pyrun 1b acbl_club_json_to_sql.py
 if errorlevel 1 goto :error
@@ -72,7 +75,11 @@ if errorlevel 1 goto :error
 :: READS:  (ACBL API via ACBL_API_KEY)
 :: WRITES: acbl/tournaments/events/{sanction_id}.sanction.json
 :: TIME:   incremental; ~minutes daily, ~1-2 h cold start (API-rate-limited).
+::         A rejected or expired ACBL_API_KEY falls back to live.acbl.org.
 ::         2026-09 cycle skipped (expired JWT). Newest sanction JSON 2026-08-14.
+::         2026-10-02 console printed this banner, then Stage 3 started 4s
+::         after 1b (06:40:29 -^> 06:40:33). 1c-2b were not remeasured;
+::         cleaned parquets were not rebuilt from the new sqlite.
 echo   [1c] Downloading tournament sanctioned events...
 call :pyrun 1c acbl_tournament_download_sanctioned_events.py
 if errorlevel 1 goto :error
@@ -83,6 +90,8 @@ if errorlevel 1 goto :error
 :: TIME:   incremental; ~minutes daily, several hours cold start (API-bound).
 ::         90s read timeout covers large NABC full_monty payloads.
 ::         HTTP 400/404 (unpublished / no boards) do not fail the step.
+::         A rejected or expired ACBL_API_KEY falls back to live.acbl.org
+::         (same Chrome/Cloudflare download path as club results).
 ::         2026-09 cycle skipped (expired JWT). Newest session JSON 2026-09-02.
 echo   [1d] Downloading tournament sessions...
 call :pyrun 1d acbl_tournament_download_sessions_using_sanctioned_events.py --timeout 90
@@ -143,10 +152,10 @@ echo [Stage 3] Augmentation...
 ::         acbl/acbl_{club,tournament}_hand_records_augmented_narrow.parquet
 :: TIME:   COLD START ~38 h for 747K novel PBNs (batched SD pipeline; CPU-bound).
 ::         WARM compute is cache hits, but this step still rewrites the full
-::         augmented parquets. MEASURED 2026-09-11 04:27-16:30 (~12 h):
-::         club 71.2 GB @ 16:13, tournament 4.1 GB @ 16:30.
-::         Daily incremental (few new PBNs, no full rewrite) is still ~minutes.
-::         Longest single step in a cold rebuild; 3c is longer on a warm rewrite.
+::         augmented parquets. MEASURED 2026-10-02 06:40-08:50: 7777s (2h 10m).
+::         Club 7214s (20.93M rows, 71.2 GB), tournament 556s (2.05M rows, 4.1 GB).
+::         DD/Par/SD pbns_to_process=0. Previous warm rewrite 2026-09-11 was ~12 h.
+::         3c is longer on a warm rewrite.
 echo   [3a] Augmenting hand records (DD + SD + Par)...
 call :pyrun 3a acbl_hand_records_augment.py
 if errorlevel 1 goto :error
@@ -154,8 +163,9 @@ if errorlevel 1 goto :error
 :: ---- 3b ----
 :: READS:  acbl/acbl_{club,tournament}_board_results_cleaned.parquet
 :: WRITES: acbl/acbl_{club,tournament}_board_results_augmented_step1.parquet
-:: TIME:   MEASURED 2026-09-11 16:30-16:33 (~3 min). Club 9.7 GB,
-::         tournament 0.54 GB. Was ~5-15 min.
+:: TIME:   MEASURED 2026-10-02 08:50-08:52: 128s. Club 105s
+::         (152.4M cleaned -^> 120.87M step1, 9.7 GB), tournament 17s
+::         (31.77M -^> 27.77M, 0.54 GB).
 echo   [3b] Augmenting board results (step 1: contracts + vulnerability)...
 call :pyrun 3b acbl_board_results_augment_step1.py
 if errorlevel 1 goto :error
@@ -164,9 +174,10 @@ if errorlevel 1 goto :error
 :: READS:  acbl/acbl_{club,tournament}_board_results_augmented_step1.parquet
 ::         acbl/acbl_{club,tournament}_hand_records_augmented.parquet
 :: WRITES: acbl/acbl_{club,tournament}_board_results_augmented.parquet
-:: TIME:   MEASURED 2026-09-11 16:33 -^> 09-12 10:59 (~18.4 h). Club 82.4 GB
-::         @ 08:07, tournament 19.6 GB @ 10:59. Was ~30-60 min at smaller
-::         volume. Joins ~6k-col hand-record features into board results.
+:: TIME:   MEASURED 2026-10-02 08:52 -^> 10-03 01:19: 59213s (16h 27m).
+::         Club 47221s, 70,827,715 rows, 82.4 GB. Tournament 11970s,
+::         18,667,922 rows, 19.6 GB. Club Date max 2026-09-09.
+::         Joins ~6k-col hand-record features into board results.
 echo   [3c] Augmenting board results (step 2: join hand records + full augmentation)...
 call :pyrun 3c acbl_board_results_augment_step2.py
 if errorlevel 1 goto :error
@@ -182,9 +193,9 @@ echo [Stage 4] Elo ratings...
 :: WRITES: acbl/acbl_{club,tournament}_elo_ratings.parquet
 ::         acbl/acbl_{club,tournament}_player_elo_ratings.parquet  -> elo, postmortem-acbl
 ::         acbl/acbl_{club,tournament}_pair_elo_ratings.parquet    -> elo, postmortem-acbl
-:: TIME:   MEASURED 2026-09-12 10:59-12:01 (~62 min). Club ~50 min,
-::         tournament ~12 min. Walks games chronologically; mostly
-::         single-threaded.
+:: TIME:   MEASURED 2026-10-03 01:19-01:59: 2418s (40m). Club 1937s
+::         (70.83M rows), tournament 475s (18.67M rows). Walks games
+::         chronologically; mostly single-threaded.
 echo   [4] Computing Elo ratings (player + pair)...
 call :pyrun 4 acbl_elo_ratings_create.py
 if errorlevel 1 goto :error
@@ -203,12 +214,16 @@ echo [Stage 5] ML model pipeline...
 ::         (default --no-merge-shards since 2026-08-16: the single-file merge
 ::         took ~12 h for club and made downstream reads SLOWER; consumers
 ::         now scan the shard glob with file-level Date pruning instead)
-:: TIME:   MEASURED 2026-09-12: successful resume (shards already valid)
-::         ~1 min both modes (manifests 22:36). Club 96 monthly shards +
-::         manifest, 85.9 GB. Tournament 132 shards + manifest, 14.3 GB.
-::         A failed club pass the same day ran ~10.5 h (12:02-22:31) before
-::         the unregistered-column assert; that is the current cold-club
-::         cost. Tournament was 889 s / 15.3 GB on 2026-08-16.
+:: TIME:   MEASURED 2026-10-03 02:01-02:03: 231s. Every monthly shard
+::         was skipped. That run treated a readable schema as valid, so
+::         club shards stayed at Date max 2026-08-12 while the augmented
+::         parquet reached 2026-09-09. Skip now rebuilds a month when its
+::         source row count changed (manifest source_rows). Shards written
+::         before that field existed rebuild when the window Date max moved.
+::         Manifests then: club 96 shards, 69,445,246 rows, 85.9 GB;
+::         tournament 132 shards, 16,732,751 rows, 14.3 GB.
+::         Cold club rebuild was ~10.5 h on 2026-09-12. Tournament cold
+::         was 889 s / 15.3 GB on 2026-08-16.
 echo   [5a] Building model data...
 call :pyrun 5a acbl_model_data.py
 if errorlevel 1 goto :error
@@ -221,10 +236,13 @@ if errorlevel 1 goto :error
 ::         acbl/acbl_{club,tournament}_pair_elo_ratings.parquet
 :: WRITES: acbl/acbl_{club,tournament}_prediction_data_train.parquet
 ::         acbl/acbl_{club,tournament}_prediction_data_test.parquet
-:: TIME:   MEASURED 2026-09-12 22:36 -^> 09-13 01:06 (~2.5 h) reading
-::         monthly shards (not the old merged file):
+:: TIME:   Last complete run 2026-09-12 22:36 -^> 09-13 01:06 (~2.5 h)
+::         reading monthly shards (not the old merged file):
 ::           club       ~2.1 h (61.71M train + 7.74M test; 203.5 + 20.4 GB).
 ::           tournament ~21 min (15.70M train + 1.03M test; 41.6 + 2.7 GB).
+::         2026-10-03 run was still going when the log was captured:
+::         club 2019/train finished in 317s (24.07 GB); 2020/train had
+::         just started. Shard Date max on that pass was 2026-08-12.
 ::         Earlier 2026-04 run against the single merged file was club 7.3 h
 ::         / tournament ~30-60 min (see script docstring "KNOWN ISSUE").
 echo   [5b] Preparing prediction data (train/test split)...

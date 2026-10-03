@@ -18,7 +18,10 @@ Why year-chunking:
     Bounding the plan to one calendar year at a time caps the row count at
     ~6-8M (instead of 58.8M for club) and reduces the worst-case memory by
     the same factor. Each year sinks to a shard, then a final streaming
-    concat merges them. Resume-safe: existing valid shards are skipped.
+    concat merges them. Resume-safe: a shard is skipped only when the source
+    window still has the row count stored in manifest.json (source_rows).
+    Older shards, which lack that field, are skipped only when their Date
+    max still equals the source window.
 
 Architecture:
     1. Eager schema-validation prelude (unchanged): build 0-row joined schema,
@@ -263,13 +266,16 @@ def _stream_concat_shards(shards, out_path, *, label):
     return size
 
 
-def _write_shard_manifest(shard_dir, shards, *, label):
+def _write_shard_manifest(shard_dir, shards, *, label, source_by_file=None):
     """Write manifest.json describing the complete shard set.
 
     Consumers assert every listed file still exists (and optionally check
     row totals) before scanning the shard glob, so a manually deleted or
     half-written shard fails fast instead of silently dropping months.
     Row counts are read from parquet footers only (~1 s for ~100 shards).
+    source_by_file records the pre-join board-results row count for each
+    window so the next run can rebuild a month that gained or lost rows.
+    The inner join means shard row count is not that source count.
     """
     import json
     import pyarrow.parquet as pq
@@ -281,7 +287,13 @@ def _write_shard_manifest(shard_dir, shards, *, label):
         if not s.exists():
             continue
         n = pq.ParquetFile(str(s)).metadata.num_rows
-        entries.append({'file': s.name, 'rows': n, 'bytes': s.stat().st_size})
+        entry = {'file': s.name, 'rows': n, 'bytes': s.stat().st_size}
+        extra = (source_by_file or {}).get(s.name)
+        if extra is not None:
+            entry['source_rows'] = int(extra['source_rows'])
+            if extra.get('source_date_max'):
+                entry['source_date_max'] = extra['source_date_max']
+        entries.append(entry)
         total_rows += n
     manifest = {
         'label': label,
@@ -294,6 +306,146 @@ def _write_shard_manifest(shard_dir, shards, *, label):
     path.write_text(json.dumps(manifest, indent=1), encoding='utf-8')
     print(f"Wrote {path}: {len(entries)} shards, {total_rows:,} rows")
     return manifest
+
+
+def _as_date(value):
+    """Normalize polars/pyarrow date stats to datetime.date."""
+    from datetime import date, datetime
+    if value is None:
+        return None
+    if hasattr(value, 'as_py'):
+        value = value.as_py()
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return value
+
+
+def _read_recorded_source_rows(shard_dir):
+    """filename -> source_rows from the previous manifest, if that field exists."""
+    import json
+    path = shard_dir.joinpath('manifest.json')
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    recorded = {}
+    for entry in data.get('shards', []):
+        if 'source_rows' in entry and entry.get('file'):
+            recorded[entry['file']] = int(entry['source_rows'])
+    return recorded
+
+
+def _parquet_num_rows(path):
+    import pyarrow.parquet as pq
+    return pq.ParquetFile(str(path)).metadata.num_rows
+
+
+def _parquet_date_max(path):
+    """Date max from parquet column statistics, falling back to a column scan."""
+    import pyarrow.parquet as pq
+    pf = pq.ParquetFile(str(path))
+    names = list(pf.schema_arrow.names)
+    if 'Date' not in names:
+        return None
+    idx = names.index('Date')
+    mx = None
+    for rg_i in range(pf.metadata.num_row_groups):
+        stats = pf.metadata.row_group(rg_i).column(idx).statistics
+        if stats is None or not stats.has_min_max:
+            mx = None
+            break
+        v = _as_date(stats.max)
+        if v is None:
+            mx = None
+            break
+        if mx is None or v > mx:
+            mx = v
+    else:
+        return mx
+    value = pl.scan_parquet(path).select(pl.col('Date').max()).collect().item()
+    return _as_date(value)
+
+
+def _source_window_stats(source_file, windows):
+    """One Date scan. Map each [start, end) window to (row_count, date_max)."""
+    from dateutil.relativedelta import relativedelta
+    monthly = (
+        pl.scan_parquet(source_file)
+        .select(pl.col('Date').cast(pl.Date))
+        .filter(pl.col('Date').is_not_null())
+        .group_by(pl.col('Date').dt.truncate('1mo').alias('month'))
+        .agg(
+            pl.len().alias('n'),
+            pl.col('Date').max().alias('mx'),
+        )
+        .collect()
+    )
+    by_month = {}
+    for row in monthly.iter_rows(named=True):
+        month = _as_date(row['month'])
+        by_month[month] = (int(row['n']), _as_date(row['mx']))
+    stats = {}
+    for w_start, w_end in windows:
+        n = 0
+        mx = None
+        cur = w_start
+        while cur < w_end:
+            got = by_month.get(cur)
+            if got:
+                month_n, month_mx = got
+                n += month_n
+                if month_mx is not None and (mx is None or month_mx > mx):
+                    mx = month_mx
+            cur = cur + relativedelta(months=1)
+        stats[(w_start, w_end)] = (n, mx)
+    return stats
+
+
+def _model_shard_is_current(shard, src_n, src_mx, recorded_source_n, shard_label):
+    """True when the shard can be skipped. Unreadable or stale shards are deleted."""
+    try:
+        pl.read_parquet_schema(shard)
+        shard_n = _parquet_num_rows(shard)
+    except Exception as e:
+        print(f"[{shard_label}] shard exists but unreadable ({e}); "
+              f"deleting and re-creating")
+        shard.unlink()
+        return False
+    if src_n == 0:
+        if shard_n == 0:
+            print(f"[{shard_label}] shard matches empty source; skipping")
+            return True
+        print(f"[{shard_label}] source window is empty but shard has "
+              f"{shard_n:,} rows; rebuilding")
+        shard.unlink()
+        return False
+    if recorded_source_n is not None:
+        if recorded_source_n == src_n:
+            print(f"[{shard_label}] shard matches source ({src_n:,} rows, "
+                  f"max {src_mx}); skipping")
+            return True
+        print(f"[{shard_label}] source rows {recorded_source_n:,} -> {src_n:,} "
+              f"(max {src_mx}); rebuilding")
+        shard.unlink()
+        return False
+    if shard_n == 0:
+        print(f"[{shard_label}] shard is empty but source has {src_n:,} rows "
+              f"(max {src_mx}); rebuilding")
+        shard.unlink()
+        return False
+    shard_mx = _parquet_date_max(shard)
+    if shard_mx == src_mx:
+        print(f"[{shard_label}] shard Date max {shard_mx} matches source "
+              f"({src_n:,} rows); skipping")
+        return True
+    print(f"[{shard_label}] shard Date max {shard_mx} != source {src_mx} "
+          f"({src_n:,} rows); rebuilding")
+    shard.unlink()
+    return False
 
 
 def create_model_data(
@@ -1028,6 +1180,12 @@ def create_model_data(
         shard_dir = acblPath.joinpath(f'shards_{club_or_tournament}_model_data')
         shard_dir.mkdir(exist_ok=True)
         print(f"Shard dir: {shard_dir}")
+        recorded_source_rows = _read_recorded_source_rows(shard_dir)
+        print("Counting source rows per month (Date column only)...")
+        t_stats = time.time()
+        source_stats = _source_window_stats(acbl_board_results_augmented_file, windows)
+        print(f"Source window stats in {time.time() - t_stats:.1f}s")
+        source_by_file = {}
 
         shards = []
         for w_start, w_end in windows:
@@ -1038,15 +1196,15 @@ def create_model_data(
             shard_label = f'{w_start.isoformat()}_{w_end.isoformat()}'
             shard = shard_dir.joinpath(f'window={shard_label}.parquet')
             shards.append(shard)
-            if shard.exists():
-                try:
-                    pl.read_parquet_schema(shard)
-                    print(f"[{shard_label}] shard exists and is valid; skipping")
-                    continue
-                except Exception as e:
-                    print(f"[{shard_label}] shard exists but unreadable ({e}); "
-                          f"deleting and re-creating")
-                    shard.unlink()
+            src_n, src_mx = source_stats[(w_start, w_end)]
+            source_by_file[shard.name] = {
+                'source_rows': src_n,
+                'source_date_max': None if src_mx is None else src_mx.isoformat(),
+            }
+            if shard.exists() and _model_shard_is_current(
+                shard, src_n, src_mx, recorded_source_rows.get(shard.name), shard_label,
+            ):
+                continue
 
             d_start_lit = pl.lit(w_start.isoformat()).str.to_date()
             d_end_lit = pl.lit(w_end.isoformat()).str.to_date()
@@ -1096,7 +1254,9 @@ def create_model_data(
         # shard set is complete before scanning the glob. Row counts come
         # from parquet footers only (cheap), so this also covers shards that
         # were skip-resumed from an earlier run.
-        _write_shard_manifest(shard_dir, shards, label=club_or_tournament)
+        _write_shard_manifest(
+            shard_dir, shards, label=club_or_tournament, source_by_file=source_by_file,
+        )
 
         if merge_shards:
             non_empty_shards = [s for s in shards if s.stat().st_size > 0]

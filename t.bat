@@ -1,13 +1,15 @@
 @echo off
 setlocal EnableExtensions
-:: Resume after 5c stopped mid tournament Pct_NS (2026-09-15 08:31).
-:: Already done this run:
-::   1e-4, 5a, 5b
-::   5c club DD / Contract / Pct_NS
-::   5c tournament DD / Contract
-:: Tournament Pct_NS: schema + 16 shards written 08:16-08:25; epochs 1-7
-:: ran then the process exited. .pth is still 2026-08-26. Restart that
-:: target only, reusing the leftover shards (epochs restart from 1).
+:: Resume after the 2026-10-01 club download.
+:: Already done and not repeated here:
+::   1a  club JSON (1944 clubs, 7689 sessions, Failed: 0)
+::   1b  acbl_club_results.sqlite (139.34 GB, err=0, finished 2026-10-02 06:40)
+:: That console printed the 1c banner and then Stage 3 four seconds later.
+:: 1c-2b never ran, so 3a-4 rewrote the previous cleaned parquets
+:: (club Date max 2026-09-09) and 5a skipped every monthly shard.
+:: 5b was reading shards whose Date max was 2026-08-12.
+:: This run cleans that sqlite and rebuilds through prediction data.
+:: 5c and 5d stay out until those prediction parquets exist.
 set "PY=%~dp0.venv\Scripts\python.exe"
 if not exist "%PY%" (
   echo *** FAILED: project venv not found: %PY%
@@ -19,12 +21,11 @@ set PYTHONIOENCODING=utf-8
 set PYTHONUNBUFFERED=1
 set MPLBACKEND=Agg
 set "STEP_OK=%TEMP%\acbl_all_step.ok"
-set "PTH_CHECK=e:\bridge\data\acbl\SavedModels\acbl_tournament_predicted_pct_ns_torch_model.pth"
 echo ======================================================================
-echo  ACBL pipeline resume (5c tournament Pct_NS only)
-echo  Skipped: 1a-4, 5a, 5b, club 5c, tournament DD/Contract
-echo  Running: 5c  acbl_prediction_train.py --reuse-shards --tournament --target Pct_NS
-echo           5d  acbl_prediction_charts.py  (interactive charts; close windows to finish)
+echo  ACBL pipeline resume (1c through 5b)
+echo  Skipped: 1a, 1b (sqlite already has the 2026-10-01 download)
+echo  Running: 1c 1d 1e  2a 2b  3a 3b 3c  4  5a 5b
+echo  Not in this bat: 5c train, 5d charts
 echo ======================================================================
 echo.
 echo Using: %PY%
@@ -32,18 +33,57 @@ echo Start: %date% %time%
 echo.
 call :now PIPE_T0
 
-echo [Stage 5] ML model pipeline...
-echo   [5c] Training tournament Pct_NS (reuse leftover shards)...
-call :pyrun 5c acbl_prediction_train.py --reuse-shards --tournament --target Pct_NS
-if errorlevel 1 goto :error
-call :freshpth "%PTH_CHECK%" %PIPE_T0%
+echo [Stage 1] Data ingestion...
+echo   [1c] Downloading tournament sanctioned events...
+call :pyrun 1c acbl_tournament_download_sanctioned_events.py
 if errorlevel 1 goto :error
 
-:: 5d: same as acbl_all.bat. Shows every completed model's charts
-:: (club + tournament, all targets that have artifacts), not just Pct_NS.
-echo   [5d] Showing prediction charts (close the figure windows to finish)...
-set "MPLBACKEND="
-call :pyrun 5d acbl_prediction_charts.py
+echo   [1d] Downloading tournament sessions...
+call :pyrun 1d acbl_tournament_download_sessions_using_sanctioned_events.py --timeout 90
+if errorlevel 1 goto :error
+
+echo   [1e] Loading tournament sessions into SQLite...
+call :pyrun 1e acbl_tournament_sessions_json_to_sql.py
+if errorlevel 1 goto :error
+
+echo.
+echo [Stage 2] Cleaning...
+echo   [2a] Cleaning hand records...
+call :pyrun 2a acbl_sql_to_hand_records_clean.py
+if errorlevel 1 goto :error
+
+echo   [2b] Cleaning board results...
+call :pyrun 2b acbl_sql_to_board_results_clean.py
+if errorlevel 1 goto :error
+
+echo.
+echo [Stage 3] Augmentation...
+echo   [3a] Augmenting hand records (DD + SD + Par)...
+call :pyrun 3a acbl_hand_records_augment.py
+if errorlevel 1 goto :error
+
+echo   [3b] Augmenting board results (step 1: contracts + vulnerability)...
+call :pyrun 3b acbl_board_results_augment_step1.py
+if errorlevel 1 goto :error
+
+echo   [3c] Augmenting board results (step 2: join hand records + full augmentation)...
+call :pyrun 3c acbl_board_results_augment_step2.py
+if errorlevel 1 goto :error
+
+echo.
+echo [Stage 4] Elo ratings...
+echo   [4] Computing Elo ratings (player + pair)...
+call :pyrun 4 acbl_elo_ratings_create.py
+if errorlevel 1 goto :error
+
+echo.
+echo [Stage 5] ML model pipeline...
+echo   [5a] Building model data...
+call :pyrun 5a acbl_model_data.py
+if errorlevel 1 goto :error
+
+echo   [5b] Preparing prediction data (train/test split)...
+call :pyrun 5b acbl_prediction_data.py
 if errorlevel 1 goto :error
 
 echo.
@@ -55,8 +95,7 @@ set /a PIPE_H=PIPE_ELAPSED/3600
 set /a PIPE_M=(PIPE_ELAPSED %% 3600)/60
 set /a PIPE_S=PIPE_ELAPSED %% 60
 echo  TIME[total]: %PIPE_ELAPSED%s (%PIPE_H%h %PIPE_M%m %PIPE_S%s)
-echo  Tournament sessions are as of the last successful 1d (JWT still expired).
-echo  Re-run acbl_all.bat from 1c after a new ACBL_API_KEY.
+echo  Prediction parquets now include the post-1b clean. Run 5c after this.
 echo ======================================================================
 del /q "%STEP_OK%" 2>nul
 goto :eof
@@ -73,12 +112,6 @@ exit /b 0
 
 :now
 for /f %%t in ('powershell -NoProfile -Command "[DateTimeOffset]::Now.ToUnixTimeSeconds()"') do set "%~1=%%t"
-goto :eof
-
-:freshpth
-:: Fail if %1 does not exist or its mtime is older than unix seconds %2.
-powershell -NoProfile -Command "$p='%~1'; $t0=[int64]'%~2'; if (-not (Test-Path -LiteralPath $p)) { Write-Host ('*** FAILED: missing model {0}' -f $p); exit 1 }; $u=[DateTimeOffset](Get-Item -LiteralPath $p).LastWriteTime.ToUniversalTime(); if ($u.ToUnixTimeSeconds() -lt $t0) { Write-Host ('*** FAILED: stale model {0}' -f $p); exit 1 }; Write-Host ('Verified fresh model: {0}' -f $p); exit 0"
-if errorlevel 1 exit /b 1
 goto :eof
 
 :toc

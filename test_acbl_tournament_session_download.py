@@ -18,9 +18,11 @@ from acbl_tournament_download_sessions_using_sanctioned_events import (
     build_session_ids_from_sanctioned_events,
     canonical_event_id,
     download_tournament_sessions,
+    sessions_still_needed,
     expired_api_key_message,
     is_unavailable_http,
     jwt_expiry_unix,
+    api_key_rejection_reason,
     session_request_timeout,
 )
 
@@ -79,6 +81,10 @@ class TournamentSessionDiscoveryTests(unittest.TestCase):
         )
         self.assertIsNone(expired_api_key_message(token, now=1_000_000_000))
         self.assertIsNone(expired_api_key_message("not-a-jwt"))
+        self.assertIsNotNone(api_key_rejection_reason(None))
+        self.assertIsNotNone(api_key_rejection_reason("  "))
+        self.assertIsNotNone(api_key_rejection_reason(token, now=1_000_000_000 + 120))
+        self.assertIsNone(api_key_rejection_reason("not-a-jwt"))
 
     def test_audit_reports_only_sessions_without_json_or_sql(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -188,6 +194,7 @@ class TournamentSessionDiscoveryTests(unittest.TestCase):
             get.assert_called_once()
             self.assertEqual(stats.errors, 1)
             self.assertTrue(stats.aborted)
+            self.assertTrue(stats.auth_rejected)
             self.assertTrue(stats.failed())
 
     def test_download_exhausted_timeout_is_hard_error(self) -> None:
@@ -206,6 +213,18 @@ class TournamentSessionDiscoveryTests(unittest.TestCase):
             self.assertEqual(stats.errors, 1)
             self.assertEqual(stats.unavailable, 0)
             self.assertTrue(stats.failed())
+
+    def test_sessions_still_needed_leaves_saved_files_out(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            (output_dir / "2604346-1001-1.session.json").write_text("{}", encoding="utf-8")
+            (output_dir / "2604346-1001-2.session.sql").write_text("select 1", encoding="utf-8")
+            pending, saved = sessions_still_needed(
+                ["2604346-1001-1", "2604346-1001-2", "2604346-1001-3"],
+                output_dir,
+            )
+        self.assertEqual(saved, 2)
+        self.assertEqual(pending, ["2604346-1001-3"])
 
     def test_acbl_builder_persists_elo_from_first_session(self) -> None:
         self.assertEqual(

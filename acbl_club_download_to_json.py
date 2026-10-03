@@ -79,26 +79,43 @@ def _launch_browser_context(p):
     )
 
 
-def _page_has_acbl_payload(content: str) -> bool:
-    """True when the HTML looks like a real ACBL results page, not a CF interstitial."""
+def _is_aws_waf_challenge(content: str) -> bool:
+    """True for the AWS WAF interstitial in front of live.acbl.org."""
     if not content:
         return False
-    # Details pages embed session JSON; list pages expose the Vue/app shell + links.
+    return any(marker in content for marker in ("gokuProps", "challenge-container", "awswaf.com"))
+
+
+def _page_has_acbl_payload(content: str) -> bool:
+    """True when the HTML looks like a real ACBL results page, not a challenge interstitial."""
+    if not content or _is_aws_waf_challenge(content):
+        return False
+    # Club details pages embed session JSON; list pages expose the Vue/app shell.
+    # live.acbl.org renders tournament HTML (no ``var data =``).
     return (
         "var data =" in content
         or ('id="app"' in content and "/club-results/" in content)
         or 'href="/club-results/details/' in content
+        or 'id="events"' in content
+        or 'class="tournaments"' in content
+        or "tablesorter scorecard" in content
+        or 'id="board-' in content
+        or "/ajax/tourn-list/" in content
     )
 
 
 def _is_cloudflare_challenge(page, content: str) -> bool:
     """
-    Detect an active Cloudflare interstitial.
+    Detect an active Cloudflare or AWS WAF interstitial.
 
     Do NOT treat bare 'cf-chl' / 'challenge-platform' substrings as sufficient
     once real ACBL payload is present — cleared pages can still mention those
     strings in leftover scripts and would otherwise loop forever.
+    A WAF page (gokuProps / challenge-container) is still a challenge even when
+    its title is empty and the Cloudflare markers are absent.
     """
+    if _is_aws_waf_challenge(content):
+        return True
     if _page_has_acbl_payload(content):
         return False
     title = ""
@@ -165,13 +182,28 @@ def _try_click_turnstile(page) -> None:
         pass
 
 
-def _wait_through_cloudflare(page, timeout_ms: int = 180000) -> bool:
+# Someone often is not at the machine when Turnstile appears. Three minutes
+# expired before the check could be clicked (2026-10-03, title stayed
+# 'ACBL Live'). Keep waiting, and reload: a refresh often replaces the
+# interstitial once the clearance cookie is set.
+CHALLENGE_TIMEOUT_MS = 6 * 60 * 60 * 1000
+CHALLENGE_RELOAD_S = 30
+
+
+def _wait_through_cloudflare(
+    page,
+    timeout_ms: int = CHALLENGE_TIMEOUT_MS,
+    reload_after_s: float = CHALLENGE_RELOAD_S,
+) -> bool:
     """
     After navigating, wait out a Cloudflare managed/JS challenge interstitial.
 
     Real Chrome usually clears the challenge automatically within a few seconds.
     Interactive Turnstile needs a visible window (and sometimes a human click);
-    we bring the window forward and print instructions.
+    we bring the window forward and print instructions. Every
+    ``reload_after_s`` the page is refreshed, which often dismisses a stuck
+    challenge without a click. The wait defaults to six hours so an unattended
+    run is still sitting on the check when someone returns.
 
     Returns:
         True once real page content is loaded.
@@ -180,8 +212,10 @@ def _wait_through_cloudflare(page, timeout_ms: int = 180000) -> bool:
         Forbidden403Error if the challenge never clears within timeout_ms.
     """
     deadline = time.time() + timeout_ms / 1000.0
+    started = time.time()
     announced = False
     last_status = 0.0
+    last_reload = time.time()
     clicked = False
     while time.time() < deadline:
         content = ""
@@ -196,30 +230,43 @@ def _wait_through_cloudflare(page, timeout_ms: int = 180000) -> bool:
             except Exception:
                 pass
             if announced:
-                print("  Cloudflare challenge cleared.")
+                print("  Cloudflare/WAF challenge cleared.")
             return True
 
         if not announced:
-            print("  Cloudflare challenge detected; waiting for it to clear...")
+            print("  Cloudflare/WAF challenge detected; waiting for it to clear...")
             print("  -> Chrome window should be visible. If you see 'Verify you are human', click it.")
+            print(f"  -> Refreshing every {int(reload_after_s)}s. A reload often clears this without a click.")
+            print(f"  -> This wait lasts up to {int(timeout_ms / 3600000)}h, so it is still here when you come back.")
             print(f"  -> Profile: {PROFILE_DIR}")
-            print("  -> If this hangs every run, delete that profile folder and retry.")
             _bring_page_window_forward(page)
             announced = True
+            last_reload = time.time()
 
         if not clicked:
             _try_click_turnstile(page)
             clicked = True
 
         now = time.time()
+        if announced and reload_after_s >= 0 and now - last_reload >= reload_after_s:
+            print("  refreshing the page; a reload often clears the challenge")
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=90000)
+            except Exception as exc:
+                print(f"  refresh failed ({exc}); still waiting")
+            last_reload = time.time()
+            clicked = False
+            _try_click_turnstile(page)
+            continue
+
         if now - last_status >= 15:
             title = ""
             try:
                 title = page.title() or ""
             except Exception:
                 pass
-            remaining = int(deadline - now)
-            print(f"  ... still waiting ({remaining}s left); title={title!r}")
+            elapsed_m = int((now - started) / 60)
+            print(f"  ... still waiting ({elapsed_m}m elapsed); title={title!r}")
             _bring_page_window_forward(page)
             _try_click_turnstile(page)
             last_status = now
@@ -270,6 +317,79 @@ def _get_browser_page():
     except Exception as e:
         print(f"  Warning: session warm-up failed ({e}); continuing anyway")
     return _PAGE
+
+
+def _reset_browser_page() -> None:
+    """Drop the shared tab after a cancelled navigation and open a fresh one.
+
+    ``net::ERR_ABORTED`` leaves the shared page mid-navigation. The next
+    ``goto`` on that same tab usually aborts too. A new tab keeps the
+    persistent profile and its Cloudflare cookie.
+    """
+    global _PAGE
+    page = _PAGE
+    _PAGE = None
+    try:
+        if page is not None:
+            page.close()
+    except Exception:
+        pass
+    if _CONTEXT is None:
+        return
+    try:
+        _PAGE = _CONTEXT.new_page()
+    except Exception as exc:
+        print(f"  could not open a new tab ({exc}); restarting Chrome")
+        _shutdown_browser()
+
+
+def _transient_navigation_error(exc: BaseException) -> bool:
+    message = str(exc)
+    return any(
+        token in message
+        for token in ("ERR_", "net::", "Timeout", "timeout", "Target closed", "frame was detached")
+    )
+
+
+def fetch_acbl_page(url: str, timeout_ms: int = 180000) -> str:
+    """
+    Open ``url`` in the shared real-Chrome session and return its HTML.
+
+    Club and live.acbl.org pages both go through this. The persistent profile
+    keeps the Cloudflare clearance cookie warm, and the waiter holds the
+    on-screen window until a Cloudflare or AWS WAF interstitial finishes.
+    A cancelled navigation (``net::ERR_ABORTED``) retries on a fresh tab.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        page = _get_browser_page()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=90000)
+            _wait_through_cloudflare(page)
+            for _ in range(8):
+                try:
+                    return page.content()
+                except Exception as exc:
+                    last_error = exc
+                    page.wait_for_timeout(400)
+            raise Forbidden403Error(f"Could not read page content for {url}: {last_error}")
+        except Forbidden403Error:
+            raise
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt >= 3 or not _transient_navigation_error(exc):
+                raise
+            print(f"  navigation failed for {url} ({exc}); retry {attempt}/3")
+            _reset_browser_page()
+            time.sleep(2 * attempt)
+    raise Forbidden403Error(f"Could not open {url}: {last_error}")
+
+
+def shutdown_acbl_browser() -> None:
+    """Close the shared Chrome session started by :func:`fetch_acbl_page`."""
+    _shutdown_browser()
 
 
 def _shutdown_browser() -> None:

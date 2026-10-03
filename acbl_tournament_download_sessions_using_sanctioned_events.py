@@ -22,7 +22,8 @@ Behavior:
   - 400/404 are unavailable (cancelled, unpublished, no boards) and do not
     fail the run; they are retried on the next invocation
   - Timeouts and 429/5xx are retried; exhausted attempts fail the run
-  - 401/403 abort immediately (invalid or expired ACBL_API_KEY)
+  - 401/403 stop the API and fall back to live.acbl.org pages
+    (same Chrome/Cloudflare path as club downloading)
 """
 
 from __future__ import annotations
@@ -82,6 +83,21 @@ def jwt_expiry_unix(api_key: str) -> int | None:
         return int(exp) if exp is not None else None
     except (ValueError, TypeError, json.JSONDecodeError, OSError):
         return None
+
+
+def api_key_rejection_reason(
+    api_key: str | None,
+    *,
+    now: float | None = None,
+) -> str | None:
+    """Return why the API must not be called, or None when the key may be tried.
+
+    A missing key and an expired JWT never reach the API. A key that is not a
+    JWT is tried; HTTP 401/403 is still a rejection and uses the webpage path.
+    """
+    if not (api_key or "").strip():
+        return "ERROR: ACBL_API_KEY environment variable not set."
+    return expired_api_key_message(api_key or "", now=now)
 
 
 def expired_api_key_message(
@@ -177,6 +193,32 @@ def session_request_timeout(timeout_seconds: int) -> tuple[float, float]:
     return (connect, read)
 
 
+def sessions_still_needed(
+    session_ids: list[str],
+    output_dir: pathlib.Path,
+    *,
+    skip_json: bool = True,
+    skip_sql: bool = True,
+) -> tuple[list[str], int]:
+    """Split ids into those with no saved artifact, and the count already saved.
+
+    A later run of the downloader used to walk the full id list from index 0
+    and print a skip line per file. Saved ``.session.json`` / ``.session.sql``
+    files were not fetched again, but the counter restarted at 0/N and the
+    new work did not begin until every earlier id had been stat'ed.
+    """
+    pending: list[str] = []
+    saved = 0
+    for session_id in session_ids:
+        has_sql = skip_sql and (output_dir / f"{session_id}.session.sql").is_file()
+        has_json = skip_json and (output_dir / f"{session_id}.session.json").is_file()
+        if has_sql or has_json:
+            saved += 1
+            continue
+        pending.append(session_id)
+    return pending, saved
+
+
 def is_unavailable_http(status_code: int) -> bool:
     """True for permanent-for-this-run HTTP statuses (unpublished / no boards)."""
     return status_code in UNAVAILABLE_HTTP_STATUSES
@@ -189,6 +231,7 @@ class DownloadStats:
     errors: int = 0
     unavailable: int = 0
     aborted: bool = False
+    auth_rejected: bool = False
     unavailable_ids: list[str] = field(default_factory=list)
 
     def failed(self) -> bool:
@@ -307,6 +350,7 @@ def download_tournament_sessions(
         if response.status_code in AUTH_HTTP_STATUSES:
             stats.errors += 1
             stats.aborted = True
+            stats.auth_rejected = True
             print(
                 f"ERROR: HTTP {response.status_code} unauthorized/forbidden "
                 f"for {session_id}. ACBL_API_KEY is invalid or expired; stopping."
@@ -469,17 +513,17 @@ def main() -> int:
             "When supplied, sanctioned-event discovery is skipped."
         ),
     )
+    parser.add_argument(
+        "--web",
+        action="store_true",
+        help="Download from live.acbl.org instead of the API",
+    )
 
     args = parser.parse_args()
 
     api_key = args.api_key or os.getenv("ACBL_API_KEY")
-    if not api_key:
-        print("ERROR: ACBL_API_KEY environment variable not set")
-        return 1
-    expiry_msg = expired_api_key_message(api_key)
-    if expiry_msg:
-        print(expiry_msg)
-        return 1
+    rejection = None if args.web else api_key_rejection_reason(api_key)
+    use_web = bool(args.web or rejection)
 
     events_dir = acblPath.joinpath(args.events_dir)
     sessions_dir = acblPath.joinpath(args.sessions_dir)
@@ -496,6 +540,11 @@ def main() -> int:
     print(f"Start/end:    {args.start}/{args.end or 'all'}")
     print(f"Timeout:      {session_request_timeout(args.timeout)} (connect, read)")
     print(f"Sleep:        {args.sleep}s")
+    if use_web:
+        print("Source:       live.acbl.org webpages")
+        if rejection:
+            print(rejection)
+            print("API PAT unavailable; using the live.acbl.org webpage fallback.")
     print()
 
     session_ids = (
@@ -508,23 +557,70 @@ def main() -> int:
     else:
         print(f"Derived {len(session_ids):,} unique sessions from sanctioned events")
 
-    stats = download_tournament_sessions(
-        session_ids=session_ids,
-        api_key=api_key,
-        output_dir=sessions_dir,
-        full_monty=args.full_monty,
-        timeout=args.timeout,
-        max_attempts=args.max_attempts,
-        sleep_seconds=args.sleep,
-        starting_nfile=args.start,
-        ending_nfile=args.end,
-        skip_if_json_exists=args.skip_if_json_exists,
-        skip_if_sql_exists=args.skip_if_sql_exists,
-    )
     selected_end = args.end or len(session_ids)
-    selected_ids = session_ids[args.start:selected_end]
+    audit_ids = session_ids[args.start:selected_end]
+    saved = 0
+    if args.skip_if_json_exists or args.skip_if_sql_exists:
+        selected_ids, saved = sessions_still_needed(
+            audit_ids,
+            sessions_dir,
+            skip_json=args.skip_if_json_exists,
+            skip_sql=args.skip_if_sql_exists,
+        )
+        print(
+            f"Already saved: {saved:,}. "
+            f"Fetching {len(selected_ids):,} remaining "
+            f"(saved session files are not downloaded again)."
+        )
+    else:
+        selected_ids = audit_ids
+
+    def _web_download(ids: list[str]) -> DownloadStats:
+        from acbl_tournament_live_download import download_sessions_from_web
+
+        return download_sessions_from_web(
+            session_ids=ids,
+            output_dir=sessions_dir,
+            sleep_seconds=args.sleep,
+            skip_if_json_exists=args.skip_if_json_exists,
+            skip_if_sql_exists=args.skip_if_sql_exists,
+        )
+
+    if use_web:
+        stats = _web_download(selected_ids)
+    else:
+        stats = download_tournament_sessions(
+            session_ids=selected_ids,
+            api_key=api_key or "",
+            output_dir=sessions_dir,
+            full_monty=args.full_monty,
+            timeout=args.timeout,
+            max_attempts=args.max_attempts,
+            sleep_seconds=args.sleep,
+            starting_nfile=0,
+            ending_nfile=0,
+            skip_if_json_exists=args.skip_if_json_exists,
+            skip_if_sql_exists=args.skip_if_sql_exists,
+        )
+        if stats.auth_rejected:
+            print("API PAT rejected; switching remaining sessions to live.acbl.org.")
+            remaining = [
+                session_id
+                for session_id in selected_ids
+                if not (sessions_dir / f"{session_id}.session.json").is_file()
+                and not (sessions_dir / f"{session_id}.session.sql").is_file()
+            ]
+            web = _web_download(remaining)
+            stats.written += web.written
+            stats.skipped += web.skipped
+            stats.unavailable += web.unavailable
+            stats.unavailable_ids.extend(web.unavailable_ids)
+            stats.errors = web.errors
+            stats.aborted = web.aborted
+            stats.auth_rejected = False
+    stats.skipped += saved
     missing = audit_session_artifacts(
-        selected_ids,
+        audit_ids,
         sessions_dir,
         unavailable_ids=stats.unavailable_ids,
     )

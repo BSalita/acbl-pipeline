@@ -31,6 +31,7 @@ from dotenv import load_dotenv
 
 from acbl_tournament_download_sessions_using_sanctioned_events import (
     AcblApiAuthError,
+    api_key_rejection_reason,
     expired_api_key_message,
 )
 
@@ -256,27 +257,22 @@ Environment:
         default=None,
         help='ACBL API key (default: from ACBL_API_KEY env var)'
     )
+    parser.add_argument(
+        '--web',
+        action='store_true',
+        help='Download from live.acbl.org instead of the API'
+    )
     
     args = parser.parse_args()
     
     # Get API key
     if args.api_key:
         api_key = args.api_key
-    
-    if not api_key:
-        print("ERROR: ACBL_API_KEY environment variable not set")
-        print("Set it with: export ACBL_API_KEY=your_key_here")
-        print("Or use --api-key argument")
-        print("Get an API key at: https://api.acbl.org")
-        return 1
-    expiry_msg = expired_api_key_message(api_key)
-    if expiry_msg:
-        print(expiry_msg)
-        return 1
-    
-    # Resolve output directory
+
     output_dir = acblPath.joinpath(args.output_dir)
-    
+    rejection = None if args.web else api_key_rejection_reason(api_key)
+    use_web = bool(args.web or rejection)
+
     print("=" * 70)
     print("ACBL Tournament Events Downloader")
     print("=" * 70)
@@ -285,24 +281,52 @@ Environment:
     print(f"Date range: {args.start_date or '2013-01-01'} to {args.end_date or 'today'}")
     print(f"Limit: {args.limit or 'unlimited'}")
     print(f"Sleep: {args.sleep}s between requests")
+    if use_web:
+        print("Source: live.acbl.org webpages")
+        if rejection:
+            print(rejection)
+            print("API PAT unavailable; using the live.acbl.org webpage fallback.")
     print()
-    
+
     from mlBridge import print_started, print_ended
     program_start = print_started()
     print()
 
-    try:
-        write_count = download_events(
-            api_key=api_key,
+    def _from_web() -> int:
+        from acbl_tournament_live_download import download_events_from_web
+        return download_events_from_web(
             output_dir=output_dir,
             start_date=args.start_date,
             end_date=args.end_date,
             limit=args.limit,
             sleep_seconds=args.sleep,
-            page_size=args.page_size
         )
-    except AcblApiAuthError as exc:
-        print(exc)
+
+    try:
+        if use_web:
+            write_count = _from_web()
+        else:
+            try:
+                write_count = download_events(
+                    api_key=api_key,
+                    output_dir=output_dir,
+                    start_date=args.start_date,
+                    end_date=args.end_date,
+                    limit=args.limit,
+                    sleep_seconds=args.sleep,
+                    page_size=args.page_size
+                )
+            except AcblApiAuthError as exc:
+                print(exc)
+                print("API PAT rejected; switching to live.acbl.org webpage fallback.")
+                write_count = _from_web()
+    except Exception as exc:
+        if type(exc).__name__ == "Forbidden403Error":
+            print(exc)
+            return 1
+        raise
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user")
         return 1
 
     print()

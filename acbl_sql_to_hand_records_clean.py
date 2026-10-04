@@ -50,6 +50,33 @@ rootPath = pathlib.Path('e:/bridge/data')
 acblPath = rootPath.joinpath('acbl')
 
 
+_PAR_CONTRACT_RE = re.compile(r'(\d)([CDHSN])(\**)-(NS|EW|[NSEW])([\+\-]\d)?')
+
+
+def _parse_acbl_par(value: str) -> tuple:
+    """Parse ``Par: <score> <contracts>``.
+
+    Tournament all-pass rows are stored as ``0``, which becomes ``Par: 0``.
+    Club rows and the other tournament rows are ``Par: +140 3H-NS/3S-NS``.
+    """
+    parts = value.split(' ')
+    assert parts[0] == 'Par:', value
+    score = int(parts[1])
+    if score == 0 and len(parts) == 2:
+        return (0, [(0, '', '', '', 0)])
+    assert len(parts) == 3, value
+    if score == 0:
+        return (0, [(0, '', '', '', 0)])
+    contracts = []
+    for contract in parts[2].replace('NT', 'N').split('/'):
+        bid = _PAR_CONTRACT_RE.match(contract)
+        assert bid is not None, value
+        level, suit, double, direction, result = bid.groups()
+        contracts.append((int(level), suit, double, direction, 0 if result is None else int(result)))
+    assert contracts, value
+    return (score, contracts)
+
+
 def clean_hand_records(hrs_df):
     # common to club and tournament
     print(f"Initial hrs_df shape: {hrs_df.shape}")
@@ -181,24 +208,7 @@ def clean_hand_records(hrs_df):
     # todo: eliminate for-loop by using replace() with a list of regex? Or using map/apply?
     print("Processing ACBL Par scores...")
     assert hrs_df['ACBL_Par'].str.starts_with('Par: ').all()
-    acbl_par_l = []
-    for v in hrs_df['ACBL_Par']:
-        split_comma = v.split(' ')
-        assert split_comma[0] == 'Par:'
-        assert len(split_comma) == 3
-        score = int(split_comma[1])
-        split_slash = split_comma[2].replace('NT','N').split('/')
-        assert len(split_slash) > 0
-        pars_l = []
-        acbl_par_l.append((score, pars_l))
-        if score == 0: # all pass is par score
-            pars_l.append((0,'','','',0))
-            continue
-        for contract in split_slash:
-            bid = re.match(r'(\d)([CDHSN])(\**)-(NS|EW|[NSEW])([\+\-]\d)?',contract)
-            assert len(bid.groups()) > 0
-            level, suit, double, direction, result = bid.groups()
-            pars_l.append((int(level),suit,double,direction,0 if result is None else int(result)))
+    acbl_par_l = [_parse_acbl_par(v) for v in hrs_df['ACBL_Par']]
 
     hrs_df = hrs_df.with_columns(pl.Series('ACBL_Par', acbl_par_l, dtype=pl.Object)) # , strict=False?
     print(f"Updated ACBL_Par column")

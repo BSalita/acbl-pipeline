@@ -13,6 +13,10 @@ class ParParseTests(unittest.TestCase):
             (140, [(3, "H", "", "NS", 0), (3, "S", "", "NS", 0)]),
         )
 
+    def test_blank_and_unknown_sign_are_dropped(self) -> None:
+        self.assertIsNone(_parse_acbl_par("Par: "))
+        self.assertIsNone(_parse_acbl_par("Par: ?90 1NT-SW"))
+
     def test_notrump_doubled_off_one(self) -> None:
         self.assertEqual(
             _parse_acbl_par("Par: -100 5S*-NS-1"),

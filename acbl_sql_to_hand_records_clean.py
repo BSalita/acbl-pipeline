@@ -53,27 +53,36 @@ acblPath = rootPath.joinpath('acbl')
 _PAR_CONTRACT_RE = re.compile(r'(\d)([CDHSN])(\**)-(NS|EW|[NSEW])([\+\-]\d)?')
 
 
-def _parse_acbl_par(value: str) -> tuple:
+def _parse_acbl_par(value: str) -> tuple | None:
     """Parse ``Par: <score> <contracts>``.
 
     Tournament all-pass rows are stored as ``0``, which becomes ``Par: 0``.
     Club rows and the other tournament rows are ``Par: +140 3H-NS/3S-NS``.
+    Blank pars become ``Par:`` with no score. A leading ``?`` is an unknown
+    sign. Both are returned as None so the caller can drop those rows.
     """
-    parts = value.split(' ')
-    assert parts[0] == 'Par:', value
-    score = int(parts[1])
+    parts = value.split()
+    if len(parts) < 2 or parts[0] != 'Par:':
+        return None
+    try:
+        score = int(parts[1])
+    except ValueError:
+        return None
     if score == 0 and len(parts) == 2:
         return (0, [(0, '', '', '', 0)])
-    assert len(parts) == 3, value
+    if len(parts) != 3:
+        return None
     if score == 0:
         return (0, [(0, '', '', '', 0)])
     contracts = []
     for contract in parts[2].replace('NT', 'N').split('/'):
         bid = _PAR_CONTRACT_RE.match(contract)
-        assert bid is not None, value
+        if bid is None:
+            return None
         level, suit, double, direction, result = bid.groups()
         contracts.append((int(level), suit, double, direction, 0 if result is None else int(result)))
-    assert contracts, value
+    if not contracts:
+        return None
     return (score, contracts)
 
 
@@ -208,7 +217,13 @@ def clean_hand_records(hrs_df):
     # todo: eliminate for-loop by using replace() with a list of regex? Or using map/apply?
     print("Processing ACBL Par scores...")
     assert hrs_df['ACBL_Par'].str.starts_with('Par: ').all()
-    acbl_par_l = [_parse_acbl_par(v) for v in hrs_df['ACBL_Par']]
+    parsed = [_parse_acbl_par(v) for v in hrs_df['ACBL_Par']]
+    keep = [item is not None for item in parsed]
+    dropped = len(keep) - sum(keep)
+    print(f"Dropping {dropped} rows with unparsed ACBL par")
+    if dropped:
+        hrs_df = hrs_df.filter(pl.Series('keep_par', keep))
+    acbl_par_l = [item for item in parsed if item is not None]
 
     hrs_df = hrs_df.with_columns(pl.Series('ACBL_Par', acbl_par_l, dtype=pl.Object)) # , strict=False?
     print(f"Updated ACBL_Par column")

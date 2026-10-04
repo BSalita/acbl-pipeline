@@ -797,6 +797,17 @@ def get_club_sessions(club_number: str, output_dir: pathlib.Path, refresh: bool 
                 # Combine all page content and cache to disk
                 combined_content = '\n'.join(all_content)
                 content = combined_content
+                if not _page_has_acbl_payload(content):
+                    # A 403 or challenge page has no session links. Saving it
+                    # would replace a good listing and look like an empty club.
+                    print(
+                        f"ERROR: Club {club_number} page was not ACBL results "
+                        f"HTML ({len(content)} bytes). Not saving it."
+                    )
+                    raise Forbidden403Error(
+                        f"Club {club_number} page was not ACBL results HTML "
+                        f"({len(content)} bytes)"
+                    )
 
                 with open(club_html_file, 'w', encoding='utf-8') as f:
                     f.write(content)

@@ -281,6 +281,14 @@ class LiveTournamentParseTests(unittest.TestCase):
         club = '<html><script>var data = {"x": 1};</script></html>'
         self.assertFalse(_is_cloudflare_challenge(page, club))
 
+    def test_forbidden_page_is_not_a_club_listing(self) -> None:
+        from acbl_club_download_to_json import _page_has_acbl_payload
+
+        forbidden = "<html><head><title>403 Forbidden</title></head><body><h1>403 Forbidden</h1></body></html>"
+        self.assertFalse(_page_has_acbl_payload(forbidden))
+        listing = '<html><a href="/club-results/details/100">Mon</a></html>'
+        self.assertTrue(_page_has_acbl_payload(listing))
+
 
 class SavedLivePageTests(unittest.TestCase):
     def test_probed_events_hands_and_scorecard(self) -> None:

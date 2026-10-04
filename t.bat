@@ -8,7 +8,9 @@ setlocal EnableExtensions
 :: 1c-2b never ran, so 3a-4 rewrote the previous cleaned parquets
 :: (club Date max 2026-09-09) and 5a skipped every monthly shard.
 :: 5b was reading shards whose Date max was 2026-08-12.
-:: This run cleans that sqlite and rebuilds through prediction data.
+:: 1c-1e finished on 2026-10-04. 2a then stopped because Windows
+:: blocked the ADBC SQLite driver; cleaning now reads through DuckDB.
+:: This resume starts at 2a and rebuilds through prediction data.
 :: 5c and 5d stay out until those prediction parquets exist.
 set "PY=%~dp0.venv\Scripts\python.exe"
 if not exist "%PY%" (
@@ -22,9 +24,9 @@ set PYTHONUNBUFFERED=1
 set MPLBACKEND=Agg
 set "STEP_OK=%TEMP%\acbl_all_step.ok"
 echo ======================================================================
-echo  ACBL pipeline resume (1c through 5b)
-echo  Skipped: 1a, 1b (sqlite already has the 2026-10-01 download)
-echo  Running: 1c 1d 1e  2a 2b  3a 3b 3c  4  5a 5b
+echo  ACBL pipeline resume (2a through 5b)
+echo  Skipped: 1a, 1b, 1c, 1d, 1e
+echo  Running: 2a 2b  3a 3b 3c  4  5a 5b
 echo  Not in this bat: 5c train, 5d charts
 echo ======================================================================
 echo.
@@ -32,19 +34,6 @@ echo Using: %PY%
 echo Start: %date% %time%
 echo.
 call :now PIPE_T0
-
-echo [Stage 1] Data ingestion...
-echo   [1c] Downloading tournament sanctioned events...
-call :pyrun 1c acbl_tournament_download_sanctioned_events.py
-if errorlevel 1 goto :error
-
-echo   [1d] Downloading tournament sessions...
-call :pyrun 1d acbl_tournament_download_sessions_using_sanctioned_events.py --timeout 90
-if errorlevel 1 goto :error
-
-echo   [1e] Loading tournament sessions into SQLite...
-call :pyrun 1e acbl_tournament_sessions_json_to_sql.py
-if errorlevel 1 goto :error
 
 echo.
 echo [Stage 2] Cleaning...

@@ -32,6 +32,8 @@ import time
 import re
 import sys
 
+from acbl_sqlite_read import read_sqlite_query
+
 _SRC_DIR = pathlib.Path(__file__).resolve().parent.parent
 _MLBRIDGE = _SRC_DIR / 'mlBridge'
 if not _MLBRIDGE.is_dir():
@@ -284,12 +286,11 @@ def club_hand_records_clean():
     db_connection_string = 'sqlite:///'+acblPath.joinpath(f'acbl_club_results.sqlite').as_posix()
     print(f"Database connection string: {db_connection_string}")
 
-    # takes 1m30s/5s using adbc. alternative engine is 'connectx'.
     uri = db_connection_string
     dfs_adbc = {}
     for table,schema in schema_d.items():
         print(f"Reading table:{table}")
-        dfs_adbc[table] = pl.read_database_uri(query=sql_selects_d[table], uri=uri, engine="adbc", schema_overrides=schema)
+        dfs_adbc[table] = read_sqlite_query(uri, sql_selects_d[table], schema)
     print(f"Tables read: {list(dfs_adbc.keys())}")
 
     hrs_df = dfs_adbc["hand_records"]
@@ -379,12 +380,11 @@ def tournament_hand_records_clean():
     db_connection_string = 'sqlite:///'+acblPath.joinpath(f'acbl_tournament_results.sqlite').as_posix()
     print(f"Database connection string: {db_connection_string}")
 
-    # takes 1m30s/5s using adbc. alternative engine is 'connectx'.
     uri = db_connection_string
     dfs_adbc = {}
     for table,schema in schema_d.items():
         print(f"Reading table:{table}")
-        dfs_adbc[table] = pl.read_database_uri(query=sql_selects_d[table], uri=uri, engine="adbc", schema_overrides=schema)
+        dfs_adbc[table] = read_sqlite_query(uri, sql_selects_d[table], schema)
     print(f"Tables read: {list(dfs_adbc.keys())}")
     # usage
     hrs_df = dfs_adbc["handrecord"]

@@ -36,6 +36,29 @@ class SqliteReadTests(unittest.TestCase):
             self.assertEqual(frame["is_virtual_game"].to_list(), [False, True])
             self.assertEqual(frame["hand_record_id"].to_list(), ["10", "SHUFFLE"])
 
+    def test_sqlite_cast_keeps_a_leading_integer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pairs.sqlite"
+            con = sqlite3.connect(path)
+            con.execute("CREATE TABLE board_results (ns_pair TEXT, ew_pair TEXT, mp_total TEXT)")
+            con.executemany(
+                "INSERT INTO board_results VALUES (?, ?, ?)",
+                [("2-NS", "15", "12.5x"), ("NS", None, None), ("", "3", "nope")],
+            )
+            con.commit()
+            con.close()
+
+            frame = read_sqlite_query(
+                "sqlite:///" + path.as_posix(),
+                "SELECT CAST(ns_pair AS INTEGER) AS ns_pair, "
+                "CAST(ew_pair AS INTEGER) AS ew_pair, "
+                "CAST(mp_total AS REAL) AS mp_total FROM board_results",
+                {"ns_pair": pl.UInt16, "ew_pair": pl.UInt16, "mp_total": pl.Float32},
+            )
+            self.assertEqual(frame["ns_pair"].to_list(), [2, 0, 0])
+            self.assertEqual(frame["ew_pair"].to_list(), [15, None, 3])
+            self.assertEqual(frame["mp_total"].to_list(), [12.5, None, 0.0])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -57,6 +57,17 @@ mlBridgeLib.pd_options_display()
 rootPath = pathlib.Path('e:/bridge/data')
 acblPath = rootPath.joinpath('acbl')
 
+# A clean pair id list is null or a JSON array of numbers. Some tournament
+# rows are truncated mid-name, e.g. [1590227,Al Ober], and json_decode aborts
+# the whole column on the first one.
+_PAIR_ID_CLEAN = r'^(?i)\s*(?:null|\[(?:\s*"?[0-9]+"?(?:\s*,\s*"?[0-9]+"?)*)?\s*\])\s*$'
+_PAIR_ID_TOKEN = r'#[0-9]+|[0-9]+'
+
+
+def pair_id_list(column: str) -> pl.Expr:
+    """Player-number tokens from a pair id column. Names and broken JSON are skipped."""
+    return pl.col(column).str.extract_all(_PAIR_ID_TOKEN).alias(column)
+
 
 def get_club_schemas():
     """Return SQL selects and schemas for club data."""
@@ -439,6 +450,11 @@ def tournament_board_results_clean():
     
     # Process columns
     print("Processing and cleaning columns...")
+    for column in ("pair_acbl_ns", "pair_acbl_ew"):
+        messy = brs_df.filter(
+            pl.col(column).is_not_null() & ~pl.col(column).str.contains(_PAIR_ID_CLEAN)
+        ).height
+        print(f"Pair ids with non-numeric text in {column}: {messy}")
     brs_df = brs_df.with_columns(
         pl.when(pl.col('declarer').is_null() | pl.col('declarer').eq('')).then(None).otherwise('declarer').replace_strict(mlBridgeLib.Direction_to_NESW_d, return_dtype=pl.Utf8).alias('declarer'),
         pl.when(pl.col('score_ns') == 'PASS').then(0).otherwise(pl.col('score_ns').cast(pl.Int16, strict=False)).alias('score_ns'),
@@ -449,14 +465,14 @@ def tournament_board_results_clean():
             pl.col('board_number').sub(1).cast(pl.String)
         ]).alias('hand_record_id'),
         pl.col('board_result_id_ns').str.split('-').list.slice(0, 4).list.join('-').alias('section_id'),
-        pl.col("pair_acbl_ns").str.json_decode(pl.List(pl.String)),
+        pair_id_list("pair_acbl_ns"),
         pl.col("pair_names_ns")
             .str.replace_all(r'^\[|\]$', '')
             .str.replace_all(r'"', '')
             # remove '(swap names)' suffix that's in some player names. Doesn't seem to be any in tournament data.
             #.str.replace(r'\s*\(swap names\)\s*$', '', literal=False)
             .str.split(","),
-        pl.col("pair_acbl_ew").str.json_decode(pl.List(pl.String)),
+        pair_id_list("pair_acbl_ew"),
         pl.col("pair_names_ew")
             .str.replace_all(r'^\[|\]$', '')
             .str.replace_all(r'"', '')

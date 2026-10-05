@@ -573,6 +573,9 @@ def tournament_board_results_clean():
                 .agg([
                     pl.col("MasterPoints").first().alias("MasterPoints")
                 ])
+                # Club ids are integers. Tournament ids stay strings because a
+                # few are temporary numbers such as #155.
+                .with_columns(pl.col("Player_ID").cast(pl.String))
             )
             
             # Join MasterPoints to tournament data for each position

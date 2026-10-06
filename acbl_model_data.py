@@ -1040,8 +1040,12 @@ def create_model_data(
     combined0_df = combined0_df.select(pl.exclude(dtypes_to_exclude))
     print(f"Final schema: {combined0_df.shape[1]} columns, {len(deal_features_to_join)} deal features to join")
 
-    # takes 0s
-    # todo: move game_status lists to mlBridgeAi? That way there's no need for the acbl_club_model_data_d.pkl file.
+    # TODO: Replace this pickle with JSON. The catalog is one record per column
+    # (name, game_state integer, dtype name, regex, feature group), not a
+    # bridge-results table, so parquet is the wrong format. Pickle stores the
+    # features_enum and Polars dtype objects, so the file breaks if those move
+    # and it can list columns the shards do not have. Write
+    # acbl_{club,tournament}_model_data_d.json and have step 5b read that.
     acbl_club_model_data_d_filename = f"acbl_{club_or_tournament}_model_data_d.pkl"
     acbl_club_model_data_d_file = acblPath.joinpath(acbl_club_model_data_d_filename)
     with open(acbl_club_model_data_d_file, 'wb') as f:

@@ -552,6 +552,8 @@ def prepare_prediction_data(
     show_memory('start')
 
     # --- 1. Load game-state column metadata --------------------------------
+    # TODO: Read acbl_{mode}_model_data_d.json instead of this pickle.
+    # The replacement is noted on the writer in acbl_model_data.py.
     gs_pkl = acblPath.joinpath(f"acbl_{club_or_tournament}_model_data_d.pkl")
     with open(gs_pkl, 'rb') as f:
         game_state_columns = pickle.load(f)

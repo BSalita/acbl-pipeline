@@ -429,6 +429,62 @@ def _stream_concat_shards(shards: list, out_path: pathlib.Path, label: str) -> N
     show_memory(f'after merge {label}')
 
 
+_TEXT_ID_COLUMNS = ("Player_ID_N", "Player_ID_E", "Player_ID_S", "Player_ID_W", "Declarer_ID")
+_SHARD_SCHEMA_CACHE: dict[str, pl.Schema] = {}
+
+
+def _shard_schema(path) -> pl.Schema:
+    key = str(path)
+    schema = _SHARD_SCHEMA_CACHE.get(key)
+    if schema is None:
+        schema = pl.scan_parquet(path).collect_schema()
+        _SHARD_SCHEMA_CACHE[key] = schema
+    return schema
+
+
+def _scan_source_shards(src_paths, columns: list[str]) -> pl.LazyFrame:
+    """Scan model-data shards that do not all share one schema.
+
+    Newer months add columns such as Is_Sacrifice_Opportunity, and some of
+    those files store player ids as integers. Group identical projections,
+    cast the id columns to text, and fill a column the file does not have
+    with null.
+    """
+    paths = [src_paths] if isinstance(src_paths, (str, pathlib.Path)) else list(src_paths)
+    union: dict[str, pl.DataType] = {}
+    groups: dict[tuple, list] = {}
+    for path in paths:
+        schema = _shard_schema(path)
+        for name, dtype in schema.items():
+            union.setdefault(name, dtype)
+        signature = tuple(
+            (name, str(schema[name]) if name in schema else None) for name in columns
+        )
+        groups.setdefault(signature, []).append((path, schema))
+
+    frames = []
+    for group in groups.values():
+        schema = group[0][1]
+        exprs = []
+        for name in columns:
+            if name not in schema:
+                exprs.append(pl.lit(None).cast(union[name]).alias(name))
+            elif name in _TEXT_ID_COLUMNS and schema[name] != pl.String:
+                exprs.append(pl.col(name).cast(pl.String, strict=False).alias(name))
+            else:
+                exprs.append(pl.col(name))
+        frames.append(
+            pl.scan_parquet(
+                [path for path, _schema in group],
+                extra_columns="ignore",
+                missing_columns="insert",
+            ).select(exprs)
+        )
+    if len(frames) == 1:
+        return frames[0]
+    return pl.concat(frames, how="vertical_relaxed")
+
+
 def _prediction_source_counts(src_paths, test_cutoff):
     """One Date scan. Returns (date_min, date_max, {(year, is_test): row_count}).
 
@@ -437,7 +493,7 @@ def _prediction_source_counts(src_paths, test_cutoff):
     that contains the cutoff is split into those two groups.
     """
     grouped = (
-        pl.scan_parquet(src_paths)
+        _scan_source_shards(src_paths, ["Date"])
         .select(pl.col('Date').cast(pl.Date))
         .filter(pl.col('Date').is_not_null())
         .group_by(
@@ -549,7 +605,7 @@ def prepare_prediction_data(
     # Used to count final columns and verify no leftover String/List/Object/
     # Struct columns. Pure schema walk; no data materialised.
     diag_lf = _build_joined_plan(
-        pl.scan_parquet(src_paths).select(sorted(read_cols)).head(0),
+        _scan_source_shards(src_paths, sorted(read_cols)).head(0),
         player_elo=player_elo, pair_elo=pair_elo,
     )
     diag_schema = diag_lf.collect_schema()
@@ -581,10 +637,10 @@ def prepare_prediction_data(
     # ======================================================================
     if not chunk_years:
         print("\nBuilding single lazy plan (no year chunking)...")
-        base = pl.scan_parquet(src_paths).select(sorted(read_cols))
+        base = _scan_source_shards(src_paths, sorted(read_cols))
         if max_rows is not None:
             if recent:
-                total_rows = pl.scan_parquet(src_paths).select(pl.len()).collect()[0, 0]
+                total_rows = _scan_source_shards(src_paths, ["Date"]).select(pl.len()).collect()[0, 0]
                 offset = max(0, total_rows - max_rows)
                 actual_take = min(max_rows, total_rows)
                 base = base.slice(offset, actual_take)
@@ -693,8 +749,7 @@ def prepare_prediction_data(
                 t = time.time()
 
                 base = (
-                    pl.scan_parquet(src_paths)
-                    .select(sorted(read_cols))
+                    _scan_source_shards(src_paths, sorted(read_cols))
                     .filter(
                         (pl.col('Date').cast(pl.Date) >= s_start)
                         & (pl.col('Date').cast(pl.Date) < s_end)

@@ -1,8 +1,11 @@
 import unittest
+import tempfile
+from datetime import date
+from pathlib import Path
 
 import polars as pl
 
-from acbl_prediction_data import _build_joined_plan
+from acbl_prediction_data import _build_joined_plan, _scan_source_shards
 
 
 class EloJoinTests(unittest.TestCase):
@@ -36,6 +39,37 @@ class EloJoinTests(unittest.TestCase):
         self.assertEqual(out["Elo_N_N"].to_list(), [1500.0])
         self.assertEqual(out["Elo_N_E"].to_list(), [1600.0])
         self.assertEqual(out["Elo_N_W"].to_list(), [None])
+
+
+class ShardScanTests(unittest.TestCase):
+    def test_integer_ids_and_extra_columns_scan_together(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "old.parquet"
+            new = Path(tmp) / "new.parquet"
+            pl.DataFrame(
+                {
+                    "Date": [date(2020, 1, 1)],
+                    "Player_ID_N": ["111"],
+                }
+            ).write_parquet(old)
+            pl.DataFrame(
+                {
+                    "Date": [date(2026, 8, 1)],
+                    "Player_ID_N": pl.Series([5798205], dtype=pl.Int32),
+                    "Is_Sacrifice_Opportunity": [True],
+                }
+            ).write_parquet(new)
+            out = (
+                _scan_source_shards(
+                    [old, new],
+                    ["Date", "Player_ID_N", "Is_Sacrifice_Opportunity"],
+                )
+                .collect()
+                .sort("Date")
+            )
+            self.assertEqual(out["Player_ID_N"].dtype, pl.String)
+            self.assertEqual(out["Player_ID_N"].to_list(), ["111", "5798205"])
+            self.assertEqual(out["Is_Sacrifice_Opportunity"].to_list(), [None, True])
 
 
 if __name__ == "__main__":

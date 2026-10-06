@@ -2421,6 +2421,7 @@ _POSTMORTEM_BOARD_COLUMNS = [
     "Board", "Contract", "Declarer_Direction", "Declarer_ID", "Declarer_Name",
     "Result", "Tricks", "Score_NS", "Score_EW", "Pct_NS", "Pct_EW",
     "MP_NS", "MP_EW", "MP_Top", "Par_NS",
+    "Par_Contract_NS", "Par_Contract_EW", "Is_Sacrifice_Opportunity",
     "Pair_Number_NS", "Pair_Number_EW", "PBN",
 ]
 _POSTMORTEM_CONTEXT_COLUMNS = [

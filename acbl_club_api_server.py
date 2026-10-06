@@ -246,6 +246,7 @@ def get_postmortem_boards(
     limit: int = Query(svc.DEFAULT_ROW_LIMIT, ge=1, le=svc.MAX_ROW_LIMIT),
     refresh: bool = Query(False),
 ) -> dict:
+    """Default columns include Par_Contract_NS, Par_Contract_EW (+1/-1), and Is_Sacrifice_Opportunity."""
     return svc.postmortem_boards(
         session_id,
         player_id,

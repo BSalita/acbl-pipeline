@@ -7,7 +7,10 @@ setlocal EnableExtensions
 :: and Is_Sacrifice_Opportunity are only on the newest shards.
 :: Deleting the shard dirs forces a cold 5a. Last measured cold rebuild:
 :: club ~10.5 h (2026-09-12), tournament 889s (2026-08-16).
-:: 5b is then rerun from the new shards. 5c and 5d stay out.
+:: 5b is then rerun from the new shards, then 5c trains.
+:: 5c baseline ~45 h for 6 models (2026-09-13 -^> 09-15: club ~40 h,
+:: tournament ~5 h). Needs at least 1.5 TiB free on F: (SavedModels).
+:: 5d charts stay out.
 set "PY=%~dp0.venv\Scripts\python.exe"
 if not exist "%PY%" (
   echo *** FAILED: project venv not found: %PY%
@@ -20,12 +23,13 @@ set PYTHONUNBUFFERED=1
 set MPLBACKEND=Agg
 set "STEP_OK=%TEMP%\acbl_all_step.ok"
 echo ======================================================================
-echo  ACBL pipeline resume: rebuild model shards, then 5b
+echo  ACBL pipeline resume: rebuild model shards, then 5b, then 5c
 echo  Skipped: 1a through 4, and the 5b that is already running
 echo  Running: delete shards_club_model_data and shards_tournament_model_data
 echo           5a acbl_model_data.py
 echo           5b acbl_prediction_data.py
-echo  Not in this bat: 5c train, 5d charts
+echo           5c acbl_prediction_train.py (~45 h)
+echo  Not in this bat: 5d charts
 echo ======================================================================
 echo.
 echo Using: %PY%
@@ -58,6 +62,11 @@ call :pyrun 5b acbl_prediction_data.py
 if errorlevel 1 goto :error
 
 echo.
+echo [5c] Training prediction models...
+call :pyrun 5c acbl_prediction_train.py
+if errorlevel 1 goto :error
+
+echo.
 echo ======================================================================
 echo  Resume complete: %date% %time%
 call :now PIPE_T1
@@ -68,7 +77,7 @@ set /a PIPE_S=PIPE_ELAPSED %% 60
 echo  TIME[total]: %PIPE_ELAPSED%s (%PIPE_H%h %PIPE_M%m %PIPE_S%s)
 echo  Model shards now include the par-contract and sacrifice columns.
 echo  Train and test files still omit them: 5b reads game states 0-4.
-echo  5c train and 5d charts are not in this bat.
+echo  5d charts are not in this bat.
 echo ======================================================================
 del /q "%STEP_OK%" 2>nul
 goto :eof

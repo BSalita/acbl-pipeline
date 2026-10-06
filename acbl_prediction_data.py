@@ -371,6 +371,11 @@ def _build_joined_plan(
     plan_schema = lf.collect_schema()
     if 'section_name' not in plan_schema.names():
         lf = lf.with_columns(pl.lit(None).cast(pl.String).alias('section_name'))
+    # Tournament shards disagree: most store session_number as Int64, a few
+    # as text ("1".."7"). vertical_relaxed then keeps the column as String.
+    # The model-data catalog type is UInt8, and observed values are 1..8.
+    if plan_schema.get('session_number') == pl.String:
+        lf = lf.with_columns(pl.col('session_number').cast(pl.UInt8, strict=False))
 
     cat_columns = ['Contract', 'Declarer_Direction', 'Dealer']
     plan_schema = lf.collect_schema()

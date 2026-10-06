@@ -71,6 +71,47 @@ class ShardScanTests(unittest.TestCase):
             self.assertEqual(out["Player_ID_N"].to_list(), ["111", "5798205"])
             self.assertEqual(out["Is_Sacrifice_Opportunity"].to_list(), [None, True])
 
+    def test_mixed_session_number_casts_to_uint8(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "old.parquet"
+            new = Path(tmp) / "new.parquet"
+            common = {
+                "Player_ID_N": ["1"],
+                "Player_ID_E": ["2"],
+                "Player_ID_S": ["3"],
+                "Player_ID_W": ["4"],
+                "session_id": ["10"],
+            }
+            pl.DataFrame({**common, "session_number": pl.Series([1], dtype=pl.Int64)}).write_parquet(old)
+            pl.DataFrame({**common, "session_number": ["2"]}).write_parquet(new)
+            player_elo = pl.DataFrame(
+                {
+                    "Player_ID": pl.Series([], dtype=pl.String),
+                    "session_id": pl.Series([], dtype=pl.String),
+                    "Elo_N": pl.Series([], dtype=pl.Float64),
+                    "Elo_R_EventStart": pl.Series([], dtype=pl.Float64),
+                }
+            )
+            pair_elo = pl.DataFrame(
+                {
+                    "Pair_IDs": pl.Series([], dtype=pl.String),
+                    "session_id": pl.Series([], dtype=pl.String),
+                    "Elo_N": pl.Series([], dtype=pl.Float64),
+                    "Elo_R_EventStart": pl.Series([], dtype=pl.Float64),
+                }
+            )
+            out = (
+                _build_joined_plan(
+                    _scan_source_shards([old, new], ["session_number", *common]),
+                    player_elo=player_elo,
+                    pair_elo=pair_elo,
+                )
+                .collect()
+                .sort("session_number")
+            )
+            self.assertEqual(out["session_number"].dtype, pl.UInt8)
+            self.assertEqual(out["session_number"].to_list(), [1, 2])
+
 
 if __name__ == "__main__":
     unittest.main()

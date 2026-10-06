@@ -321,12 +321,20 @@ def _build_joined_plan(
 
     Pure function: no I/O, no global state besides mlBridge.CATEGORICAL_SCHEMAS
     and the module-level _compiled_drop / STRING_COLUMNS_KEEP."""
-    lf = base_lf
+    lf = base_lf.with_columns([
+        pl.col(f"Player_ID_{direction}").cast(pl.String, strict=False)
+        for direction in "NESW"
+    ])
 
     for direction in "NESW":
         rhs = (
             player_elo.lazy()
-            .select(["Player_ID", "session_id", "Elo_N", "Elo_R_EventStart"])
+            .select([
+                pl.col("Player_ID").cast(pl.String, strict=False),
+                "session_id",
+                "Elo_N",
+                "Elo_R_EventStart",
+            ])
             .rename({
                 "Player_ID": f"Player_ID_{direction}",
                 "Elo_N": f"Elo_N_{direction}",

@@ -27,13 +27,13 @@ echo      (~38 h Stage 3a + ~18 h Stage 3c + ~45 h Stage 5c + other stages).
 echo    Warm rewrite measured 2026-10-01 -^> 10-03 (log captured mid-5b):
 echo      1a 10h01m + 1b 7h56m + 3a 2h10m (DD/SD cache hit) + 3b 2m
 echo      + 3c 16h27m + 4 40m + 5a 4m (every shard skipped). 5b+ unfinished.
-echo    Stage 5c current baseline: ~45 h for all 6 models (2026-09-13 -^> 09-15).
-echo      club ~40 h, tournament ~5 h.
+echo    Stage 5c current baseline: 45h 31m for all 6 models (2026-10-06 15:50 -^> 10-08 13:21).
+echo      club 39h 19m, tournament 6h 12m. Clean run; no OOM resume.
 echo    Stage 5d shows the prediction charts 5c no longer opens (close windows to finish).
 echo    Empirical bottlenecks per stage are noted as "TIME:" tags below.
 echo    Each step prints its own measured elapsed time as "TIME[step]: ..." lines.
-echo  Latest measured stages: 2026-10-01 -^> 2026-10-03 (through 5a; 5b still running).
-echo    5c baseline remains 2026-09-13 -^> 09-15 (resumed after OOM and AppHang).
+echo  Latest measured stages: 1a-4 from 2026-10-01 -^> 10-03. Stage 5 from
+echo    the 2026-10-06 -^> 10-08 rebuild (5a shard writes, 5b, 5c).
 echo  Model training results history: RESULTS.md (append an entry after each 5c run).
 echo ======================================================================
 echo.
@@ -214,16 +214,17 @@ echo [Stage 5] ML model pipeline...
 ::         (default --no-merge-shards since 2026-08-16: the single-file merge
 ::         took ~12 h for club and made downstream reads SLOWER; consumers
 ::         now scan the shard glob with file-level Date pruning instead)
-:: TIME:   MEASURED 2026-10-03 02:01-02:03: 231s. Every monthly shard
-::         was skipped. That run treated a readable schema as valid, so
-::         club shards stayed at Date max 2026-08-12 while the augmented
-::         parquet reached 2026-09-09. Skip now rebuilds a month when its
-::         source row count changed (manifest source_rows). Shards written
-::         before that field existed rebuild when the window Date max moved.
-::         Manifests then: club 96 shards, 69,445,246 rows, 85.9 GB;
-::         tournament 132 shards, 16,732,751 rows, 14.3 GB.
-::         Cold club rebuild was ~10.5 h on 2026-09-12. Tournament cold
-::         was 889 s / 15.3 GB on 2026-08-16.
+:: TIME:   COLD REBUILD MEASURED 2026-10-06 from shard-dir creation
+::         (after the dirs were deleted) through manifest.json:
+::           club       12:42:51-13:31:45 (49 min). 96 shards,
+::                      71,773,521 rows, 88.43 GB.
+::           tournament 13:31:49-13:48:46 (17 min). 132 shards,
+::                      18,970,284 rows, 15.52 GB.
+::         Skip-all pass remains 231s (2026-10-03 02:01-02:03). Skip
+::         rebuilds a month when manifest source_rows changed, or, for
+::         shards written before that field, when the window Date max moved.
+::         Earlier cold club rebuild was ~10.5 h on 2026-09-12. Tournament
+::         cold was 889 s / 15.3 GB on 2026-08-16.
 echo   [5a] Building model data...
 call :pyrun 5a acbl_model_data.py
 if errorlevel 1 goto :error
@@ -236,15 +237,15 @@ if errorlevel 1 goto :error
 ::         acbl/acbl_{club,tournament}_pair_elo_ratings.parquet
 :: WRITES: acbl/acbl_{club,tournament}_prediction_data_train.parquet
 ::         acbl/acbl_{club,tournament}_prediction_data_test.parquet
-:: TIME:   Last complete run 2026-09-12 22:36 -^> 09-13 01:06 (~2.5 h)
-::         reading monthly shards (not the old merged file):
-::           club       ~2.1 h (61.71M train + 7.74M test; 203.5 + 20.4 GB).
-::           tournament ~21 min (15.70M train + 1.03M test; 41.6 + 2.7 GB).
-::         2026-10-03 run was still going when the log was captured:
-::         club 2019/train finished in 317s (24.07 GB); 2020/train had
-::         just started. Shard Date max on that pass was 2026-08-12.
-::         Earlier 2026-04 run against the single merged file was club 7.3 h
-::         / tournament ~30-60 min (see script docstring "KNOWN ISSUE").
+:: TIME:   MEASURED 2026-10-06 13:49-15:50 (2h 2m) from the rebuilt
+::         monthly shards:
+::           club       13:49-15:29 (1h 40m). 61,705,397 train + 10,068,124
+::                      test rows; 203.51 + 26.83 GB. 6,042 columns.
+::           tournament 15:29-15:50 (22 min). 17,698,014 train + 1,272,270
+::                      test rows; 47.01 + 3.32 GB. 6,033 columns.
+::         Test cutoff 2026-01-01. Earlier 2026-09-12 run was ~2.5 h
+::         (club 61.71M+7.74M, tournament 15.70M+1.03M). The 2026-04 run
+::         against the single merged file was club 7.3 h.
 echo   [5b] Preparing prediction data (train/test split)...
 call :pyrun 5b acbl_prediction_data.py
 if errorlevel 1 goto :error
@@ -259,29 +260,44 @@ if errorlevel 1 goto :error
 ::         acbl/debug_input_{club,tournament}_{target}.parquet
 ::         acbl/debug_predictions_{club,tournament}_{target}.parquet
 ::         Charts are not shown here (MPLBACKEND=Agg). Use 5d.
-:: TIME:   CURRENT BASELINE ~45 h for all 6 models, 20 epochs each.
-::         MEASURED 2026-09-13 -^> 09-15 from artifact mtimes (club ~40 h,
-::         tournament ~5 h). First club DD reused leftover shards after an
-::         OOM reboot; tournament Pct_NS reused shards after AppHang.
-::         A clean uninterrupted run should be similar (~44-46 h).
-::         Input sizes:
-::           club:      61.71M train + 7.74M test rows, 203.5 + 20.4 GB
-::           tournament:15.70M train + 1.03M test rows, 41.6 + 2.7 GB
-::         club (~40 h; schema mtime = load+prepare done, then shards+epochs
-::         until .pth, then eval until importance.csv):
-::           Declarer_Direction: load ~3h27m + shards ~4h26m + epochs 9h07m
-::                               (~1637 s/epoch) + eval 50m; .pth 09-14 04:23
-::           Contract:           load 3h06m + shards+epochs 15h18m + eval 51m
-::                               .pth 09-14 23:37
-::           Pct_NS (pruned):    load 1h13m + shards+epochs 1h45m + eval 7m
-::                               .pth 09-15 03:26
-::         tournament (~5 h):
-::           Declarer_Direction: load 10m + shards+epochs 2h00m + eval 4m
-::                               .pth 09-15 05:43
-::           Contract:           load 10m + shards+epochs 2h07m + eval 4m
-::                               .pth 09-15 08:04
-::           Pct_NS (pruned):    load 8m + shards ~9m + epochs ~18m (~52 s/epoch)
-::                               + eval 1m; .pth 09-15 09:22 (resumed).
+:: TIME:   CURRENT BASELINE 45h 31m for all 6 models.
+::         MEASURED 2026-10-06 15:50 -^> 10-08 13:21 from artifact mtimes
+::         (club 39h 19m, tournament 6h 12m). Clean run.
+::         schema mtime = load+prepare done; .pth = shards+epochs done;
+::         importance.csv = eval done.
+::         Input sizes (test cutoff 2026-01-01):
+::           club:      61.71M train + 10.07M test rows, 203.51 + 26.83 GB
+::           tournament:17.70M train + 1.27M test rows, 47.01 + 3.32 GB
+::         club (39h 19m):
+::           Declarer_Direction: load 3h 10m + shards 4h 18m + epochs 9h 35m
+::                               + eval 56m. .pth 10-07 08:53, importance 09:50.
+::           Contract:           load 3h 03m + shards+epochs 14h 22m + eval 59m.
+::                               .pth 10-08 03:14, importance 04:13.
+::           Pct_NS (pruned):    load 1h 25m + shards+epochs 1h 22m + eval 10m.
+::                               .pth 10-08 07:00, importance 07:09.
+::         tournament (6h 12m):
+::           Declarer_Direction: load 16m + shards+epochs 2h 18m + eval 5m.
+::                               .pth 10-08 09:43, importance 09:49.
+::           Contract:           load 13m + shards+epochs 2h 30m + eval 6m.
+::                               .pth 10-08 12:32, importance 12:38.
+::           Pct_NS (pruned):    load 13m + shards+epochs 29m + eval 1m.
+::                               .pth 10-08 13:20, importance 13:21.
+::         ACCURACY on the held-out test parquets (debug_predictions_*):
+::           club Declarer_Direction: accuracy 0.6644, macro F1 0.664,
+::                               majority baseline 0.2623 (N). 60,268 test
+::                               rows have a null direction and count as misses.
+::           club Contract:      accuracy 0.3795, macro F1 0.182,
+::                               majority baseline 0.0408 (3NN). 141 test classes.
+::           club Pct_NS:        MAE 0.2595, variance ratio 0.167
+::                               (pred_std/actual_std). y max 1.25.
+::           tournament Declarer_Direction: accuracy 0.6522, macro F1 0.652,
+::                               majority baseline 0.2623 (N).
+::           tournament Contract: accuracy 0.3824, macro F1 0.073,
+::                               majority baseline 0.0434 (3NN). 378 test classes.
+::           tournament Pct_NS:  MAE 0.2514, variance ratio 0.164.
+::                               y max 9.99 (sentinel; still in the test file).
+::         Earlier 2026-09-13 -^> 09-15 run was ~45 h and resumed after an
+::         OOM reboot (club DD) and an AppHang (tournament Pct_NS).
 ::         HOST MEMORY: this is the bottleneck, not VRAM. Loading train+test
 ::         together drove Python to ~488 GB and OOM-rebooted club DD
 ::         (2026-09-13). After loading them one at a time, resume RSS was

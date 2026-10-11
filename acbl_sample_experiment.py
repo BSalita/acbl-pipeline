@@ -3,9 +3,12 @@
 Reads acbl_club_prediction_data_{train,test}_v2.parquet. Does not rebuild
 stages 5a or 5b and does not write into SavedModels.
 
-Samples are cached under e:/bridge/data/acbl/experiments/. Each trial trains
-with the same architecture, epoch cap, and early-stop patience as stage 5c.
-The test set is one fixed 500,000-row draw, so trials are comparable.
+Samples are cached under e:/bridge/data/acbl/experiments/. Each draw takes
+rows from every parquet row group, in proportion to the group size, so the
+sample covers the whole file. Train sizes below 8,000,000 are drawn from
+that 8,000,000-row spread sample. Each trial trains with the same
+architecture, epoch cap, and early-stop patience as stage 5c. The test set
+is one fixed 500,000-row draw, so trials are comparable.
 Validation is one shard out of about twenty (~5%), not half the sample.
 
 Full-run club test numbers to beat or match (10,068,124 rows):
@@ -22,7 +25,6 @@ import gc
 import json
 import math
 import os
-import random
 import sys
 import time
 from pathlib import Path
@@ -100,37 +102,98 @@ def _hparams(y_name: str) -> dict:
     return hp
 
 
+def _group_take_counts(pf: pq.ParquetFile, n_rows: int) -> list[int]:
+    """How many rows to keep from each row group. Sums to n_rows when the file is larger."""
+    sizes = [pf.metadata.row_group(i).num_rows for i in range(pf.num_row_groups)]
+    total = sum(sizes)
+    if n_rows >= total:
+        return sizes
+    raw = [n_rows * size / total for size in sizes]
+    counts = [min(size, int(share)) for size, share in zip(sizes, raw)]
+    leftover = n_rows - sum(counts)
+    order = sorted(range(len(sizes)), key=lambda i: raw[i] - int(raw[i]), reverse=True)
+    while leftover > 0:
+        progressed = False
+        for i in order:
+            room = sizes[i] - counts[i]
+            if room <= 0:
+                continue
+            counts[i] += 1
+            leftover -= 1
+            progressed = True
+            if leftover <= 0:
+                break
+        if not progressed:
+            break
+    return counts
+
+
+def _build_spread(src: Path, dest: Path, n_rows: int, seed: int) -> None:
+    """Keep a proportional slice of every row group and write it as one parquet."""
+    pf = pq.ParquetFile(src)
+    counts = _group_take_counts(pf, n_rows)
+    used = sum(1 for count in counts if count)
+    print(
+        f"Spread sample of {src.name}: {n_rows:,} rows from {used:,}/{len(counts):,} row groups",
+        flush=True,
+    )
+    writer = None
+    taken = 0
+    t0 = time.time()
+    try:
+        for index, count in enumerate(counts):
+            if count <= 0:
+                continue
+            table = pf.read_row_group(index)
+            df = pl.from_arrow(table)
+            del table
+            if df.height > count:
+                df = df.sample(n=count, seed=seed + index, shuffle=True)
+            out = df.to_arrow()
+            if writer is None:
+                writer = pq.ParquetWriter(dest, out.schema, compression="zstd", compression_level=3)
+            writer.write_table(out)
+            taken += out.num_rows
+            del df, out
+            if index % 25 == 0 or index + 1 == len(counts):
+                print(
+                    f"  group {index + 1}/{len(counts)}  rows {taken:,}  {time.time() - t0:.0f}s",
+                    flush=True,
+                )
+    finally:
+        if writer is not None:
+            writer.close()
+    print(f"Wrote {dest.name}: {taken:,} rows in {time.time() - t0:.1f}s", flush=True)
+    if taken != n_rows:
+        dest.unlink(missing_ok=True)
+        raise RuntimeError(f"Spread sample has {taken:,} rows, wanted {n_rows:,}")
+
+
 def sample_parquet(src: Path, dest: Path, n_rows: int, seed: int) -> Path:
-    """Draw n_rows from randomly chosen row groups and cache the result."""
+    """Cache a file-wide sample. Smaller train sizes are drawn from the 8,000,000-row spread."""
     if dest.exists():
         have = pq.ParquetFile(dest).metadata.num_rows
         if have == n_rows:
-            print(f"Reusing sample {dest.name} ({have:,} rows)")
+            print(f"Reusing sample {dest.name} ({have:,} rows)", flush=True)
             return dest
+        dest.unlink()
     dest.parent.mkdir(parents=True, exist_ok=True)
-    pf = pq.ParquetFile(src)
-    rng = random.Random(seed)
-    order = list(range(pf.num_row_groups))
-    rng.shuffle(order)
-    chosen: list[int] = []
-    total = 0
-    target = max(n_rows, int(n_rows * 1.05))
-    for index in order:
-        chosen.append(index)
-        total += pf.metadata.row_group(index).num_rows
-        if total >= target:
-            break
-    print(f"Reading {len(chosen)} row groups ({total:,} rows) from {src.name} for a {n_rows:,}-row sample")
-    t0 = time.time()
-    table = pf.read_row_groups(sorted(chosen))
-    df = pl.from_arrow(table)
-    del table
-    if df.height > n_rows:
-        df = df.sample(n=n_rows, seed=seed, shuffle=True)
-    df.write_parquet(dest, compression="zstd", compression_level=3)
-    print(f"Wrote {dest.name}: {df.height:,} rows in {time.time() - t0:.1f}s")
-    del df
-    gc.collect()
+    if src == TRAIN_SRC and n_rows < max(ROW_LADDER):
+        parent = sample_parquet(
+            TRAIN_SRC,
+            EXP / f"club_train_rows{max(ROW_LADDER)}_seed{SEED}.parquet",
+            max(ROW_LADDER),
+            SEED,
+        )
+        print(f"Drawing {n_rows:,} rows from spread sample {parent.name}", flush=True)
+        t0 = time.time()
+        df = pl.read_parquet(parent).sample(n=n_rows, seed=seed, shuffle=True)
+        df.write_parquet(dest, compression="zstd", compression_level=3)
+        print(f"Wrote {dest.name}: {df.height:,} rows in {time.time() - t0:.1f}s", flush=True)
+        del df
+        gc.collect()
+        return dest
+    _build_spread(src, dest, n_rows, seed)
     return dest
 
 

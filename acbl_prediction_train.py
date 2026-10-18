@@ -849,6 +849,15 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         gc.collect()
         _log_mem(f"{club_or_tournament}/{y_name} after eval freed")
 
+    if 'Pct_NS' in selected_targets:
+        import json
+        import acbl_prediction_rank_eval
+        ranking = acbl_prediction_rank_eval.evaluate_ranking(club_or_tournament, input_suffix)
+        rank_path = acblPath.joinpath(f"acbl_{club_or_tournament}_prediction_rank_metrics.json")
+        rank_path.write_text(json.dumps({"side": club_or_tournament, "ranking": ranking}, indent=2), encoding="utf-8")
+        print(f"Club-rank Spearman: model {ranking['model_raw']['mean_spearman']:.4f}, "
+              f"Elo line {ranking['elo_line_raw']['mean_spearman']:.4f}. Wrote {rank_path}")
+
     print(f"{club_or_tournament} elapsed time in seconds: {time.time()-t}")
     print("-" * 70, "\n")
 

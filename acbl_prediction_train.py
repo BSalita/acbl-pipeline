@@ -849,7 +849,7 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         gc.collect()
         _log_mem(f"{club_or_tournament}/{y_name} after eval freed")
 
-    if 'Pct_NS' in selected_targets:
+    if 'Pct_NS' in selected_targets and club_or_tournament == 'club':
         import json
         import acbl_prediction_rank_eval
         ranking = acbl_prediction_rank_eval.evaluate_ranking(club_or_tournament, input_suffix)

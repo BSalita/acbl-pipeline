@@ -21,6 +21,36 @@ Reading the metrics:
 
 ---
 
+## 2026-10-18 (evaluation only, no retrain: club rank and joint pick)
+
+`acbl_prediction_rank_eval.py` on the current `_v2` test parquets and
+SavedModels. Joint pick = argmax of log P(contract) + 0.3 x log P(declarer of
+that contract's seat); weight 0.3 picked on a tune half, checked on a report
+half (weight 1.0 cost 0.14 points of contract accuracy).
+
+### Club rank (92,573 section/directions, pairs with >= 8 boards)
+
+| Ranker | Spearman | Pair session-% MAE |
+|---|---|---|
+| Pct_NS model (mean of board predictions) | 0.456 | 0.0556 |
+| Same, section-centered | 0.456 | 0.0544 |
+| Same, board-centered | 0.456 | 0.0544 |
+| Seat-Elo gap line (fit on 2025+) | 0.433 | |
+
+Section centering is rank-neutral within a direction (ACBL matchpoints within
+section and direction), so only the MAE moves. Tournament prediction data has
+no session or section id, so it is not ranked. 5c now writes
+`acbl_club_prediction_rank_metrics.json` after club Pct_NS.
+
+### Joint contract/declarer pick (served by postmortem-acbl)
+
+| Mode | Rows | Contract alone -> joint | Declarer alone -> joint | Models agree |
+|---|---|---|---|---|
+| club | 305k | 0.3787 -> 0.3787 | 0.6630 -> 0.6644 | 85.4% -> 100% |
+| tournament | 318k | 0.3826 -> 0.3830 | 0.6529 -> 0.6598 | 83.6% -> 100% |
+
+---
+
 ## 2026-07-10 → 2026-07-11 (full retrain, both modes, all 3 targets)
 
 - Hardware: RTX 5080, 192 GB RAM, NVMe E:

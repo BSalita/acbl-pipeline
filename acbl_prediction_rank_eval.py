@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Score ACBL predictions the way the postmortem uses them.
 
-Club ranking: each pair's predicted session percentage is the mean of its
+Club ranking (club only; tournament prediction data has no session or
+section id): each pair's predicted session percentage is the mean of its
 board predictions (``Pct_NS_Pred`` for North-South, the complement for
 East-West). Pairs are ranked against the other pairs in the same section and
 direction, as Mitchell games are scored, and compared with the actual ranks
@@ -134,7 +135,11 @@ def section_rank_quality(frame: pl.DataFrame, columns: list[str]) -> dict:
 
 
 def evaluate_ranking(side: str, suffix: str) -> dict:
+    """Club only: tournament prediction data has no session or section id."""
     test_path = ACBL_DIR / f"acbl_{side}_prediction_data_test{suffix}.parquet"
+    missing = sorted(set(META_COLUMNS) - set(pl.read_parquet_schema(test_path)))
+    if missing:
+        raise ValueError(f"{test_path.name} lacks {missing}; sections cannot be ranked")
     train_path = ACBL_DIR / f"acbl_{side}_prediction_data_train{suffix}.parquet"
     predictions_path = ACBL_DIR / f"debug_predictions_{side}_pct_ns.parquet"
     meta = pl.read_parquet(test_path, columns=list(META_COLUMNS))
@@ -273,9 +278,11 @@ def main(argv: list[str] | None = None) -> int:
 
     started = datetime.now()
     print(f"Start {started:%Y-%m-%d %H:%M:%S}")
-    metrics = {"side": args.side, "ranking": evaluate_ranking(args.side, args.input_suffix)}
-    print(json.dumps(metrics["ranking"], indent=2))
-    print(f"Ranking done ({(datetime.now() - started).total_seconds():.0f}s)")
+    metrics = {"side": args.side}
+    if args.side == "club":
+        metrics["ranking"] = evaluate_ranking(args.side, args.input_suffix)
+        print(json.dumps(metrics["ranking"], indent=2))
+        print(f"Ranking done ({(datetime.now() - started).total_seconds():.0f}s)")
     if not args.skip_joint:
         metrics["joint_contract_declarer"] = evaluate_joint(args.side, args.input_suffix, args.models_dir, args.device)
         print(json.dumps(metrics["joint_contract_declarer"], indent=2))

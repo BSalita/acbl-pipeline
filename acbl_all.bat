@@ -259,7 +259,13 @@ if errorlevel 1 goto :error
 ::         acbl/SavedModels/{model_name}_importance.csv
 ::         acbl/debug_input_{club,tournament}_{target}.parquet
 ::         acbl/debug_predictions_{club,tournament}_{target}.parquet
+::         acbl/acbl_club_prediction_rank_metrics.json  (after club Pct_NS:
+::           club-rank Spearman per section/direction vs a seat-Elo line,
+::           via acbl_prediction_rank_eval.py; ~1 min. Tournament prediction
+::           data has no session/section id, so it is not ranked.)
 ::         Charts are not shown here (MPLBACKEND=Agg). Use 5d.
+::         Joint contract/declarer pick (what postmortem-acbl serves):
+::           acbl_prediction_rank_eval.py --side club|tournament (~3 min).
 :: TIME:   CURRENT BASELINE 45h 31m for all 6 models.
 ::         MEASURED 2026-10-06 15:50 -^> 10-08 13:21 from artifact mtimes
 ::         (club 39h 19m, tournament 6h 12m). Clean run.
@@ -290,6 +296,15 @@ if errorlevel 1 goto :error
 ::                               majority baseline 0.0408 (3NN). 141 test classes.
 ::           club Pct_NS:        MAE 0.2595, variance ratio 0.167
 ::                               (pred_std/actual_std). y max 1.25.
+::           club rank (2026-10-18): Spearman 0.456 vs seat-Elo line 0.433
+::                               (92,573 section/directions). Section
+::                               centering keeps ranks, pair MAE 0.0556 ->
+::                               0.0544; board centering adds nothing.
+::           club joint pick (declarer weight 0.3, 305k boards): contract
+::                               0.3787 -^> 0.3787, declarer 0.6630 -^> 0.6644,
+::                               contract/declarer agree 85.4%% -^> 100%%.
+::           tournament joint pick (318k boards): contract 0.3826 -^> 0.3830,
+::                               declarer 0.6529 -^> 0.6598.
 ::           tournament Declarer_Direction: accuracy 0.6522, macro F1 0.652,
 ::                               majority baseline 0.2623 (N).
 ::           tournament Contract: accuracy 0.3824, macro F1 0.073,

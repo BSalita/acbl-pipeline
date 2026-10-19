@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Score ACBL predictions the way the postmortem uses them.
 
-Club ranking (club only; tournament prediction data has no session or
-section id): each pair's predicted session percentage is the mean of its
-board predictions (``Pct_NS_Pred`` for North-South, the complement for
+Section ranking (club and tournament): each pair's predicted session
+percentage is the mean of its board predictions (``Pct_NS_Pred`` for North-South, the complement for
 East-West). Pairs are ranked against the other pairs in the same section and
 direction, as Mitchell games are scored, and compared with the actual ranks
 by Spearman correlation. Variants:
@@ -135,7 +134,6 @@ def section_rank_quality(frame: pl.DataFrame, columns: list[str]) -> dict:
 
 
 def evaluate_ranking(side: str, suffix: str) -> dict:
-    """Club only: tournament prediction data has no session or section id."""
     test_path = ACBL_DIR / f"acbl_{side}_prediction_data_test{suffix}.parquet"
     missing = sorted(set(META_COLUMNS) - set(pl.read_parquet_schema(test_path)))
     if missing:
@@ -264,7 +262,7 @@ def evaluate_joint(side: str, suffix: str, models_dir: Path, device: str) -> dic
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Club-rank and joint contract/declarer evaluation for ACBL.")
+    parser = argparse.ArgumentParser(description="Section-rank and joint contract/declarer evaluation for ACBL.")
     parser.add_argument("--side", choices=("club", "tournament"), default="club")
     parser.add_argument("--input-suffix", default="_v2")
     parser.add_argument("--models-dir", type=Path, default=MODELS_DIR)
@@ -279,10 +277,9 @@ def main(argv: list[str] | None = None) -> int:
     started = datetime.now()
     print(f"Start {started:%Y-%m-%d %H:%M:%S}")
     metrics = {"side": args.side}
-    if args.side == "club":
-        metrics["ranking"] = evaluate_ranking(args.side, args.input_suffix)
-        print(json.dumps(metrics["ranking"], indent=2))
-        print(f"Ranking done ({(datetime.now() - started).total_seconds():.0f}s)")
+    metrics["ranking"] = evaluate_ranking(args.side, args.input_suffix)
+    print(json.dumps(metrics["ranking"], indent=2))
+    print(f"Ranking done ({(datetime.now() - started).total_seconds():.0f}s)")
     if not args.skip_joint:
         metrics["joint_contract_declarer"] = evaluate_joint(args.side, args.input_suffix, args.models_dir, args.device)
         print(json.dumps(metrics["joint_contract_declarer"], indent=2))

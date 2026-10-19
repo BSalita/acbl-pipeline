@@ -220,9 +220,6 @@ DROP_PATTERNS = [
     r'^event_type$',
     r'^hand_record_id$',
     r'^sBoard$',
-    r'^event_id$',                  # tournament only
-    r'^section_id$',                # tournament only
-    r'^session_id$',                # tournament only
     r'^SL_[NESW]_CDHS_SJ$',
     r'^SL_[NESW]_ML_I_SJ$',
     r'^SL_Max_(NS|EW)_Col$',
@@ -234,7 +231,11 @@ DROP_PATTERNS = [
 ]
 _compiled_drop = [re.compile(p) for p in DROP_PATTERNS]
 
-STRING_COLUMNS_KEEP = ['section_name']
+# Tournament event_id/session_id/section_id are String (club's are Int64) and
+# stay in the output so acbl_prediction_rank_eval.py can rank pairs per
+# section. The training schema blacklist in mlBridgeAiLib keeps them out of
+# the model inputs.
+STRING_COLUMNS_KEEP = ['section_name', 'event_id', 'session_id', 'section_id']
 
 # Columns that exist in model_data but cause downstream issues; dropped at read.
 EXTRA_PROJECTION_DROPS = {

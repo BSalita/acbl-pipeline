@@ -113,5 +113,54 @@ class ShardScanTests(unittest.TestCase):
             self.assertEqual(out["session_number"].to_list(), [1, 2])
 
 
+class TournamentIdTests(unittest.TestCase):
+    def test_text_section_ids_reach_the_output(self) -> None:
+        base = pl.LazyFrame(
+            {
+                **{f"Player_ID_{seat}": [str(i)] for i, seat in enumerate("NESW", 1)},
+                "event_id": ["2503355-2901"],
+                "session_id": ["2503355-2901-2"],
+                "section_id": ["2503355-2901-2-0"],
+                "hand_record_id": ["x"],
+            }
+        )
+        empty_elo = {
+            "session_id": pl.Series([], dtype=pl.String),
+            "Elo_N": pl.Series([], dtype=pl.Float64),
+            "Elo_R_EventStart": pl.Series([], dtype=pl.Float64),
+        }
+        out = _build_joined_plan(
+            base,
+            player_elo=pl.DataFrame({"Player_ID": pl.Series([], dtype=pl.String), **empty_elo}),
+            pair_elo=pl.DataFrame({"Pair_IDs": pl.Series([], dtype=pl.String), **empty_elo}),
+        ).collect()
+        self.assertEqual(out["section_id"].to_list(), ["2503355-2901-2-0"])
+        self.assertEqual(out["session_id"].to_list(), ["2503355-2901-2"])
+        self.assertEqual(out["event_id"].to_list(), ["2503355-2901"])
+        self.assertNotIn("hand_record_id", out.columns)
+
+
+class SchemaBlacklistTests(unittest.TestCase):
+    def test_ids_and_dates_are_not_model_inputs(self) -> None:
+        from mlBridge.mlBridgeAiLib import generate_and_save_schema
+
+        frame = pl.DataFrame(
+            {
+                "Pct_NS": pl.Series([0.4, 0.6, 0.5], dtype=pl.Float32),
+                "HCP_N": pl.Series([10, 12, 8], dtype=pl.UInt8),
+                "club_class": pl.Series([3, 4, 4], dtype=pl.UInt8),
+                "Club": pl.Series([1, 2, 3], dtype=pl.Int32),
+                "section_id": pl.Series([7, 8, 9], dtype=pl.Int64),
+                "session_id": ["a", "b", "c"],
+                "event_id": pl.Series([1, 2, 3], dtype=pl.Int64),
+                "Date": [date(2025, 1, 1)] * 3,
+                "game_date": pl.Series([date(2025, 1, 1)] * 3).cast(pl.Datetime("us")),
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            schema = generate_and_save_schema(frame, Path(tmp), "m", "Pct_NS", y_range=None)
+        self.assertEqual(sorted(schema["feature_dtypes"]), ["HCP_N", "club_class"])
+
+
 if __name__ == "__main__":
     unittest.main()

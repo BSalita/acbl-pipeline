@@ -259,10 +259,12 @@ if errorlevel 1 goto :error
 ::         acbl/SavedModels/{model_name}_importance.csv
 ::         acbl/debug_input_{club,tournament}_{target}.parquet
 ::         acbl/debug_predictions_{club,tournament}_{target}.parquet
-::         acbl/acbl_club_prediction_rank_metrics.json  (after club Pct_NS:
-::           club-rank Spearman per section/direction vs a seat-Elo line,
-::           via acbl_prediction_rank_eval.py; ~1 min. Tournament prediction
-::           data has no session/section id, so it is not ranked.)
+::         acbl/acbl_{club,tournament}_prediction_rank_metrics.json  (after
+::           Pct_NS: Spearman per section/direction vs a seat-Elo line,
+::           via acbl_prediction_rank_eval.py; ~1 min.)
+::         Ids and dates (event/session/section_id, Club, Date, game_date)
+::           are not model inputs (mlBridgeAiLib schema blacklist) since
+::           2026-10-19. Tournament ids stay in the 5b parquets as metadata.
 ::         Charts are not shown here (MPLBACKEND=Agg). Use 5d.
 ::         Joint contract/declarer pick (what postmortem-acbl serves):
 ::           acbl_prediction_rank_eval.py --side club|tournament (~3 min).

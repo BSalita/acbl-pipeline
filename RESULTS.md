@@ -21,6 +21,40 @@ Reading the metrics:
 
 ---
 
+## 2026-10-19 → 2026-10-20 (tournament retrain without ids and dates)
+
+5b tournament rebuilt (22 min) so the test parquet keeps the String
+`event_id` / `session_id` / `section_id` (6,035 sections, no duplicate
+section/board/NS-pair rows). 5c tournament retrained all 3 targets (7h 29m)
+with `Date`, `game_date`, `section_id`, and `Club` added to the schema
+blacklist. Tournament models had only used `Date` and `game_date` of these.
+Club is not retrained yet (waiting for full October data); the served club
+models still take `section_id`, `Club`, and dates as inputs.
+
+| Metric (tournament test, 1.27M rows) | 2026-10-08 | 2026-10-20 |
+|---|---|---|
+| Declarer_Direction accuracy | 0.6522 | 0.6516 |
+| Contract alone / joint (318k sample) | 0.3826 / 0.3830 | 0.3823 / 0.3824 |
+| Declarer alone / joint (318k sample) | 0.6529 / 0.6598 | 0.6511 / 0.6580 |
+| Pct_NS board MAE (constant 0.5: 0.2554) | 0.2514 | 0.2516 |
+| Pct_NS variance ratio | 0.164 | 0.145 |
+
+Accuracy is unchanged within noise, so the dates were not carrying signal.
+
+### Tournament rank (first measurement; 11,965 section/directions, 122,366 pairs)
+
+| Ranker | Spearman | Pair session-% MAE |
+|---|---|---|
+| Pct_NS model | 0.375 | 0.0575 |
+| Same, section-centered | 0.375 | 0.0573 |
+| Same, board-centered | 0.376 | 0.0573 |
+| Seat-Elo gap line | 0.338 | 0.0584 |
+| Constant 50% | | 0.0636 |
+
+The model beats Elo alone by +0.037 (club: +0.023 on the old club models).
+
+---
+
 ## 2026-10-18 (evaluation only, no retrain: club rank and joint pick)
 
 `acbl_prediction_rank_eval.py` on the current `_v2` test parquets and

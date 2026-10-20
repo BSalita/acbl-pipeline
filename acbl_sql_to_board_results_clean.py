@@ -69,6 +69,19 @@ def pair_id_list(column: str) -> pl.Expr:
     return pl.col(column).str.extract_all(_PAIR_ID_TOKEN).alias(column)
 
 
+# Tournament percentages come from ACBL and include a 9.99 sentinel and sessions
+# scored against the wrong top. Club percentages are MP / MP_Top, where MP_Top
+# (tables - 1) can be below ACBL's factored matchpoints.
+def drop_out_of_range_pct(df: pl.DataFrame, label: str) -> pl.DataFrame:
+    """Drop rows whose Pct_NS or Pct_EW is outside [0, 1]. Nulls are kept."""
+    out_of_range = pl.any_horizontal(
+        [pl.col(c).is_not_null() & ~pl.col(c).is_between(0, 1) for c in ("Pct_NS", "Pct_EW")]
+    )
+    kept = df.filter(~out_of_range)
+    print(f"{label}: dropped {df.height - kept.height:,} rows with Pct_NS or Pct_EW outside [0,1]")
+    return kept
+
+
 def get_club_schemas():
     """Return SQL selects and schemas for club data."""
     sql_selects_d = {
@@ -542,6 +555,7 @@ def tournament_board_results_clean():
         'pair_number_ns': 'Pair_Number_NS',
         'pair_number_ew': 'Pair_Number_EW',
     })
+    brs_df = drop_out_of_range_pct(brs_df, "tournament")
     
     # Enrich tournament data with club's MasterPoints
     print("Enriching tournament data with club MasterPoints (takes 1 minute)...")

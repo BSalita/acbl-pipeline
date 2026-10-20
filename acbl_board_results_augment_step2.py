@@ -19,7 +19,6 @@ Next steps:
 
 TODO:
 1. why is 'section_name_right' appearing?
-2. investigate source of out-of-bounds percentage values (see _validate_percentage_columns)
 """
 
 import polars as pl
@@ -37,6 +36,7 @@ for _p in (_SRC_DIR, _MLBRIDGE):
     if _s not in sys.path:
         sys.path.append(_s)
 import mlBridge.mlBridgeAugmentLib as mlBridgeAugmentLib
+from acbl_sql_to_board_results_clean import drop_out_of_range_pct
 
 rootPath = pathlib.Path('e:/bridge/data')
 acblPath = rootPath.joinpath('acbl')
@@ -144,6 +144,7 @@ def augment_board_results_step2(club_or_tournament):
             part_brs_df = mlBridgeAugmentLib.AllBoardResultsAugmentations(part_brs_df).perform_all_board_results_augmentations()
             non_object_columns = [col for col, dtype in zip(part_brs_df.columns, part_brs_df.dtypes) if dtype != pl.Object]
             part_brs_df = part_brs_df.select(non_object_columns)
+            part_brs_df = drop_out_of_range_pct(part_brs_df, f"club year {y}")
             _validate_percentage_columns(part_brs_df, f"club year {y}")
             print(part_brs_df)
             arrow_table = part_brs_df.to_arrow()

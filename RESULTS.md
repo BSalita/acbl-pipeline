@@ -126,7 +126,11 @@ no session or section id, so it is not ranked. 5c now writes
 
 - **Pct_NS target outliers**: club max 1.38, tournament max 9.99 — a
   matchpoint percentage should be <= 1.0. Upstream data-quality bug
-  (9.99 looks like a sentinel). Clean before next retrain.
+  (9.99 looks like a sentinel). Clean before next retrain. FIXED 2026-10-20:
+  `drop_out_of_range_pct` drops rows with Pct_NS or Pct_EW outside [0,1] in
+  tournament cleaning (4,756 of 32.7M rows) and in club step 2 after
+  augmentation; takes effect on the next run from stage 2 (tournament) or
+  step 2 (club).
 - **`session_id` / `event_id` in top-10 classifier importances**: raw IDs
   acting as time/venue proxies. FIXED 2026-07-12: added
   `^(event_id|session_id|group_id|session_number)$` to the default

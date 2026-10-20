@@ -2,7 +2,7 @@ import unittest
 
 import polars as pl
 
-from acbl_sql_to_board_results_clean import pair_id_list
+from acbl_sql_to_board_results_clean import drop_out_of_range_pct, pair_id_list
 
 
 class PairIdListTests(unittest.TestCase):
@@ -32,6 +32,22 @@ class PairIdListTests(unittest.TestCase):
                 [],
                 None,
             ],
+        )
+
+
+class DropOutOfRangePctTests(unittest.TestCase):
+    def test_drops_rows_outside_unit_interval_and_keeps_nulls(self) -> None:
+        frame = pl.DataFrame(
+            {
+                "Pct_NS": [0.0, 1.0, 0.5, 9.99, 1.06, 0.05, None, -0.01],
+                "Pct_EW": [1.0, 0.0, 0.5, 9.99, 0.2, 2.45, None, 1.0],
+            },
+            schema={"Pct_NS": pl.Float32, "Pct_EW": pl.Float32},
+        )
+        kept = drop_out_of_range_pct(frame, "test")
+        self.assertEqual(
+            kept.rows(),
+            [(0.0, 1.0), (1.0, 0.0), (0.5, 0.5), (None, None)],
         )
 
 

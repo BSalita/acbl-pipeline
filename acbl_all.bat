@@ -250,6 +250,22 @@ echo   [5b] Preparing prediction data (train/test split)...
 call :pyrun 5b acbl_prediction_data.py
 if errorlevel 1 goto :error
 
+:: ---- 5v ----
+:: READS:  acbl/acbl_club_board_results_augmented_step1.parquet
+::         acbl/acbl_{club,tournament}_board_results_augmented.parquet
+::         acbl/acbl_{club,tournament}_{,player_,pair_}elo_ratings.parquet
+::         acbl/acbl_club_prediction_data_test_v2.parquet
+:: WRITES: (none; exits 1 on any FAIL)
+:: TIME:   minutes (lazy scans).
+::         Verifies the 2026-10 data fixes: doubled contracts kept, typed
+::         Result/Tricks, player ID 0 nulled, unrated seats, ordered pair keys.
+::         Runs before 5c so bad data does not cost ~45 h of training.
+::         After the first passing run, merge acbl-pipeline branch
+::         after-nov-2026-acbl-rebuild (drops the club API raw-result override).
+echo   [5v] Verifying data fixes...
+call :pyrun 5v acbl_verify_data_fixes.py
+if errorlevel 1 goto :error
+
 :: ---- 5c ----
 :: READS:  acbl/acbl_{club,tournament}_prediction_data_train_v2.parquet
 ::         acbl/acbl_{club,tournament}_prediction_data_test_v2.parquet

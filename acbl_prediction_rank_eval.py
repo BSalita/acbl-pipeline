@@ -42,6 +42,7 @@ ACBL_DIR = Path(r"E:\bridge\data\acbl")
 MODELS_DIR = ACBL_DIR / "SavedModels"
 MIN_PAIR_BOARDS = 8
 MIN_SECTION_PAIRS = 4
+Z95 = 1.959963984540054
 JOINT_SAMPLE_ROWS = 300_000
 ELO_FIT_FROM = date(2025, 1, 1)
 SECTION = ["session_id", "section_id"]
@@ -91,8 +92,8 @@ def center(column: str, over: list[str]) -> pl.Expr:
     return (pl.col(column) - pl.col(column).mean().over(over) + 0.5).clip(0.0, 1.0)
 
 
-def section_rank_quality(frame: pl.DataFrame, columns: list[str]) -> dict:
-    """Spearman of predicted and actual pair percentage per section and direction."""
+def pair_sessions(frame: pl.DataFrame, columns: list[str]) -> pl.DataFrame:
+    """One row per pair per section and direction with 8+ boards: actual and predicted mean."""
     pieces = []
     for direction, number, east_west in (("NS", "Pair_Number_NS", False), ("EW", "Pair_Number_EW", True)):
         def side(name: str) -> pl.Expr:
@@ -109,7 +110,47 @@ def section_rank_quality(frame: pl.DataFrame, columns: list[str]) -> dict:
             .drop(number)
             .with_columns(pl.lit(direction).alias("direction"))
         )
-    pairs = pl.concat(pieces, how="vertical")
+    return pl.concat(pieces, how="vertical")
+
+
+def interval_calibration(frame: pl.DataFrame, column: str) -> dict:
+    """Spread for a pair's predicted session percentage: widening * board_sd / sqrt(boards).
+
+    One pair's board errors move together, so board_sd / sqrt(boards) alone is
+    too narrow. ``widening`` is the RMS of pair_error * sqrt(boards) / board_sd,
+    which makes the 95% range (1.96 x spread) cover about 95% of pair sessions.
+    """
+    board_sd = float((frame[column] - frame["Pct_NS"]).std())
+    pairs = pair_sessions(frame, [column]).with_columns(
+        (pl.col(column) - pl.col("actual")).alias("error"),
+        pl.col("boards").cast(pl.Float64).sqrt().alias("root_boards"),
+    )
+    widening = float(
+        pairs.select(((pl.col("error") * pl.col("root_boards") / board_sd) ** 2).mean().sqrt()).item()
+    )
+
+    def coverage(factor: float) -> float:
+        return float(
+            pairs.select(
+                (pl.col("error").abs() <= Z95 * factor * board_sd / pl.col("root_boards")).mean()
+            ).item()
+        )
+
+    return {
+        "column": column,
+        "board_sd": board_sd,
+        "widening": widening,
+        "pairs": pairs.height,
+        "coverage_95_plain": coverage(1.0),
+        "coverage_95_widened": coverage(widening),
+        "pair_error_sd": float(pairs["error"].std()),
+        "median_boards": float(pairs["boards"].median()),
+    }
+
+
+def section_rank_quality(frame: pl.DataFrame, columns: list[str]) -> dict:
+    """Spearman of predicted and actual pair percentage per section and direction."""
+    pairs = pair_sessions(frame, columns)
     groups = (
         pairs.group_by([*SECTION, "direction"])
         .agg(
@@ -175,6 +216,7 @@ def evaluate_ranking(side: str, suffix: str) -> dict:
     }
     quality["board_mae"]["constant_half"] = float((frame["Pct_NS"] - 0.5).abs().mean())
     quality["elo_line"] = {"intercept": intercept, "slope_per_100_elo": slope * 100.0}
+    quality["interval"] = interval_calibration(frame, "model_section_centered")
     quality["test_rows"] = frame.height
     return quality
 

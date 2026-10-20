@@ -2487,8 +2487,16 @@ def _given_name_first(value: Any) -> Any:
     return f"{first.strip()} {last.strip()}".strip()
 
 
+_RAW_ACBL_RESULT_COLUMNS = {"result": "Result", "tricks_taken": "Tricks"}
+
+
 def _normalize_postmortem_frame(frame: pl.DataFrame) -> pl.DataFrame:
-    """Normalize API presentation fields without changing the monolith."""
+    """Normalize API presentation fields without changing the monolith.
+
+    ACBL's raw 'result' and 'tricks_taken' strings are merged into Result and
+    Tricks, then dropped: DuckDB is case-insensitive and would bind Result to
+    the raw 'result' string.
+    """
     name_columns = [
         name for name in [
             *(f"Player_Name_{seat}" for seat in "NESW"),
@@ -2518,7 +2526,12 @@ def _normalize_postmortem_frame(frame: pl.DataFrame) -> pl.DataFrame:
             .otherwise(pl.col("Result"))
             .alias("Result")
         )
-    return frame.with_columns(expressions) if expressions else frame
+    if expressions:
+        frame = frame.with_columns(expressions)
+    return frame.drop(
+        raw for raw, typed in _RAW_ACBL_RESULT_COLUMNS.items()
+        if raw in frame.columns and typed in frame.columns
+    )
 
 
 def _scale_percentage_columns(frame: pl.DataFrame) -> pl.DataFrame:
@@ -2787,6 +2800,10 @@ def postmortem_schema(
             dtypes = {
                 name: str(dtype)
                 for name, dtype in zip(schema.names(), schema.dtypes())
+                if not (
+                    name in _RAW_ACBL_RESULT_COLUMNS
+                    and _RAW_ACBL_RESULT_COLUMNS[name] in schema.names()
+                )
             }
             dtypes.update(_POSTMORTEM_DERIVED_DTYPES)
     else:

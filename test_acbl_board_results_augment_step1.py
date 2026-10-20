@@ -37,5 +37,22 @@ class TypedClubResultsTests(unittest.TestCase):
         self.assertEqual(out.schema["Tricks"], pl.UInt8)
 
 
+class PostmortemFrameTests(unittest.TestCase):
+    def test_raw_result_strings_are_merged_then_dropped(self) -> None:
+        from acbl_club_api_service import _normalize_postmortem_frame
+
+        frame = pl.DataFrame(
+            {
+                "Result": pl.Series([0, 1, -1], dtype=pl.Int8),
+                "result": ["=", "+1", "-1"],
+                "Tricks": pl.Series([9, 10, 8], dtype=pl.Int16),
+                "tricks_taken": ["9", "10", "8"],
+            }
+        )
+        out = _normalize_postmortem_frame(frame)
+        self.assertEqual(out.columns, ["Result", "Tricks"])
+        self.assertEqual(out["Result"].to_list(), [0, 1, -1])
+
+
 if __name__ == "__main__":
     unittest.main()

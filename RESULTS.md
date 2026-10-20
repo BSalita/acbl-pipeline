@@ -70,6 +70,27 @@ The cost is about 0.6 points of exact-contract accuracy. Choosing the exact
 level first instead (sum over strains and seats) removed less of the bias
 (ACBL club 52.2% predicted game).
 
+### FFBridge contract model: bigger network (2026-10-21)
+
+The FFBridge contract model was still improving at its last epoch (16).
+`ffbridge_prediction_train.py` now trains it with 1024/512/256 layers for up
+to 96 epochs (best epoch 93, 2 minutes on CUDA). Same 300,000 test rows,
+bucket-first pick, declarer model unchanged:
+
+| | 512/256/128, 16 epochs | 1024/512/256, 96 epochs | Best possible per deal |
+|---|---|---|---|
+| Exact contract | 38.4% | 40.4% | 48.0% |
+| Right bucket | 76.4% | 76.9% | 77.4% |
+| Level too high / too low | 19.2% / 26.3% | 19.7% / 24.5% | 19.5% / 20.4% |
+| Declarer seat (played boards) | 66.8% | 68.0% | |
+
+"Best possible per deal" predicts each deal's most common contract, looked
+up in the test results (181 tables play each FFBridge deal). Tried and not
+kept: 2048-wide layers (overfit by epoch 30), dropout 0.10, per-suit HCP and
+losing-trick counts per hand (+0.2 points), the 52-card layout (worse), a
+bigger declarer model (+0.2 points), and the archived single-dummy EV grid
+(within seed noise, and it only covers 2024 deals).
+
 ### Prediction range for pair session percentages
 
 `acbl_prediction_rank_eval.py` now writes `ranking.interval`: the board-level
@@ -89,11 +110,8 @@ constant in `default.favorites.json` after a club retrain.
 
 ### Follow-up for the next retrain
 
-Not changed yet. Candidate fix, inference only: pick the bucket (pass,
-part-score, game, slam) by summed class probability first, then the most
-probable contract within it. Measure contract accuracy and the bucket table
-above before and after, and check that the joint contract/declarer pick
-(weight 0.3) still helps.
+Try a longer, wider ACBL contract model the way FFBridge's was sized above,
+and compare exact contract, bucket, and level too high / too low.
 
 ---
 

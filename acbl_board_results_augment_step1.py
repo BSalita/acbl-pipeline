@@ -51,6 +51,43 @@ rootPath = pathlib.Path('e:/bridge/data')
 acblPath = rootPath.joinpath('acbl')
 
 
+def normalize_contracts(brs_df: pl.DataFrame) -> pl.DataFrame:
+    """Normalize raw contracts ('4 S x', '4SX', '3 NT') to BidLvl/BidSuit/Dbl and e.g. '4SXN'."""
+    brs_df = brs_df.with_columns(
+        pl.col('Contract').str.replace_all(' ', '').str.to_uppercase().str.replace('NT', 'N'),
+    )
+    brs_df = brs_df.with_columns([
+        pl.col('Contract').str.extract(r'^(\d)').alias('BidLvl'),
+        pl.col('Contract').str.extract(r'^\d([CDHSN])').alias('BidSuit'),
+        pl.col('Contract').str.extract(r'^\d[CDHSN](X*)').alias('Dbl')
+    ])
+    brs_df = brs_df.with_columns(
+        pl.when(pl.col('Contract') == 'PASS')
+        .then(pl.col('Contract'))
+        .otherwise(
+            (pl.col('BidLvl') +
+             pl.col('BidSuit') +
+             pl.col('Dbl') +
+             pl.col('Declarer_Direction'))
+        )
+        .alias('Contract')
+    )
+    return brs_df.with_columns(pl.col("BidLvl").fill_null(0).cast(pl.UInt8))
+
+
+def typed_club_results(brs_df: pl.DataFrame) -> pl.DataFrame:
+    """Replace ACBL's raw 'result' ('=', '+1', '-2') and 'tricks_taken' strings with Result/Tricks.
+
+    ACBL's values are authoritative, so augmentation must not re-derive them from Score_NS.
+    The raw 'result' must not survive: DuckDB is case-insensitive and would resolve 'Result' to it.
+    """
+    return brs_df.with_columns(
+        pl.when(pl.col('result') == '=').then(pl.lit('0')).otherwise(pl.col('result'))
+        .cast(pl.Int8, strict=False).alias('Result'),
+        pl.col('tricks_taken').cast(pl.UInt8, strict=False).alias('Tricks'),
+    ).drop('result', 'tricks_taken')
+
+
 def augment_board_results_step1(club_or_tournament):
     """Perform step 1 augmentation on board results."""
     print(f"Processing {club_or_tournament} board results augmentation step 1...")
@@ -99,34 +136,8 @@ def augment_board_results_step1(club_or_tournament):
     assert brs_df['MP_NS'].is_not_null().all() and brs_df['MP_EW'].is_not_null().all()
     assert brs_df['Contract'].is_not_null().all()
     
-    # Normalize contracts
     print("Normalizing contracts...")
-    brs_df = brs_df.with_columns(
-        pl.col('Contract').str.replace(' ', '').str.to_uppercase().str.replace('NT', 'N'),
-    )
-    
-    # Extract contract components
-    brs_df = brs_df.with_columns([
-        pl.col('Contract').str.extract(r'^(\d)').alias('BidLvl'),
-        pl.col('Contract').str.extract(r'^\d([CDHSN])').alias('BidSuit'),
-        pl.col('Contract').str.extract(r'^\d[CDHSN](X*)').alias('Dbl')
-    ])
-    
-    # Recreate Contract in normalized form
-    brs_df = brs_df.with_columns(
-        pl.when(pl.col('Contract') == 'PASS')
-        .then(pl.col('Contract'))
-        .otherwise(
-            (pl.col('BidLvl') +
-             pl.col('BidSuit') + 
-             pl.col('Dbl') + 
-             pl.col('Declarer_Direction'))
-        )
-        .alias('Contract')
-    )
-    
-    # Convert BidLvl to numeric, set PASS to 0
-    brs_df = brs_df.with_columns(pl.col("BidLvl").fill_null(0).cast(pl.UInt8))
+    brs_df = normalize_contracts(brs_df)
     
     # Drop rows with invalid contracts
     drop_rows = pl.col('Contract').ne('PASS') & brs_df['BidSuit'].is_null()
@@ -186,6 +197,7 @@ def augment_board_results_step1(club_or_tournament):
 
     # todo: looks like all of this can be moved/handled in mlBridgeAugmentLib.py
     if club_or_tournament == 'club':
+        brs_df = typed_club_results(brs_df)
         #mae = pl.Series('Event',['?' if not isinstance(p, str) else p.split(' ')[1][0] for p in brs_df['club_session']])
         brs_df = brs_df.with_columns(
             pl.col('Date').str.strptime(pl.Date, '%Y-%m-%d %H:%M:%S'), # should Date be pl.Date, pl.Datetime or pl.String?

@@ -960,8 +960,6 @@ def create_model_data(
     if club_or_tournament == 'club':
         shouldnt_exist_features = [
             'board_id',
-            'result',
-            'tricks_taken',
             #'session_id',
             #'section_name',
             'ns_pair_summary_id',

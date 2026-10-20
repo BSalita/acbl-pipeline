@@ -21,6 +21,47 @@ Reading the metrics:
 
 ---
 
+## 2026-10-20 (evaluation only, no retrain: contract level bias)
+
+Prompted by a postmortem report (club session 993420: boards 13, 14, and 22
+predicted at game, played in a part-score). Measured on the held-out
+`debug_predictions_{club,tournament}_contract.parquet` (club models from
+2026-10-08, tournament from 2026-10-20). Buckets: game is any contract
+below the 6 level that scores game (3NT or higher, 4H/4S or higher, 5C/5D);
+slam is the 6 or 7 level.
+
+| Bucket | Club actual | Club predicted | Tournament actual | Tournament predicted |
+|---|---|---|---|---|
+| Pass | 60,268 | 82,909 | 14 | 0 |
+| Part-score | 5,363,773 | 4,376,431 (-18%) | 634,761 | 526,201 (-17%) |
+| Game | 4,387,562 | 5,485,267 (+25%) | 594,924 | 721,091 (+21%) |
+| Slam | 256,521 | 123,517 (-52%) | 42,571 | 24,978 (-41%) |
+
+| Share of actual bucket (club) | Predicted part-score | Predicted game | Predicted slam |
+|---|---|---|---|
+| Part-score | 69.0% | 30.0% | 0.0% |
+| Game | 14.7% | 84.2% | 1.0% |
+| Slam | 1.2% | 69.1% | 29.6% |
+
+The mean level error is near zero (club pred - actual -0.023, tournament
+-0.002), so this is not an overall level bias. It is a pull toward game from
+both sides: part-scores are predicted up to game and slams down to game.
+Likely cause: the contract model picks the single most probable contract.
+Game probability is concentrated in a few classes (3NN/3NE/3NW/3NS and the
+4-major contracts are the most frequent classes), while part-score
+probability is spread over many (1N, 2-level suits, 3-minor), so argmax
+favors game even when part-score as a whole is more likely.
+
+### Follow-up for the next retrain
+
+Not changed yet. Candidate fix, inference only: pick the bucket (pass,
+part-score, game, slam) by summed class probability first, then the most
+probable contract within it. Measure contract accuracy and the bucket table
+above before and after, and check that the joint contract/declarer pick
+(weight 0.3) still helps.
+
+---
+
 ## 2026-10-19 → 2026-10-20 (tournament retrain without ids and dates)
 
 5b tournament rebuilt (22 min) so the test parquet keeps the String

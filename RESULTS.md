@@ -52,6 +52,23 @@ Game probability is concentrated in a few classes (3NN/3NE/3NW/3NS and the
 probability is spread over many (1N, 2-level suits, 3-minor), so argmax
 favors game even when part-score as a whole is more likely.
 
+### Prediction range for pair session percentages
+
+`acbl_prediction_rank_eval.py` now writes `ranking.interval`: the board-level
+error SD of the served (section-centered) prediction and the widening factor
+that makes 1.96 x widening x board_sd / sqrt(boards) cover 95% of held-out
+pair sessions (8+ boards). One pair's board errors move together, so the plain
+board_sd / sqrt(boards) is too narrow.
+
+| Side | Pairs | board_sd | widening | 95% coverage plain / widened | Pair error SD |
+|---|---|---|---|---|---|
+| club | 847,653 | 0.3022 | 1.0873 | 92.9% / 95.0% | 0.0687 |
+| tournament | 122,611 | 0.2943 | 1.0903 | 92.7% / 95.0% | 0.0730 |
+
+postmortem-acbl's Overall Rankings Predictions uses the club spread
+0.3022 x 1.0873 = 0.3286 (Pct_Pred_SD = 0.3286 / sqrt(Boards)). Update that
+constant in `default.favorites.json` after a club retrain.
+
 ### Follow-up for the next retrain
 
 Not changed yet. Candidate fix, inference only: pick the bucket (pass,

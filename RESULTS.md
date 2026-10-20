@@ -52,6 +52,24 @@ Game probability is concentrated in a few classes (3NN/3NE/3NW/3NS and the
 probability is spread over many (1N, 2-level suits, 3-minor), so argmax
 favors game even when part-score as a whole is more likely.
 
+**Fix (2026-10-20, inference only):** `joint_contract_and_declarer` in
+`mlBridge/ffbridge_prediction_features.py` now picks the pass-out,
+part-score, game, or slam bucket with the most total probability first, then
+the best contract inside it. Measured on about 300,000 held-out rows each:
+
+| | ACBL club argmax | ACBL club bucket first | FFBridge argmax | FFBridge bucket first |
+|---|---|---|---|---|
+| Predicted game (actual 43.7% / 51.8%) | 54.4% | 44.4% | 63.8% | 55.9% |
+| Predicted part-score (actual 53.2% / 42.7%) | 43.7% | 54.5% | 33.1% | 41.4% |
+| Predicted pass-out (actual 0.59% / 0.53%) | 0.70% | 0.10% | 0.00% | 0.00% |
+| Right bucket | 74.5% | 77.1% | 74.7% | 76.4% |
+| Exact contract | 37.9% | 37.2% | 38.9% | 38.4% |
+| Declarer seat (played boards) | 66.4% | 66.7% | 66.8% | 66.8% |
+
+The cost is about 0.6 points of exact-contract accuracy. Choosing the exact
+level first instead (sum over strains and seats) removed less of the bias
+(ACBL club 52.2% predicted game).
+
 ### Prediction range for pair session percentages
 
 `acbl_prediction_rank_eval.py` now writes `ranking.interval`: the board-level

@@ -2426,7 +2426,6 @@ _POSTMORTEM_BOARD_COLUMNS = [
 ]
 _POSTMORTEM_CONTEXT_COLUMNS = [
     "section_name", "Date", "Declarer_ID", "Declarer_Direction",
-    "result", "tricks_taken",
     "Pair_Number_NS", "Pair_Number_EW",
     *(f"Player_ID_{seat}" for seat in "NESW"),
     *(f"Player_Name_{seat}" for seat in "NESW"),
@@ -2502,22 +2501,6 @@ def _normalize_postmortem_frame(frame: pl.DataFrame) -> pl.DataFrame:
         .alias(name)
         for name in name_columns
     ]
-    if "tricks_taken" in frame.columns and "Tricks" in frame.columns:
-        raw_tricks = pl.col("tricks_taken").cast(pl.Int16, strict=False)
-        expressions.append(
-            pl.when(raw_tricks.is_not_null())
-            .then(raw_tricks)
-            .otherwise(pl.col("Tricks"))
-            .alias("Tricks")
-        )
-    if "result" in frame.columns and "Result" in frame.columns:
-        raw_result = pl.col("result").cast(pl.Int16, strict=False)
-        expressions.append(
-            pl.when(raw_result.is_not_null())
-            .then(raw_result)
-            .otherwise(pl.col("Result"))
-            .alias("Result")
-        )
     return frame.with_columns(expressions) if expressions else frame
 
 
@@ -3065,8 +3048,8 @@ def session_frames_from_augmented_parquet(
     available = lazy.collect_schema().names()
     wanted = [
         "event_id", "session_id", "Date", "club_id", "club_name",
-        "event_name", "section_name", "Board", "Contract", "Result", "result",
-        "Tricks", "tricks_taken", "Declarer_Direction", "Declarer_ID",
+        "event_name", "section_name", "Board", "Contract", "Result",
+        "Tricks", "Declarer_Direction", "Declarer_ID",
         "Declarer_Name", "Score_NS", "Score_EW", "Pct_NS", "Pct_EW",
         "MP_NS", "MP_EW", "MP_Top", "Pair_Number_NS", "Pair_Number_EW",
         "PBN", "Vul", "Vul_NS", "Vul_EW", "DD_Tricks",

@@ -53,6 +53,26 @@ Accuracy is unchanged within noise, so the dates were not carrying signal.
 
 The model beats Elo alone by +0.037 (club: +0.023 on the old club models).
 
+### Caveats / follow-ups
+
+Found while fixing the out-of-range Pct_NS rows (`drop_out_of_range_pct`,
+2026-10-20). Both are left as is for now:
+
+- **Pct_NS + Pct_EW != 1 on in-range rows**: 14,021 tournament rows (of 19.0M)
+  and 38,857 club rows (of 71.8M) in the model-data shards. Each side is
+  within [0,1]; the pattern (e.g. MP 4.24 / 3.52 on a top of 8) looks like
+  ACBL adjusted or factored scores, which are real recorded results, so they
+  are kept. Open question: whether adjusted scores (average-plus /
+  average-minus) belong in the Pct_NS training target at all.
+- **Club MP_Top can be understated**: club data has no ACBL top, so
+  `add_board_matchpoint_top` in `mlBridge/mlBridgeAugmentLib.py` uses
+  tables-in-frame - 1. When some of a board's rows are missing from our data,
+  the top is too small and every Pct on that board is inflated, not just the
+  rows that end up above 1.0 (which are now dropped). Not measured. Fixing it
+  means deriving the club top from ACBL's matchpoints (e.g. the board's max
+  MP_NS + MP_EW) instead of the row count, in ACBL code rather than the
+  shared library, which FFBridge and postmortem also use.
+
 ---
 
 ## 2026-10-18 (evaluation only, no retrain: club rank and joint pick)

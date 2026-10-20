@@ -19,6 +19,9 @@ Next steps:
 
 TODO:
 1. why is 'section_name_right' appearing?
+2. club MP_Top is tables-in-frame - 1, so boards with missing rows get inflated
+   Pct_NS/Pct_EW. Derive it from ACBL's matchpoints instead (see RESULTS.md,
+   2026-10-20 caveats).
 """
 
 import polars as pl

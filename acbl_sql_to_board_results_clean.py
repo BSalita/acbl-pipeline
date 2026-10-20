@@ -65,8 +65,15 @@ _PAIR_ID_TOKEN = r'#[0-9]+|[0-9]+'
 
 
 def pair_id_list(column: str) -> pl.Expr:
-    """Player-number tokens from a pair id column. Names and broken JSON are skipped."""
-    return pl.col(column).str.extract_all(_PAIR_ID_TOKEN).alias(column)
+    """Player-number tokens from a pair id column. Names and broken JSON are skipped.
+
+    0 means the player has no ACBL number; it becomes null so it keeps its seat but is not an id.
+    """
+    return pl.col(column).str.extract_all(_PAIR_ID_TOKEN).list.eval(
+        pl.when(pl.element().str.contains(r"^0+$"))
+        .then(pl.lit(None, dtype=pl.String))
+        .otherwise(pl.element())
+    ).alias(column)
 
 
 # Tournament percentages come from ACBL and include a 9.99 sentinel and sessions
@@ -90,7 +97,7 @@ def get_club_schemas():
         'board_results':'SELECT id AS board_result_id, board_id, round_number, table_number, CAST(ns_pair AS INTEGER) AS ns_pair, CAST(ew_pair AS INTEGER) AS ew_pair, ns_score, ew_score, contract, declarer, ew_match_points, ns_match_points, opening_lead, result, tricks_taken FROM board_results',
         'boards':'SELECT id AS board_id, section_id, board_number FROM boards',
         'pair_summaries':'SELECT id AS pair_summary_id, section_id, CAST(pair_number AS INTEGER) AS pair_number, direction FROM pair_summaries',
-        'players':'SELECT id AS player_id, pair_summary_id, CAST(id_number AS INTEGER) AS player_number, name AS player_name, CAST(mp_total AS REAL) AS mp_total FROM players',
+        'players':'SELECT id AS player_id, pair_summary_id, NULLIF(CAST(id_number AS INTEGER), 0) AS player_number, name AS player_name, CAST(mp_total AS REAL) AS mp_total FROM players',
         'sessions':'SELECT id AS session_id, event_id, hand_record_id, game_date FROM sessions',
         'sections':'SELECT id AS section_id, session_id, name AS section_name FROM sections'
     }

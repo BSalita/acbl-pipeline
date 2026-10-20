@@ -135,6 +135,7 @@ for _p in (_SRC_DIR, _MLBRIDGE):
     if _s not in sys.path:
         sys.path.append(_s)
 import mlBridge  # noqa: E402
+import mlBridge.mlBridgeAugmentLib as mlBridgeAugmentLib  # noqa: E402
 
 rootPath = pathlib.Path('e:/bridge/data')
 acblPath = rootPath.joinpath('acbl')
@@ -345,16 +346,8 @@ def _build_joined_plan(
         lf = lf.join(rhs, on=[f"Player_ID_{direction}", "session_id"], how="left")
 
     lf = lf.with_columns(
-        Pair_IDs_NS=pl.concat_str([
-            pl.min_horizontal(pl.col("Player_ID_N").cast(pl.Utf8), pl.col("Player_ID_S").cast(pl.Utf8)),
-            pl.lit("-"),
-            pl.max_horizontal(pl.col("Player_ID_N").cast(pl.Utf8), pl.col("Player_ID_S").cast(pl.Utf8)),
-        ]),
-        Pair_IDs_EW=pl.concat_str([
-            pl.min_horizontal(pl.col("Player_ID_E").cast(pl.Utf8), pl.col("Player_ID_W").cast(pl.Utf8)),
-            pl.lit("-"),
-            pl.max_horizontal(pl.col("Player_ID_E").cast(pl.Utf8), pl.col("Player_ID_W").cast(pl.Utf8)),
-        ]),
+        Pair_IDs_NS=mlBridgeAugmentLib.pair_key_expr("Player_ID_N", "Player_ID_S"),
+        Pair_IDs_EW=mlBridgeAugmentLib.pair_key_expr("Player_ID_E", "Player_ID_W"),
     )
 
     for direction in ["NS", "EW"]:

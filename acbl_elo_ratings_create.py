@@ -315,10 +315,7 @@ def create_elo_ratings(club_or_tournament):
     ns_pairs = df.select([
         pl.col('Date'),
         pl.col('session_id'),
-        pl.when(pl.col('Player_ID_N') < pl.col('Player_ID_S'))
-          .then(pl.concat_str([pl.col('Player_ID_N'), pl.col('Player_ID_S')], separator='-'))
-          .otherwise(pl.concat_str([pl.col('Player_ID_S'), pl.col('Player_ID_N')], separator='-'))
-          .alias('Pair_IDs'),
+        mlBridgeAugmentLib.pair_key_expr('Player_ID_N', 'Player_ID_S').alias('Pair_IDs'),
         pl.col('Elo_R_NS_EventStart').alias('Elo_R_EventStart'),
         pl.col('Elo_R_NS_EventEnd').alias('Elo_R_EventEnd'),
         pl.col('^MasterPoints_[NESW]$'),
@@ -329,10 +326,7 @@ def create_elo_ratings(club_or_tournament):
     ew_pairs = df.select([
         pl.col('Date'),
         pl.col('session_id'),
-        pl.when(pl.col('Player_ID_E') < pl.col('Player_ID_W'))
-          .then(pl.concat_str([pl.col('Player_ID_E'), pl.col('Player_ID_W')], separator='-'))
-          .otherwise(pl.concat_str([pl.col('Player_ID_W'), pl.col('Player_ID_E')], separator='-'))
-          .alias('Pair_IDs'),
+        mlBridgeAugmentLib.pair_key_expr('Player_ID_E', 'Player_ID_W').alias('Pair_IDs'),
         pl.col('Elo_R_EW_EventStart').alias('Elo_R_EventStart'),
         pl.col('Elo_R_EW_EventEnd').alias('Elo_R_EventEnd'),
         pl.col('^MasterPoints_[NESW]$'),

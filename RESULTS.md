@@ -110,8 +110,21 @@ constant in `default.favorites.json` after a club retrain.
 
 ### Follow-up for the next retrain
 
-Try a longer, wider ACBL contract model the way FFBridge's was sized above,
-and compare exact contract, bucket, and level too high / too low.
+More epochs for the ACBL club contract model are probably not worth a
+retrain. 2026-10-21 test on a 3.8M-row spread sample of the club train file
+(production layers and lr, constant learning rate), joint pick with the
+production declarer model, bucket-first, same 320,000 test rows:
+
+| Club contract model | Exact | Right bucket | Level too high / too low | Seat |
+|---|---|---|---|---|
+| Production, 61.7M rows, 20 epochs | 37.4% | 77.2% | 18.7% / 27.8% | 66.9% |
+| Sample, 20 epochs (best epoch 17) | 34.3% | 76.2% | 20.7% / 27.5% | 64.9% |
+| Sample, up to 60 epochs (best epoch 24) | 34.5% | 76.1% | 21.0% / 26.9% | 65.0% |
+
+Rows matter far more than epochs. The sample overfits by epoch 17-24, so it
+cannot show where the full club run would stop; the full tournament run
+(17.7M rows, 2026-10-19 log) was still improving at epoch 20, by 0.2 points
+of validation accuracy over its last 5 epochs.
 
 ---
 

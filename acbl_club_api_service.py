@@ -2748,7 +2748,7 @@ def postmortem_sql(
     con = duckdb.connect(config={"enable_external_access": "false"})
     try:
         con.register("self", frame)
-        result = con.execute(query).pl()
+        result = con.sql(query).pl()
     except Exception as exc:
         raise ClubApiError(
             f"Postmortem SQL failed: {exc}", status_code=400) from exc
@@ -3349,7 +3349,7 @@ def session_sql(
     try:
         for name, frame in dfs.items():
             con.register(name, frame)
-        result = con.execute(query).pl()
+        result = con.sql(query).pl()
     except Exception as exc:
         raise ClubApiError(
             f"SQL failed: {exc}",

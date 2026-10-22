@@ -42,7 +42,7 @@ def read_sqlite_query(
         con.execute("SET sqlite_all_varchar = true")
         con.execute(f"ATTACH '{path_sql}' AS src (TYPE SQLITE, READ_ONLY)")
         con.execute("SET search_path = 'src'")
-        frame = con.execute(_sqlite_casts(query)).pl()
+        frame = con.sql(_sqlite_casts(query)).pl()
     finally:
         con.close()
     if not schema_overrides:

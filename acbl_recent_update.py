@@ -256,6 +256,7 @@ def scan_with_recent(
             left_on=pl.col("id").cast(pl.Utf8),
             right_on="id",
             how="anti",
+            maintain_order="left",
         )
     return pl.concat([historical_lf, recent_lf], how="diagonal_relaxed")
 

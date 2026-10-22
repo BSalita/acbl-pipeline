@@ -189,6 +189,29 @@ def _try_click_turnstile(page) -> None:
 CHALLENGE_TIMEOUT_MS = 6 * 60 * 60 * 1000
 CHALLENGE_RELOAD_S = 30
 
+# Phone alert (ntfy) when a challenge needs a human. postmortem_start.ps1 sets
+# both from the host config; without ACBL_CHALLENGE_NTFY_URL nothing is sent.
+# ACBL_CHALLENGE_SOLVE_URL is the noVNC page (Tailscale only) showing this
+# Chrome. Alert only after a few reloads failed to clear it on their own.
+CHALLENGE_NTFY_URL = os.getenv("ACBL_CHALLENGE_NTFY_URL", "")
+CHALLENGE_SOLVE_URL = os.getenv("ACBL_CHALLENGE_SOLVE_URL", "")
+CHALLENGE_ALERT_AFTER_S = 90
+CHALLENGE_ALERT_REPEAT_S = 60 * 60
+_last_challenge_alert = 0.0
+
+
+def _send_challenge_alert(title: str, message: str, priority: str) -> None:
+    if not CHALLENGE_NTFY_URL:
+        return
+    headers = {"Title": title, "Priority": priority, "Tags": "warning"}
+    if CHALLENGE_SOLVE_URL:
+        headers["Click"] = CHALLENGE_SOLVE_URL
+        headers["Actions"] = f"view, Open noVNC, {CHALLENGE_SOLVE_URL}"
+    try:
+        requests.post(CHALLENGE_NTFY_URL, data=message.encode("utf-8"), headers=headers, timeout=10)
+    except requests.RequestException as exc:
+        print(f"  ntfy alert failed: {exc}")
+
 
 def _wait_through_cloudflare(
     page,
@@ -217,6 +240,8 @@ def _wait_through_cloudflare(
     last_status = 0.0
     last_reload = time.time()
     clicked = False
+    alerted = False
+    global _last_challenge_alert
     while time.time() < deadline:
         content = ""
         try:
@@ -231,7 +256,34 @@ def _wait_through_cloudflare(
                 pass
             if announced:
                 print("  Cloudflare/WAF challenge cleared.")
+            if alerted:
+                _send_challenge_alert(
+                    "ACBL check cleared",
+                    "my.acbl.org is loading again. Club results fetching resumed.",
+                    "low",
+                )
             return True
+
+        if (
+            announced
+            and not alerted
+            and time.time() - started >= CHALLENGE_ALERT_AFTER_S
+            and time.time() - _last_challenge_alert >= CHALLENGE_ALERT_REPEAT_S
+        ):
+            url = ""
+            try:
+                url = page.url or ""
+            except Exception:
+                pass
+            _send_challenge_alert(
+                "ACBL needs a click",
+                "Cloudflare is asking 'Verify you are human' on my.acbl.org. "
+                "Open noVNC and click the checkbox in the Chrome window. "
+                f"The fetch waits up to {int(timeout_ms / 3600000)}h. Page: {url}",
+                "high",
+            )
+            alerted = True
+            _last_challenge_alert = time.time()
 
         if not announced:
             print("  Cloudflare/WAF challenge detected; waiting for it to clear...")

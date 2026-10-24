@@ -1,10 +1,11 @@
-"""Check that 2a/2b would read the same club data from 1b's parquets as from SQLite.
+"""Check that 2a/2b read the same data from parquet as they did from SQLite.
 
 Stages 2a (acbl_sql_to_hand_records_clean.py) and 2b
-(acbl_sql_to_board_results_clean.py) read acbl_club_results.sqlite, which 1b
-rebuilds from club_results_parquet/ every run (~7h20m). If every club query
-returns identical frames from both sources, 2a/2b can read the parquets and
-1b can run with --skip-sqlite.
+(acbl_sql_to_board_results_clean.py) used to read acbl_club_results.sqlite
+(built by 1b) and acbl_tournament_results.sqlite (built by 1e). Since
+2026-10-24 they read club_results_parquet/ and tournament_results_parquet/,
+and the SQLite builds are opt-in (--build-sqlite). Run this after a build
+with --build-sqlite to confirm both sources still agree.
 
 For each query this script:
   1. runs it through read_sqlite_query (the 2a/2b path) and read_parquet_query
@@ -17,7 +18,8 @@ Only compare SQLite and parquet from the same 1b run (the script warns if
 the parquet files are newer than the SQLite file).
 
 Usage:
-    python acbl_compare_sqlite_vs_parquet.py                 # all club tables
+    python acbl_compare_sqlite_vs_parquet.py                 # all club queries
+    python acbl_compare_sqlite_vs_parquet.py --side tournament
     python acbl_compare_sqlite_vs_parquet.py --tables boards sessions
     python acbl_compare_sqlite_vs_parquet.py --list
 
@@ -37,12 +39,18 @@ import time
 import polars as pl
 
 from acbl_sqlite_read import read_parquet_query, read_sqlite_query
-from acbl_sql_to_board_results_clean import get_club_schemas
-from acbl_sql_to_hand_records_clean import get_club_hand_records_schemas
+from acbl_sql_to_board_results_clean import get_club_schemas, get_tournament_schemas
+from acbl_sql_to_hand_records_clean import (
+    get_club_hand_records_schemas,
+    get_tournament_hand_records_schemas,
+)
 
 ACBL_PATH = pathlib.Path("e:/bridge/data/acbl")
-SQLITE_FILE = ACBL_PATH / "acbl_club_results.sqlite"
-PARQUET_DIR = ACBL_PATH / "club_results_parquet"
+SOURCES = {
+    "club": (ACBL_PATH / "acbl_club_results.sqlite", ACBL_PATH / "club_results_parquet"),
+    "tournament": (ACBL_PATH / "acbl_tournament_results.sqlite", ACBL_PATH / "tournament_results_parquet"),
+}
+SQLITE_FILE, PARQUET_DIR = SOURCES["club"]
 
 # Key columns per query (output names). hand_records has no id in its select.
 KEYS = {
@@ -55,12 +63,19 @@ KEYS = {
     "2b.players": ["player_id"],
     "2b.sessions": ["session_id"],
     "2b.sections": ["section_id"],
+    "2a.handrecord": ["hand_record_id"],
+    "2a.session": ["session_id"],
+    "2b.event": ["event_id"],
 }
 
 
-def _queries() -> dict[str, tuple[str, dict]]:
+def _queries(side: str = "club") -> dict[str, tuple[str, dict]]:
+    if side == "club":
+        steps = (("2a", get_club_hand_records_schemas()), ("2b", get_club_schemas()))
+    else:
+        steps = (("2a", get_tournament_hand_records_schemas()), ("2b", get_tournament_schemas()))
     out = {}
-    for step, (sql_d, schema_d) in (("2a", get_club_hand_records_schemas()), ("2b", get_club_schemas())):
+    for step, (sql_d, schema_d) in steps:
         for table, schema in schema_d.items():
             out[f"{step}.{table}"] = (sql_d[table], schema)
     return out
@@ -130,12 +145,16 @@ def _compare(name: str, sql: str, schema: dict, examples: int) -> bool:
 
 
 def main() -> int:
-    queries = _queries()
+    global SQLITE_FILE, PARQUET_DIR
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--side", choices=sorted(SOURCES), default="club",
+                        help="which SQLite/parquet pair to compare (default: club)")
     parser.add_argument("--tables", nargs="*", help="query names or bare table names (default: all)")
     parser.add_argument("--list", action="store_true", help="list query names and exit")
     parser.add_argument("--examples", type=int, default=5, help="example rows to print per difference")
     args = parser.parse_args()
+    SQLITE_FILE, PARQUET_DIR = SOURCES[args.side]
+    queries = _queries(args.side)
     if args.list:
         for name, (sql, _) in queries.items():
             print(f"{name}: {sql}")

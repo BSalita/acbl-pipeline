@@ -401,6 +401,87 @@ def _reusable_shards(saved_models_path: pathlib.Path, model_name: str):
 
 SPLIT_INDICATOR_COLS = ['is_train_set', 'is_val_set', 'is_test_set']
 
+# Contract can train on Declarer_Direction's shards: both drop only the other
+# targets, so X is the same and only y differs.
+SHARD_REUSE_TARGETS = {'Contract': 'Declarer_Direction'}
+SCHEMA_FEATURE_KEYS = ('numerical_feature_cols', 'categorical_feature_cols',
+                       'feature_dtypes', 'apply_scaling')
+
+
+def _schema_from_shared_shards(train_file: pathlib.Path, shared: dict, model_name: str,
+                               y_name: str, *, layers, dropout, y_range,
+                               keep_ev_duplicates: bool):
+    """Write y_name's schema without loading the full train frame.
+
+    Feature lists and dtypes come from a few rows prepared like the normal
+    path; they must equal the shard owner's. Scaling and category mappings
+    are copied from the owner (same rows and columns). Classes come from the
+    full y column. Returns (schema, y_frame), or (None, None) to fall back.
+    """
+    import json
+    cols = _input_columns(train_file, y_name, keep_ev_duplicates=keep_ev_duplicates)
+    try:
+        head = pl.read_parquet(train_file, columns=cols, n_rows=1000)
+        head = _prepare_target_frame(_cast_enums_to_categorical(head), y_name, for_training=True)
+        schema = generate_and_save_schema(
+            head, savedModelsPath, model_name, y_name,
+            layers=layers, dropout=dropout, apply_scaling_parameters=True,
+            y_range=y_range, verbose=False,
+        )
+    except Exception as exc:
+        print(f"[shard reuse] off: schema from sample rows failed: {exc}")
+        return None, None
+    src = shared['schema']
+    # json.dumps so dict key order counts too.
+    diff = [k for k in SCHEMA_FEATURE_KEYS if json.dumps(schema.get(k)) != json.dumps(src.get(k))]
+    if diff or schema.get('model_type') != src.get('model_type'):
+        print(f"[shard reuse] off: {y_name} features differ from {shared['y_name']} ({diff or 'model_type'})")
+        return None, None
+    y_df = _cast_enums_to_categorical(pl.read_parquet(train_file, columns=[y_name]))
+    if y_df.height != shared['rows']:
+        print(f"[shard reuse] off: {y_df.height:,} rows vs {shared['rows']:,} in the shards")
+        return None, None
+    for k in ('scaling_params', 'cat_feature_info', 'category_mappings'):
+        schema[k] = src[k]
+    # Same class list as generate_and_save_schema_classification.
+    classes = sorted(set(c for c in y_df[y_name].to_list() if c is not None), key=lambda x: str(x))
+    schema['classes'] = classes
+    schema['class_to_idx'] = {c: i for i, c in enumerate(classes)}
+    with open(savedModelsPath / f"{model_name}_schema.json", "w") as f:
+        json.dump(schema, f)
+    return schema, y_df
+
+
+def _swap_shard_targets(src_shards: list, schema: dict, y_df: pl.DataFrame) -> list:
+    """Rewrite each source shard with y from y_df under schema's model name.
+
+    X tensors are copied as is; y is built by the same code create_torch_shards
+    uses. Each source shard is deleted once its copy is written, so disk holds
+    about one shard set. New files are .tmp until all are written, so an
+    interrupted swap never leaves a partial set that --reuse-shards would take.
+    """
+    import torch
+    from mlBridge.mlBridgeAiLib import _shard_tensors, resolve_shards_path
+    y_schema = {**schema, 'numerical_feature_cols': [], 'categorical_feature_cols': []}
+    model_name = schema['model_name']
+    tmp_paths = []
+    offset = 0
+    for i, src in enumerate(src_shards):
+        payload = torch.load(src, map_location='cpu', mmap=True)
+        n = int(payload['y'].shape[0])
+        payload['y'] = _shard_tensors(y_df.slice(offset, n), y_schema, apply_scaling=True)['y']
+        offset += n
+        tmp = resolve_shards_path(savedModelsPath, model_name, i).with_suffix('.pt.tmp')
+        torch.save(payload, tmp)
+        del payload
+        gc.collect()
+        src.unlink()
+        tmp_paths.append(tmp)
+        print(f"   [shard reuse] {i + 1}/{len(src_shards)} {src.name} -> {tmp.with_suffix('').name}")
+    if offset != y_df.height:
+        raise RuntimeError(f"Shards hold {offset:,} rows but {schema['target_column']} has {y_df.height:,}")
+    return [p.rename(p.with_suffix('')) for p in tmp_paths]
+
 
 def _log_mem(label: str) -> None:
     try:
@@ -521,6 +602,8 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
     # end of this loop. `oof_classifier_preds` is intentionally left empty.
     oof_classifier_preds: Dict[str, pl.DataFrame] = {}
     test_classifier_preds: Dict[str, pl.DataFrame] = {}
+    # Shards built this run that a later target may reuse (SHARD_REUSE_TARGETS).
+    shared_shards: Optional[dict] = None
 
     for y_name in selected_targets:
 
@@ -623,12 +706,24 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         import json
         leftover_shards, leftover_schema = _reusable_shards(savedModelsPath, model_name)
         reusing_shards = bool(reuse_shards and leftover_shards)
+        swap_y_df = None
+        if (not reusing_shards and shared_shards is not None
+                and SHARD_REUSE_TARGETS.get(y_name) == shared_shards['y_name']):
+            print(f"Trying to reuse {shared_shards['y_name']} shards for {y_name}...")
+            schema_d, swap_y_df = _schema_from_shared_shards(
+                acbl_prediction_data_train_file, shared_shards, model_name, y_name,
+                layers=optimal_layers, dropout=optimal_dropout, y_range=optimal_y_range,
+                keep_ev_duplicates=keep_ev_duplicates,
+            )
         if reusing_shards:
             shard_bytes = sum(p.stat().st_size for p in leftover_shards)
             print(f"Reusing {len(leftover_shards)} leftover shards "
                   f"({shard_bytes / (1024**3):.1f} GB) and {leftover_schema.name}")
             with open(leftover_schema, "r", encoding="utf-8") as f:
                 schema_d = json.load(f)
+        elif swap_y_df is not None:
+            print(f"Schema {model_name}_schema.json written from {shared_shards['y_name']}'s features "
+                  f"and {swap_y_df.height:,} {y_name} labels; skipping the train load")
         else:
             _log_mem(f"{club_or_tournament}/{y_name} before train load")
             print(f"Loading {acbl_prediction_data_train_filename} for {y_name} shards...")
@@ -670,7 +765,19 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         if schema_layers != optimal_layers:
             print(f"âš ï¸ WARNING: Schema layers don't match! Expected {optimal_layers}, got {schema_layers}")
 
-        if not reusing_shards:
+        if swap_y_df is not None:
+            # Drop every other shard set (and any interrupted swap), then
+            # rewrite the shared shards with this target's y.
+            keep = set(shared_shards['shards'])
+            for p in list(savedModelsPath.glob("*model_shard_*.pt")) + list(savedModelsPath.glob("*model_shard_*.pt.tmp")):
+                if p.is_file() and p not in keep:
+                    p.unlink()
+            swap_started = time.time()
+            _swap_shard_targets(shared_shards['shards'], schema_d, swap_y_df)
+            print(f"Rewrote {len(shared_shards['shards'])} {shared_shards['y_name']} shards with "
+                  f"{y_name} targets in {time.time() - swap_started:.1f}s")
+            swap_y_df = None
+        elif not reusing_shards:
             # remove all shards to free up space.
             print("Removing all shards to free up space...")
             for p in savedModelsPath.glob("*model_shard_*.pt"):
@@ -694,6 +801,14 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
             )
             print("Feature scaling enabled for inputs; targets remain unscaled")
             print("Split indicators excluded from training shards")
+        # Only shards built from this run's train frame are offered to a later
+        # target; leftover (--reuse-shards) or swapped sets are not.
+        shared_shards = None
+        if working_df_for_training is not None and y_name in SHARD_REUSE_TARGETS.values():
+            built, _ = _reusable_shards(savedModelsPath, model_name)
+            if built:
+                shared_shards = {'y_name': y_name, 'schema': schema_d,
+                                 'shards': built, 'rows': len(working_df_for_training)}
 
         # takes 10m/12m
         # Remove old shards if they exist. Determine scale parameters, scale, create shard files.

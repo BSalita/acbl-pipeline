@@ -62,6 +62,10 @@ echo [Stage 1] Data ingestion...
 :: TIME:   MEASURED 2026-10-01: 36066s (10h 1m), ended 22:44:56.
 ::         1944 clubs, 7689 sessions extracted; last club 208 processed,
 ::         2 already on disk, Failed: 0. Incremental, network-bound.
+::         Since 2026-10-24: session requests start at most once per --sleep
+::         (no extra fixed sleep) and listing pages wait for their content
+::         instead of a fixed 2 s. --concurrency N (default 1) is opt-in; it
+::         only helps if page loads exceed --sleep.
 ::         A small daily catch-up is minutes; this pass was a full sweep.
 echo   [1a] Downloading club results to JSON...
 call :pyrun 1a acbl_club_download_to_json.py --sleep 2
@@ -177,6 +181,10 @@ echo [Stage 3] Augmentation...
 ::         Club 7214s (20.93M rows, 71.2 GB), tournament 556s (2.05M rows, 4.1 GB).
 ::         DD/Par/SD pbns_to_process=0. Previous warm rewrite 2026-09-11 was ~12 h.
 ::         3c is longer on a warm rewrite.
+::         Since 2026-10-24 a side is skipped (~1 s check) when its cleaned
+::         input, cache rows, code and versions match
+::         acbl_{club,tournament}_hand_records_augmented_manifest.json;
+::         --force recomputes. The first run after this change recomputes.
 echo   [3a] Augmenting hand records (DD + SD + Par)...
 call :pyrun 3a acbl_hand_records_augment.py
 if errorlevel 1 goto :error

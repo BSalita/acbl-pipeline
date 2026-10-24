@@ -282,7 +282,8 @@ def clean_hand_records(hrs_df):
     hrs_df = hrs_df.join(
         invalid_hrbs.select("HandRecordBoard"),
         on="HandRecordBoard",
-        how="anti"
+        how="anti",
+        maintain_order="left",
     )
     t0 = _timed('HandRecordBoard', t0)
 
@@ -351,7 +352,7 @@ def club_hand_records_clean():
     print(f"Tables read: {list(dfs_adbc.keys())}")
 
     hrs_df = dfs_adbc["hand_records"]
-    hrs_df = hrs_df.join(dfs_adbc['sessions'], how='left', on='hand_record_id')
+    hrs_df = hrs_df.join(dfs_adbc['sessions'], how='left', on='hand_record_id', maintain_order='left')
     hrs_df = hrs_df.with_columns(pl.col('game_date').str.strptime(pl.Datetime, format='%Y-%m-%d %H:%M:%S'))
     drop_rows = hrs_df['game_date'].lt(pl.date(2019,1,1)) # remove 15k rows for dates earlier than 2019. They're the earliest data and suspect.
     print(f"Dropping {hrs_df.filter(drop_rows).shape[0]} rows with dates earlier than 2019")
@@ -453,7 +454,7 @@ def tournament_hand_records_clean():
     # usage
     hrs_df = dfs_adbc["handrecord"]
     hrs_df = hrs_df.with_columns(board_record_string=hrs_to_brss(hrs_df, void="", ten="10")) # ugly but works
-    hrs_df = hrs_df.join(dfs_adbc["session"], on=['session_id'], how="left")
+    hrs_df = hrs_df.join(dfs_adbc["session"], on=['session_id'], how="left", maintain_order="left")
     hrs_df = hrs_df.with_columns(pl.concat_str(pl.col('start_date'),pl.col('start_time')).str.strptime(pl.Datetime, format='%Y%m%d%H:%M', strict=False).alias('game_date'))
     hrs_df = hrs_df.with_columns(pl.concat_str(pl.lit('NS: '),pl.col('double_dummy_ns')).alias('double_dummy_ns'))
     hrs_df = hrs_df.with_columns(pl.concat_str(pl.lit('EW: '),pl.col('double_dummy_ew')).alias('double_dummy_ew'))

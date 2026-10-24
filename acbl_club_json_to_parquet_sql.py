@@ -1,21 +1,26 @@
 """
-Club results ingest option F: parallel JSON -> Parquet -> SQLite.
+Club results ingest option F: parallel JSON -> Parquet (-> SQLite on request).
 
 Uses the same json_to_sql_walk extraction as the legacy .data.sql path, so
-row shapes match CreateSqlFile / acbl_club_results_schema.sql. Stage-2 and
-other legacy steps keep reading acbl_club_results.sqlite unchanged.
+row shapes match CreateSqlFile / acbl_club_results_schema.sql.
+
+Since 2026-10-24 the SQLite build is off by default: stages 2a/2b read the
+Parquet tables directly (acbl_compare_sqlite_vs_parquet.py showed identical
+query results), and the build took ~7h20m. Pass --build-sqlite to also
+write acbl_club_results.sqlite.
 
 Pipeline:
   1) ProcessPool over *.data.json in batches of --flush-every files
      (each batch writes Parquet shards then frees buffers)
   2) Stream-merge shards -> one Parquet file per table under club_results_parquet/
-  3) Apply acbl_club_results_schema.sql and bulk INSERT from Parquet (batched)
+  3) Only with --build-sqlite: apply acbl_club_results_schema.sql and bulk
+     INSERT from Parquet (batched)
 
 Usage:
   python acbl_club_json_to_parquet_sql.py
   python acbl_club_json_to_parquet_sql.py --workers 32 --flush-every 1000
-  python acbl_club_json_to_parquet_sql.py --skip-parquet   # reload SQLite from existing Parquet
-  python acbl_club_json_to_parquet_sql.py --skip-sqlite    # Parquet only
+  python acbl_club_json_to_parquet_sql.py --build-sqlite                 # Parquet + SQLite
+  python acbl_club_json_to_parquet_sql.py --skip-parquet --build-sqlite  # SQLite from existing Parquet
 
 Resource notes (64-core / 128-thread, 512 GB RAM):
   - Windows ProcessPoolExecutor caps max_workers at 61 (~50% of logical CPUs).
@@ -925,12 +930,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--skip-parquet",
         action="store_true",
-        help="Do not rebuild Parquet; load SQLite from existing --parquet-dir.",
+        help="Do not rebuild Parquet (with --build-sqlite: load SQLite from existing --parquet-dir).",
+    )
+    parser.add_argument(
+        "--build-sqlite",
+        action="store_true",
+        help=(
+            "Also build acbl_club_results.sqlite from the Parquet tables "
+            "(~7h20m for the full corpus). Off by default; 2a/2b read Parquet."
+        ),
     )
     parser.add_argument(
         "--skip-sqlite",
         action="store_true",
-        help="Stop after Parquet merge (do not build SQLite).",
+        help="Accepted for old command lines; skipping SQLite is now the default.",
     )
     parser.add_argument(
         "--preflight-only",
@@ -952,6 +965,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="SQLite executemany / Parquet slice batch size.",
     )
     args = parser.parse_args(argv)
+    if args.build_sqlite and args.skip_sqlite:
+        parser.error("--build-sqlite and --skip-sqlite contradict each other")
     if not args.workers or args.workers <= 0:
         args.workers = _default_workers()
     else:
@@ -1000,7 +1015,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             print(f"[parquet] skipped; using {args.parquet_dir}")
 
-        if not args.skip_sqlite:
+        if args.build_sqlite:
             load_sqlite_from_parquet(
                 args.parquet_dir,
                 args.db,
@@ -1008,7 +1023,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 batch_size=args.batch_size,
             )
         else:
-            print("[sqlite] skipped")
+            print("[sqlite] skipped (default; pass --build-sqlite to build it)")
     except Exception:
         traceback.print_exc()
         print_ended(t_prog)

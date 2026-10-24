@@ -1,8 +1,10 @@
 """
-Club JSON → SQLite builder.
+Club JSON → Parquet (and optionally SQLite) builder.
 
-Default path (option F): parallel JSON → Parquet → SQLite using
-acbl_club_json_to_parquet_sql.py and acbl_club_results_schema.sql.
+Default path (option F): parallel JSON → Parquet using
+acbl_club_json_to_parquet_sql.py. Since 2026-10-24 the SQLite build is off
+by default (stages 2a/2b read the Parquet tables); pass --build-sqlite to
+also write acbl_club_results.sqlite (same acbl_club_results_schema.sql).
 
 Legacy path (--legacy-sql-scripts): per-session .data.sql text files then
 executescript into an in-memory SQLite (slow; kept for comparison).
@@ -103,9 +105,10 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Build acbl_club_results.sqlite from club-results JSON. "
-            "Default: parallel JSON→Parquet→SQLite (same schema). "
-            "Use --legacy-sql-scripts for the old .data.sql path."
+            "Build club_results_parquet/ from club-results JSON. "
+            "Default: parallel JSON→Parquet; --build-sqlite also writes "
+            "acbl_club_results.sqlite. "
+            "Use --legacy-sql-scripts for the old .data.sql→SQLite path."
         )
     )
     parser.add_argument(
@@ -123,7 +126,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--flush-every", type=int, default=None)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--skip-parquet", action="store_true")
-    parser.add_argument("--skip-sqlite", action="store_true")
+    parser.add_argument(
+        "--build-sqlite", action="store_true",
+        help="Also build acbl_club_results.sqlite (off by default; ~7h20m).",
+    )
+    parser.add_argument(
+        "--skip-sqlite", action="store_true",
+        help="Accepted for old command lines; skipping SQLite is now the default.",
+    )
     parser.add_argument("--keep-shards", action="store_true")
     parser.add_argument(
         "--preflight-only",
@@ -147,6 +157,8 @@ def main(argv: list[str] | None = None) -> int:
         forwarded.extend(["--limit", str(args.limit)])
     if args.skip_parquet:
         forwarded.append("--skip-parquet")
+    if args.build_sqlite:
+        forwarded.append("--build-sqlite")
     if args.skip_sqlite:
         forwarded.append("--skip-sqlite")
     if args.keep_shards:

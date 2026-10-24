@@ -1,5 +1,7 @@
 @echo off
 setlocal EnableExtensions
+:: This script's folder. Inside a CALLed label %~dp0 is not the script's folder.
+set "PIPE_DIR=%~dp0"
 :: Use project venv (has requests, polars, torch, ...). Bare `python` on PATH
 :: is often the system install and will fail with ModuleNotFoundError.
 set "PY=%~dp0.venv\Scripts\python.exe"
@@ -39,6 +41,13 @@ echo ======================================================================
 echo.
 echo Using: %PY%
 echo Start: %date% %time%
+:: Each step's output is also saved to logs\acbl_all_<start time>\<step>.log
+:: (via acbl_step_log.py); summary.log collects the TIME[...] lines.
+for /f %%t in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "RUN_STAMP=%%t"
+set "LOG_DIR=%PIPE_DIR%logs\acbl_all_%RUN_STAMP%"
+if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
+echo Logs:  %LOG_DIR%
+>"%LOG_DIR%\summary.log" echo Start: %date% %time%
 echo.
 call :now PIPE_T0
 
@@ -62,7 +71,12 @@ if errorlevel 1 goto :error
 :: READS:  acbl/club-results/*/details/*.data.json
 :: WRITES: acbl/club_results_parquet/*.parquet
 ::         (acbl/acbl_club_results.sqlite only with --build-sqlite; see below)
-:: TIME:   ~16 min expected without the SQLite build (Parquet merge was 16m20s).
+:: TIME:   Since 2026-10-24 parsed JSON is cached per 200-file chunk in
+::         acbl/club_results_parquet_cache/ (~20 GB); only new or changed files
+::         are re-parsed (--rebuild-cache forces a full parse). Measured on the
+::         full corpus: nothing new 45 s; cold (first run) ~38 min; a typical
+::         run with a few thousand new files ~7-8 min (merge is the floor).
+::         Before the cache: ~16 min without the SQLite build (2026-10-01).
 ::         MEASURED 2026-10-01 22:45 -^> 10-02 06:40 WITH the SQLite build:
 ::         28533s (7h 56m). 1,335,293 JSON files, err=0. Parquet merge
 ::         16m20s, sqlite preflight 6m44s, table load ~7h20m, 139.34 GB.
@@ -386,6 +400,8 @@ set /a PIPE_H=PIPE_ELAPSED/3600
 set /a PIPE_M=(PIPE_ELAPSED %% 3600)/60
 set /a PIPE_S=PIPE_ELAPSED %% 60
 echo  TIME[total]: %PIPE_ELAPSED%s (%PIPE_H%h %PIPE_M%m %PIPE_S%s)
+>>"%LOG_DIR%\summary.log" echo  TIME[total]: %PIPE_ELAPSED%s (%PIPE_H%h %PIPE_M%m %PIPE_S%s)
+echo  Logs: %LOG_DIR%
 echo.
 echo  Downstream consumers and their required files:
 echo.
@@ -422,7 +438,7 @@ set "STEP_LABEL=%~1"
 shift
 del /q "%STEP_OK%" 2>nul
 call :now STEP_T0
-"%PY%" %1 %2 %3 %4 %5 %6 %7 %8 %9 && echo.>"%STEP_OK%"
+"%PY%" "%PIPE_DIR%acbl_step_log.py" "%LOG_DIR%\%STEP_LABEL%.log" %1 %2 %3 %4 %5 %6 %7 %8 %9 && echo.>"%STEP_OK%"
 if not exist "%STEP_OK%" exit /b 1
 call :toc %STEP_LABEL%
 exit /b 0
@@ -446,11 +462,15 @@ set /a STEP_H=STEP_ELAPSED/3600
 set /a STEP_M=(STEP_ELAPSED %% 3600)/60
 set /a STEP_S=STEP_ELAPSED %% 60
 echo   TIME[%~1]: %STEP_ELAPSED%s (%STEP_H%h %STEP_M%m %STEP_S%s) ended %date% %time%
+>>"%LOG_DIR%\%~1.log" echo   TIME[%~1]: %STEP_ELAPSED%s (%STEP_H%h %STEP_M%m %STEP_S%s) ended %date% %time%
+>>"%LOG_DIR%\summary.log" echo   TIME[%~1]: %STEP_ELAPSED%s (%STEP_H%h %STEP_M%m %STEP_S%s) ended %date% %time%
 echo.
 goto :eof
 
 :error
 echo.
 echo *** FAILED/INTERRUPTED at step %STEP_LABEL% %date% %time% ***
+>>"%LOG_DIR%\summary.log" echo *** FAILED/INTERRUPTED at step %STEP_LABEL% %date% %time% ***
+echo  Step log: %LOG_DIR%\%STEP_LABEL%.log
 del /q "%STEP_OK%" 2>nul
 exit /b 1

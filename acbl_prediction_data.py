@@ -343,7 +343,7 @@ def _build_joined_plan(
                 "Elo_R_EventStart": f"Elo_R_{direction}_EventStart",
             })
         )
-        lf = lf.join(rhs, on=[f"Player_ID_{direction}", "session_id"], how="left")
+        lf = lf.join(rhs, on=[f"Player_ID_{direction}", "session_id"], how="left", maintain_order="left")
 
     lf = lf.with_columns(
         Pair_IDs_NS=mlBridgeAugmentLib.pair_key_expr("Player_ID_N", "Player_ID_S"),
@@ -360,7 +360,7 @@ def _build_joined_plan(
                 "Elo_R_EventStart": f"Elo_R_{direction}_EventStart",
             })
         )
-        lf = lf.join(rhs, on=[f"Pair_IDs_{direction}", "session_id"], how="left")
+        lf = lf.join(rhs, on=[f"Pair_IDs_{direction}", "session_id"], how="left", maintain_order="left")
 
     plan_schema = lf.collect_schema()
     if 'section_name' not in plan_schema.names():
@@ -421,7 +421,7 @@ def _stream_concat_shards(shards: list, out_path: pathlib.Path, label: str) -> N
     t = time.time()
     (
         pl.concat([pl.scan_parquet(s) for s in shards], how='vertical_relaxed')
-        .sink_parquet(out_path, compression='zstd', compression_level=3, maintain_order=False)
+        .sink_parquet(out_path, compression='zstd', compression_level=3, maintain_order=True)
     )
     print(f"  {label} merged in {time.time() - t:.1f}s; "
           f"size={out_path.stat().st_size / (1024**3):.2f}GB")
@@ -445,25 +445,23 @@ def _scan_source_shards(src_paths, columns: list[str]) -> pl.LazyFrame:
     """Scan model-data shards that do not all share one schema.
 
     Newer months add columns such as Is_Sacrifice_Opportunity, and some of
-    those files store player ids as integers. Group identical projections,
-    cast the id columns to text, and fill a column the file does not have
-    with null.
+    those files store player ids as integers. Cast the id columns to text,
+    and fill a column the file does not have with null.
+
+    Files are scanned one at a time in the given (date) order, so rows keep
+    the source order. 5c holds out the last rows of the train file for
+    validation, so they must be the newest. Grouping files by schema used to
+    reorder months (2026-10-24: club validation rows were 95% from 2022).
     """
     paths = [src_paths] if isinstance(src_paths, (str, pathlib.Path)) else list(src_paths)
     union: dict[str, pl.DataType] = {}
-    groups: dict[tuple, list] = {}
     for path in paths:
-        schema = _shard_schema(path)
-        for name, dtype in schema.items():
+        for name, dtype in _shard_schema(path).items():
             union.setdefault(name, dtype)
-        signature = tuple(
-            (name, str(schema[name]) if name in schema else None) for name in columns
-        )
-        groups.setdefault(signature, []).append((path, schema))
 
     frames = []
-    for group in groups.values():
-        schema = group[0][1]
+    for path in paths:
+        schema = _shard_schema(path)
         exprs = []
         for name in columns:
             if name not in schema:
@@ -474,7 +472,7 @@ def _scan_source_shards(src_paths, columns: list[str]) -> pl.LazyFrame:
                 exprs.append(pl.col(name))
         frames.append(
             pl.scan_parquet(
-                [path for path, _schema in group],
+                path,
                 extra_columns="ignore",
                 missing_columns="insert",
             ).select(exprs)
@@ -658,7 +656,7 @@ def prepare_prediction_data(
         print(f"\nStreaming TRAIN -> {train_path.name}")
         show_memory('before train sink')
         t_train = time.time()
-        train_lf.sink_parquet(train_path, compression='zstd', compression_level=3, maintain_order=False)
+        train_lf.sink_parquet(train_path, compression='zstd', compression_level=3, maintain_order=True)
         print(f"  TRAIN done in {time.time() - t_train:.1f}s; "
               f"size={train_path.stat().st_size / (1024**3):.2f}GB")
         show_memory('after train sink')
@@ -667,7 +665,7 @@ def prepare_prediction_data(
         print(f"\nStreaming TEST  -> {test_path.name}")
         show_memory('before test sink')
         t_test = time.time()
-        test_lf.sink_parquet(test_path, compression='zstd', compression_level=3, maintain_order=False)
+        test_lf.sink_parquet(test_path, compression='zstd', compression_level=3, maintain_order=True)
         print(f"  TEST done in {time.time() - t_test:.1f}s; "
               f"size={test_path.stat().st_size / (1024**3):.2f}GB")
         show_memory('after test sink')
@@ -759,7 +757,7 @@ def prepare_prediction_data(
                 joined = _build_joined_plan(base, player_elo=player_elo, pair_elo=pair_elo)
                 lf = _add_split_cols(joined, split)
                 lf.sink_parquet(shard, compression='zstd', compression_level=3,
-                                maintain_order=False)
+                                maintain_order=True)
 
                 size_gb = shard.stat().st_size / (1024**3)
                 print(f"[{yr}/{split}] done in {time.time() - t:.1f}s; size={size_gb:.2f}GB")

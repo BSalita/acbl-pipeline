@@ -175,8 +175,14 @@ def _read_global_stdev_seeds(parquet_path: pathlib.Path) -> dict:
     return seeds
 
 
-def create_elo_ratings(club_or_tournament):
-    """Create Elo ratings and lookup tables for players and pairs."""
+def create_elo_ratings(club_or_tournament, out_dir=None):
+    """Create Elo ratings and lookup tables for players and pairs.
+
+    out_dir: where outputs are written (default: acblPath). Inputs and the
+    previous-run seed parquet are always read from acblPath.
+    """
+    out_path = pathlib.Path(out_dir) if out_dir else acblPath
+    out_path.mkdir(parents=True, exist_ok=True)
     print(f"Processing {club_or_tournament} Elo ratings...")
     # Read K-dampening global-stdev seeds from a previous run's parquet (if
     # any). First run after the field-relative math change picks up nothing
@@ -272,7 +278,7 @@ def create_elo_ratings(club_or_tournament):
     )
     # Save full Elo ratings
     acbl_club_elo_ratings_filename = f'acbl_{club_or_tournament}_elo_ratings.parquet'
-    acbl_club_elo_ratings_file = acblPath.joinpath(acbl_club_elo_ratings_filename)
+    acbl_club_elo_ratings_file = out_path.joinpath(acbl_club_elo_ratings_filename)
     df.write_parquet(acbl_club_elo_ratings_file)
     print(f"Saved {acbl_club_elo_ratings_filename}: shape:{df.shape} size:{acbl_club_elo_ratings_file.stat().st_size}")
     
@@ -305,7 +311,7 @@ def create_elo_ratings(club_or_tournament):
     
     # Save player Elo lookup
     acbl_club_player_elo_filename = f'acbl_{club_or_tournament}_player_elo_ratings.parquet'
-    acbl_club_player_elo_file = acblPath.joinpath(acbl_club_player_elo_filename)
+    acbl_club_player_elo_file = out_path.joinpath(acbl_club_player_elo_filename)
     player_elo_lookup.write_parquet(acbl_club_player_elo_file)
     print(f"Saved {acbl_club_player_elo_filename}: shape:{player_elo_lookup.shape} size:{acbl_club_player_elo_file.stat().st_size}")
     
@@ -346,7 +352,7 @@ def create_elo_ratings(club_or_tournament):
 
     # Save pair Elo lookup
     acbl_club_pair_elo_filename = f'acbl_{club_or_tournament}_pair_elo_ratings.parquet'
-    acbl_club_pair_elo_file = acblPath.joinpath(acbl_club_pair_elo_filename)
+    acbl_club_pair_elo_file = out_path.joinpath(acbl_club_pair_elo_filename)
     pair_elo_lookup.write_parquet(acbl_club_pair_elo_file)
     print(f"Saved {acbl_club_pair_elo_filename}: shape:{pair_elo_lookup.shape} size:{acbl_club_pair_elo_file.stat().st_size}")
 
@@ -356,7 +362,7 @@ def create_elo_ratings(club_or_tournament):
     print("Computing shrinkage metadata...")
     shrinkage_meta = _compute_shrinkage_metadata(player_elo_lookup, pair_elo_lookup)
     meta_filename = f'acbl_{club_or_tournament}_elo_shrinkage.json'
-    meta_file = acblPath.joinpath(meta_filename)
+    meta_file = out_path.joinpath(meta_filename)
     meta_file.write_text(json.dumps(shrinkage_meta, indent=2), encoding='utf-8')
     print(f"Saved {meta_filename}: player_prior={shrinkage_meta.get('player', {}).get('prior_anchor')} "
           f"pair_prior={shrinkage_meta.get('pair', {}).get('prior_anchor')}")
@@ -369,15 +375,16 @@ def _parse_club_tournament_args():
     parser = argparse.ArgumentParser(description="Create ACBL Elo ratings.")
     parser.add_argument("--club", action="store_true", help="Process club data only")
     parser.add_argument("--tournament", action="store_true", help="Process tournament data only")
+    parser.add_argument("--out-dir", default=None, help="Write outputs here instead of e:/bridge/data/acbl")
     args = parser.parse_args()
     if not args.club and not args.tournament:
-        return ["club", "tournament"]
+        return ["club", "tournament"], args.out_dir
     modes = []
     if args.club:
         modes.append("club")
     if args.tournament:
         modes.append("tournament")
-    return modes
+    return modes, args.out_dir
 
 
 if __name__ == "__main__":
@@ -385,9 +392,10 @@ if __name__ == "__main__":
     from mlBridge import print_started, print_ended
     program_start_time = print_started()
 
-    for club_or_tournament in _parse_club_tournament_args():
+    modes, out_dir = _parse_club_tournament_args()
+    for club_or_tournament in modes:
         t = time.time()
-        create_elo_ratings(club_or_tournament)
+        create_elo_ratings(club_or_tournament, out_dir=out_dir)
         print(f"{club_or_tournament} processing elapsed time in seconds: {time.time() - t}")
         print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
         print("-" * 70, "\n")

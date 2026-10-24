@@ -4,6 +4,7 @@
 #notebook
 #jupyterlab_execute_time
 numpy
+numba==0.68.0  # Elo kernels; pulls llvmlite==0.50.0
 pathlib
 python-dotenv
 pandas

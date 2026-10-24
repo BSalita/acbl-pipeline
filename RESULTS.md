@@ -21,6 +21,42 @@ Reading the metrics:
 
 ---
 
+## 2026-10-24 (tournament A/B: drop the 3,920 duplicate EV inputs)
+
+Each `EV_<pair>_<dir>_<strain>_<level>_<vul>_<tricks>_<score>` input is
+`Probs_<pair>_<dir>_<strain>_<tricks>` × score, so after z-scoring it is the
+`Probs` column again (checked on 57,912 rows: max relative gap 4e-8). 5c now
+skips them (`DUPLICATE_INPUT_PATTERNS` in `acbl_prediction_train.py`;
+`--keep-ev-duplicates` restores them). Pct_NS already pruned them, so only the
+two classifiers change. A/B: tournament Declarer_Direction and Contract
+retrained on the same 2026-10-19 train/test parquets as the 2026-10-20 models,
+written to `F:\bridge\data\acbl\ab_5c_ev_dedup` (served models untouched).
+Same code otherwise (no shard reuse or prefetch yet). The machine was busy
+with other test jobs, so times are pessimistic.
+
+| Tournament test (1.27M rows) | 2026-10-20 (6,030 inputs) | 2026-10-24 (2,110 inputs) |
+|---|---|---|
+| Declarer_Direction accuracy | 0.6516 | 0.6574 |
+| Declarer_Direction macro F1 | 0.6510 | 0.6568 |
+| Declarer_Direction best val_acc | 0.6701 | 0.6742 |
+| Contract accuracy | 0.3822 | 0.3843 |
+| Contract macro F1 | 0.0735 | 0.0739 |
+| Contract best val_acc | 0.3987 | 0.4011 |
+| Epoch time, 20 epochs each (DD / Contract) | 1.55 h / 2.05 h | 0.79 h / 0.55 h |
+| Shard size | ~24 GB | 8.4 GB |
+
+Both runs: 20 epochs, no early stop. The two runs agree on 87.1% (DD) and
+80.6% (Contract) of test predictions. The whole A/B run (load, shards, 20
+epochs and eval for both models) took 1.87 h.
+
+Accuracy went up slightly, not down. A likely reason: 14 copies of each
+`Probs` column acted like a larger learning rate on those inputs (not
+tested separately). Club classifiers are
+not retrained yet; at club size the train frame drops from ~1.4 TB to
+~0.35 TB decoded, so it should no longer page.
+
+---
+
 ## 2026-10-20 (evaluation only, no retrain: contract level bias)
 
 Prompted by a postmortem report (club session 993420: boards 13, 14, and 22

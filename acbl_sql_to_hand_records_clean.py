@@ -86,9 +86,82 @@ def _parse_acbl_par(value: str) -> tuple | None:
     return (score, contracts)
 
 
+# One DD token, e.g. S4, 4S, S4/5 or 4/5S.
+_DD_TOKEN = r'(?:[CDHSN]\d+|\d+[CDHSN]|[CDHSN]\d+/\d+|\d+/\d+[CDHSN])'
+_RANKS = 'AKQJT98765432'
+_BRS_CHARS = '23456789ACDHJKQST' # each appears 4 times in a valid brs (10 written as T)
+
+
+def _timed(label, t0):
+    t = time.time()
+    print(f"[time] {label}: {t-t0:.1f}s")
+    return t
+
+
+def _unique_in_threads(fn, s: pl.Series, n: int = 16):
+    """Run fn on n slices of s.unique() in threads and concat. Polars releases the GIL, so this uses n cores."""
+    from concurrent.futures import ThreadPoolExecutor
+    u = s.unique()
+    k = (len(u) + n - 1) // n
+    with ThreadPoolExecutor(n) as ex:
+        return pl.concat(list(ex.map(fn, [u.slice(i*k, k) for i in range(n)])))
+
+
+def _validate_brs_unique(brs: pl.Series) -> pl.Series:
+    """mlBridgeLib.validate_brs for each unique value. Returns the valid values.
+
+    Vectorized check first; values it rejects go through validate_brs too,
+    which logs them and has the final say.
+    """
+    u = brs.unique().to_frame('brs')
+    s = pl.col('brs').str.replace_all('10', 'T', literal=True)
+    ok = ~pl.col('brs').str.contains('-', literal=True) & ~pl.col('brs').str.contains('T', literal=True) & s.str.len_chars().eq(68)
+    for c in _BRS_CHARS:
+        ok = ok & s.str.count_matches(c, literal=True).eq(4)
+    ok = ok & s.str.slice(0, 17).str.count_matches('[SHDC]').eq(4)
+    u = u.with_columns(ok.alias('ok'))
+    bad = u.filter(~pl.col('ok'))['brs']
+    rescued = [v for v in bad if mlBridgeLib.validate_brs(v)]
+    return pl.concat([u.filter(pl.col('ok'))['brs'], pl.Series('brs', rescued, dtype=pl.String)])
+
+
+def _brs_to_pbn_unique(brs: pl.Series) -> pl.DataFrame:
+    """mlBridgeLib.brs_to_pbn for each unique value, as a brs -> PBN table.
+
+    For a complete deal brs_to_pbn only reorders hands to NESW and sorts each
+    suit AKQJT..2, which is done here with string ops. Anything else (missing,
+    repeated or unknown cards) goes through brs_to_pbn itself.
+    """
+    u = brs.unique().to_frame('board_record_string')
+    g = u.select(pl.col('board_record_string').str.extract_groups('^' + r'S(.*)H(.*)D(.*)C(.*)' * 4).alias('g')).unnest('g')
+    # h0..h15 in brs order: hand (N,W,E,S) * 4 + suit (S,H,D,C)
+    g = g.select([pl.col(c).str.replace_all('10', 'T', literal=True).alias(f'h{i}') for i, c in enumerate(g.columns)])
+
+    def sort_suit(h): # distinct ranks of h, in AKQJT..2 order
+        return pl.concat_str([pl.when(h.str.contains(r, literal=True)).then(pl.lit(r)).otherwise(pl.lit('')) for r in _RANKS])
+
+    # separate columns so Polars runs them in parallel
+    g = g.with_columns([sort_suit(pl.col(f'h{i}')).alias(f's{i}') for i in range(16)]
+                       + [sort_suit(pl.concat_str([pl.col(f'h{hand*4+j}') for hand in range(4)])).alias(f'u{j}') for j in range(4)])
+    n = lambda c: pl.col(c).str.len_chars()
+    ok = pl.all_horizontal(
+        [n(f's{i}').eq(n(f'h{i}')) for i in range(16)] # no repeated or unknown cards in a suit
+        + [pl.sum_horizontal([n(f'h{hand*4+j}') for j in range(4)]).eq(13) for hand in range(4)] # 13 cards per hand
+        + [n(f'u{j}').eq(13) & pl.sum_horizontal([n(f'h{hand*4+j}') for hand in range(4)]).eq(13) for j in range(4)]) # each card once
+    pbn = pl.concat_str([pl.lit('N:'), pl.concat_str([pl.concat_str([pl.col(f's{hand*4+j}') for j in range(4)], separator='.') for hand in [0, 2, 3, 1]], separator=' ')])
+    out = pl.concat([u, g], how='horizontal').select('board_record_string', pl.when(ok.fill_null(False)).then(pbn).alias('PBN'))
+    odd = out.filter(pl.col('PBN').is_null())
+    if odd.height:
+        print(f"brs_to_pbn fallback for {odd.height} odd board_record_strings")
+        odd = odd.with_columns(pl.col('board_record_string').map_elements(mlBridgeLib.brs_to_pbn, return_dtype=pl.String).alias('PBN'))
+        out = pl.concat([out.filter(pl.col('PBN').is_not_null()), odd])
+    return out
+
+
 def clean_hand_records(hrs_df):
     # common to club and tournament
     print(f"Initial hrs_df shape: {hrs_df.shape}")
+    t0 = time.time()
 
     hrs_renames = {
         'board': 'Board',
@@ -100,13 +173,15 @@ def clean_hand_records(hrs_df):
     }
     hrs_df = hrs_df.rename(hrs_renames)
 
-    # takes 2s
     # drop rows having board numbers > 255. doesn't pass the sniff test.
-    drop_rows = hrs_df.filter(pl.col('Board') > 255)
-    print(f"Dropping {drop_rows.shape[0]} rows with Board > 255")
-    if drop_rows.shape[0] > 0:
-        print(drop_rows['Board'].value_counts())
-    hrs_df = hrs_df.join(drop_rows, on=hrs_df.columns, how='anti') # Thanks to chatgpt for this trick. I had no idea anti-join was a thing.
+    # Same rows as the old anti-join on all columns: rows with a null anywhere never matched, so they stay.
+    drop_rows = pl.col('Board').gt(255).fill_null(False) & pl.all_horizontal(pl.all().is_not_null())
+    n_drop = hrs_df.select(drop_rows.sum()).item()
+    print(f"Dropping {n_drop} rows with Board > 255")
+    if n_drop > 0:
+        print(hrs_df.filter(pl.col('Board') > 255)['Board'].value_counts())
+        hrs_df = hrs_df.filter(~drop_rows)
+    t0 = _timed('board > 255', t0)
 
     print("Dealer value counts:")
     print(hrs_df['Dealer'].value_counts())
@@ -122,33 +197,36 @@ def clean_hand_records(hrs_df):
     hrs_df = hrs_df.filter(pl.col('Vul').is_not_null())
     print("After normalization:")
     print(hrs_df['Vul'].value_counts())
+    t0 = _timed('dealer/vul normalize', t0)
 
-    # takes 5s
     # drop rows having board numbers with non-normal vuls. e.g. Board 1 having N-S vul. around 3500 instances.
-    drop_rows = pl.Series([v != mlBridgeLib.vul_syms[mlBridgeLib.BoardNumberToVul(bn)] for bn,v in zip(hrs_df['Board'],hrs_df['Vul'])])
-    print(f"Dropping {drop_rows.sum()} rows with non-normal vulnerability")
+    # Same as mlBridgeLib.BoardNumberToVul: bn-=1; (bn//4 + (bn&3)) & 3
+    assert hrs_df['Board'].null_count() == 0
+    bn = pl.col('Board').cast(pl.Int64) - 1
+    vul_idx = ((bn // 4) + (bn & 3)) & 3
+    drop_rows = pl.col('Vul') != vul_idx.replace_strict(list(range(4)), mlBridgeLib.vul_syms, return_dtype=pl.Utf8)
+    print(f"Dropping {hrs_df.select(drop_rows.sum()).item()} rows with non-normal vulnerability")
     hrs_df = hrs_df.filter(~drop_rows)
     print(f"After vul filter: {hrs_df.shape}")
+    t0 = _timed('vul filter', t0)
 
-    # takes 1s
     hrs_df = hrs_df.with_columns(pl.col('board_record_string').str.replace_all('-', ''))
 
-    # takes 1m30s/8s
     # drop results whose board_record_string contains invalid characters (5492639, 13290144) or wrong number of cards (4754685, 6213531)
     print("Validating board_record_strings...")
-    hrs_df = hrs_df.filter(pl.col('board_record_string').map_elements(mlBridgeLib.validate_brs,return_dtype=pl.Boolean))
+    valid_brs = _unique_in_threads(_validate_brs_unique, hrs_df['board_record_string'])
+    hrs_df = hrs_df.filter(pl.col('board_record_string').is_in(valid_brs))
     print(f"After validation: {hrs_df.shape}")
+    t0 = _timed('validate brs', t0)
 
-    # takes 1s
     # drop rows which have empty double dummy or par columns. They're probably all SHUFFLE.
     b1 = hrs_df['ACBL_double_dummy_ns'] != ''
     b2 = hrs_df['ACBL_double_dummy_ew'] != ''
     b3 = hrs_df['ACBL_Par'] != ''
-    assert all(b1 == b2) and all(b1 == b3)
-    print(f"Dropping {hrs_df.filter(~b1).shape[0]} rows with empty DD/Par columns")
+    assert (b1 == b2).fill_null(False).all() and (b1 == b3).fill_null(False).all()
+    print(f"Dropping {(~b1).sum()} rows with empty DD/Par columns")
     hrs_df = hrs_df.filter(b1) # drop rows which have empty double dummy or par columns
 
-    # takes 5s
     # clean double dummy columns. rewrite into standarized form.
     # todo: cleaning and validations need to be done in previous notebook
     dd_cols = ['ACBL_double_dummy_ns','ACBL_double_dummy_ew']
@@ -157,82 +235,39 @@ def clean_hand_records(hrs_df):
         hrs_df =  hrs_df.with_columns(pl.col(d).str.replace_all('NT','N').str.replace_all(r'  ',' ')) # unsure why str.replace(r'\s+',' ') doesn't remove double spaces.
         assert not hrs_df[d].str.contains('NT').any()
         b = hrs_df[d].str.count_matches(' ').ne(5) | ~hrs_df[d].str.starts_with(d[-2:].upper()+': ')
-        wrong_counts = hrs_df.filter(b)
-        print(f"Dropping {wrong_counts.shape[0]} rows with wrong DD format for {d}")
+        print(f"Dropping {b.sum()} rows with wrong DD format for {d}")
         hrs_df = hrs_df.filter(~b)
+    t0 = _timed('DD format', t0)
 
-    # takes 3m30s/20s
-    # rewrite double dummy columns into more usable format
-    # put into acbllib.py
-    print("Processing double dummy makes...")
-    ACBL_DDmakes_l = []
-    zdd = zip(hrs_df['ACBL_double_dummy_ns'],hrs_df['ACBL_double_dummy_ew'])
-    for nsewdd in zdd:
-        tricks = {}
-        for dd in nsewdd:
-            split_space = dd.split(' ')
-            ds = split_space[0][:2].upper()
-            assert len(split_space) == 6
-            for ddsuit in split_space[1:]:
-                found = re.findall(r'(^([CDHSN])(\d+)$)|(^(\d+)([CDHSN])$)|(^([CDHSN])(\d+)\/(\d+)$)|(^(\d+)\/(\d+)([CDHSN])$)',ddsuit)
-                assert len(found) == 1
-                r = found[0]
-                if r[0] != '': # S4 -- direction makes 4 tricks in spades
-                    assert r[1] in 'CDHSN' and r[2].isdigit()
-                    suit = r[1]
-                    levelNE = levelSW = int(r[2])
-                elif r[3] != '': # 4S -- direction makes 10 tricks in spades
-                    assert r[4].isdigit() and r[5] in 'CDHSN'
-                    levelNE = levelSW = int(r[4])+6
-                    suit = r[5]
-                elif r[6] != '': # S4/5 -- direction (N or E) makes 4 tricks in spades, direction (S or W) makes 5 tricks
-                    assert r[7] in 'CDHSN' and r[8].isdigit() and r[9].isdigit()
-                    suit = r[7]
-                    levelNE = int(r[8])
-                    levelSW = int(r[9])
-                elif r[10] != '': # S4/5 -- direction (N or E) makes 10 tricks in spades, direction (S or W) makes 11 tricks
-                    assert r[11].isdigit() and r[12].isdigit() and r[13] in 'CDHSN'
-                    levelNE = int(r[11])+6
-                    levelSW = int(r[12])+6
-                    suit = r[13]
-                else:
-                    assert False
-                assert ds[0]+suit not in tricks
-                tricks[ds[0]+suit] = levelNE
-                assert ds[1]+suit not in tricks
-                tricks[ds[1]+suit] = levelSW
-        assert len(tricks) == 4*5
-        t = tuple(tuple(tricks[d+s] for s in 'CDHSN') for d in 'NESW') # controls order of tuple # use dict instead of tuple?
-        ACBL_DDmakes_l.append(t)
+    # Check DD columns: 5 tokens like S4, 4S, S4/5, 4/5S, one per strain CDHSN.
+    # The old loop built ACBL_DDmakes from these, but it was an Object column that was never written.
+    for d in dd_cols:
+        dd = hrs_df[d].unique()
+        tokens_ok = dd.str.contains('^' + d[-2:].upper() + ': ' + ' '.join([_DD_TOKEN]*5) + r'\n?$')
+        strains = dd.str.slice(4).str.replace_all(r'[^CDHSN]', '')
+        strains_ok = strains.str.len_chars().eq(5)
+        for s in 'CDHSN':
+            strains_ok = strains_ok & strains.str.contains(s, literal=True)
+        bad = dd.filter(~(tokens_ok & strains_ok))
+        assert bad.len() == 0, f"bad {d} values: {bad.head(10).to_list()}"
+    hrs_df = hrs_df.drop('ACBL_double_dummy_ns') # remove ACBL_double_dummy_ns as it's often wrong.
+    hrs_df = hrs_df.drop('ACBL_double_dummy_ew') # remove ACBL_double_dummy_ew as it's often wrong.
+    t0 = _timed('DD check', t0)
 
-    hrs_df = hrs_df.with_columns(pl.Series('ACBL_DDmakes', ACBL_DDmakes_l, dtype=pl.Object)) # , strict=False?
-    print(f"Added ACBL_DDmakes column")
-    hrs_df = hrs_df.drop('ACBL_double_dummy_ns') # remove ACBL_double_dummy_ns as it's often wrong. Use calculated DDmakes instead.
-    hrs_df = hrs_df.drop('ACBL_double_dummy_ew') # remove ACBL_double_dummy_ew as it's often wrong. Use calculated DDmakes instead.
-
-    # takes 45s/4.5s
-    # Create Par score column in normalized format
-    # rename par column. rewrite as list 
-    # too complex for one regex, if at all possible, so must iterate and split().
-    # todo: eliminate for-loop by using replace() with a list of regex? Or using map/apply?
+    # Par: parse each unique value and drop rows that don't parse.
+    # The parsed ACBL_Par was an Object column that was never written, so drop the column after filtering.
     print("Processing ACBL Par scores...")
     assert hrs_df['ACBL_Par'].str.starts_with('Par: ').all()
-    parsed = [_parse_acbl_par(v) for v in hrs_df['ACBL_Par']]
-    keep = [item is not None for item in parsed]
-    dropped = len(keep) - sum(keep)
+    par_counts = hrs_df['ACBL_Par'].value_counts()
+    parsed = [_parse_acbl_par(v) for v in par_counts['ACBL_Par']]
+    good_pars = [v for v, p in zip(par_counts['ACBL_Par'], parsed) if p is not None]
+    dropped = sum(n for n, p in zip(par_counts['count'], parsed) if p is None)
     print(f"Dropping {dropped} rows with unparsed ACBL par")
     if dropped:
-        hrs_df = hrs_df.filter(pl.Series('keep_par', keep))
-    acbl_par_l = [item for item in parsed if item is not None]
-
-    hrs_df = hrs_df.with_columns(pl.Series('ACBL_Par', acbl_par_l, dtype=pl.Object)) # , strict=False?
-    print(f"Updated ACBL_Par column")
-
-    # takes 2s
-    # Show Pars which are passed out
-    # todo: this should be done using 'Par' column instead of 'ACBL_Par' column. Move this to after 'Par' is created.
-    pass_outs = hrs_df.with_columns(pl.col('ACBL_Par').map_elements(lambda x: x[0]==0,return_dtype=pl.Boolean))
-    print(f"Pass outs count: {pass_outs.sum()}")
+        hrs_df = hrs_df.filter(pl.col('ACBL_Par').is_in(good_pars))
+    print(f"Pass outs count: {sum(n for n, p in zip(par_counts['count'], parsed) if p is not None and p[0] == 0)}")
+    hrs_df = hrs_df.drop('ACBL_Par')
+    t0 = _timed('par', t0)
 
     # create HandRecordBoard column
     hrs_df = hrs_df.with_columns((pl.col("hand_record_id").cast(pl.Utf8) + "_" + pl.col("Board").cast(pl.Utf8).str.zfill(2)).alias("HandRecordBoard"))
@@ -245,37 +280,27 @@ def clean_hand_records(hrs_df):
     # Filter out rows with invalid HandRecordBoards
     print(f"Filtering out {invalid_hrbs.shape[0]} HandRecordBoards with inconsistent board_record_strings")
     hrs_df = hrs_df.join(
-        invalid_hrbs.select("HandRecordBoard"), 
-        on="HandRecordBoard", 
+        invalid_hrbs.select("HandRecordBoard"),
+        on="HandRecordBoard",
         how="anti"
     )
+    t0 = _timed('HandRecordBoard', t0)
 
-    # takes 5s
     # todo: what to do with duplicate board_record_string? keep, discard? Keep dups to sustain integrity with board results?
-
-    # Unique count of 'board_record_string'
     unique_brs_count = hrs_df["board_record_string"].n_unique()
     print("unique brs count:", unique_brs_count)
+    n_dups = hrs_df["board_record_string"].is_duplicated().sum()
+    print("duplicate brs count:", n_dups)
+    print(f"Total rows: {len(hrs_df)}, Duplicates: {n_dups}, Unique: {len(hrs_df)-n_dups}")
 
-    # Calculate duplicates
-    duplicates_df = hrs_df.with_columns(pl.col("board_record_string").is_duplicated().alias("duplicates"))
-    keep_false_count = duplicates_df["duplicates"].sum()
-    print("duplicate brs count:", keep_false_count)
-
-    # takes 5s
-    assert hrs_df['board_record_string'].is_unique().sum() + hrs_df['board_record_string'].is_duplicated().sum() == len(hrs_df)
-
-    # takes 10s
-    # experiment with drop_duplicates()
-    dups = hrs_df.filter(pl.col('board_record_string').is_duplicated())
-    print(f"Total rows: {len(hrs_df)}, Duplicates: {len(dups)}, Unique: {len(hrs_df)-len(dups)}")
-
-    # takes 30m/3m
-    # todo: brs_to_pbn() is slow because of Deal(pbn).to_pbn() overhead. Need to re-implement brs_to_pbn() without Deal().
-    print("Converting board_record_string to PBN (this may take a while)...")
-    hrs_df = hrs_df.with_columns(pl.col('board_record_string').map_elements(mlBridgeLib.brs_to_pbn,return_dtype=pl.String).alias('PBN'))
+    # PBN from each unique board_record_string, joined back in row order.
+    print("Converting board_record_string to PBN...")
+    pbn_df = _unique_in_threads(_brs_to_pbn_unique, hrs_df['board_record_string'])
+    hrs_df = hrs_df.join(pbn_df, on='board_record_string', how='left', maintain_order='left')
+    assert hrs_df['PBN'].null_count() == 0
 
     hrs_df = hrs_df.drop('board_record_string')
+    t0 = _timed('PBN', t0)
     return hrs_df
 
 

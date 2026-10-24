@@ -103,24 +103,27 @@ if errorlevel 1 goto :error
 
 :: ---- 1e ----
 :: READS:  acbl/tournaments/sessions/*.session.json
-:: WRITES: acbl/tournaments/sessions/*.session.sql
-::         acbl/acbl_tournament_results.sqlite
-:: TIME:   ~minutes incremental; was ~30-60 min on a smaller full rebuild.
-::         MEASURED 2026-09-10/11: finished 00:16, sqlite 15.0 GB. If this
-::         started after 1b (18:00), the rebuild was ~6 h.
-echo   [1e] Loading tournament sessions into SQLite...
+:: WRITES: acbl/tournament_results_parquet/*.parquet  (one file per table, Utf8)
+::         acbl/tournaments/sessions/*.session.sql + acbl/acbl_tournament_results.sqlite
+::           only with --build-sqlite (off by default since 2026-10-24, like 1b).
+::           2a/2b read the parquets. Check with
+::           acbl_compare_sqlite_vs_parquet.py --side tournament.
+:: TIME:   parquet build: full rebuild of 172K session files, see TIME[1e].
+::         MEASURED 2026-09-10/11 WITH the SQLite build: finished 00:16,
+::         sqlite 15.0 GB. If this started after 1b (18:00), it was ~6 h.
+echo   [1e] Converting tournament sessions to Parquet...
 call :pyrun 1e acbl_tournament_sessions_json_to_sql.py
 if errorlevel 1 goto :error
 
 :: ====================================================================
-:: STAGE 2: CLEANING -- SQLite -> cleaned parquets
+:: STAGE 2: CLEANING -- raw parquet tables -> cleaned parquets
 :: ====================================================================
 echo.
 echo [Stage 2] Cleaning...
 
 :: ---- 2a ----
 :: READS:  acbl/club_results_parquet/{hand_records,sessions}.parquet
-::         acbl/acbl_tournament_results.sqlite   (tables: handrecord, session)
+::         acbl/tournament_results_parquet/{handrecord,session}.parquet
 :: WRITES: acbl/acbl_club_hand_records_cleaned.parquet
 ::         acbl/acbl_tournament_hand_records_cleaned.parquet
 :: TIME:   MEASURED 2026-09-11 00:16-03:54 (~3.6 h). Club 0.89 GB @ 03:37,
@@ -131,7 +134,7 @@ if errorlevel 1 goto :error
 
 :: ---- 2b ----
 :: READS:  acbl/club_results_parquet/{events,board_results,boards,...}.parquet
-::         acbl/acbl_tournament_results.sqlite
+::         acbl/tournament_results_parquet/{event,board_results,sections}.parquet
 ::         acbl/acbl_club_board_results_cleaned.parquet  (for tournament enrichment)
 :: WRITES: acbl/acbl_club_board_results_cleaned.parquet
 ::         acbl/acbl_tournament_board_results_cleaned.parquet

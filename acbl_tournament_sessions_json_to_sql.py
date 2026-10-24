@@ -1,10 +1,13 @@
 """
-ACBL Tournament Sessions JSON -> SQL -> SQLite
+ACBL Tournament Sessions JSON -> Parquet (-> SQL -> SQLite on request)
 
-Takes 23m to process 150,000 session files.
+Default (since 2026-10-24): `tournaments/sessions/*.session.json` -> one
+Parquet file per table under `tournament_results_parquet/` (all Utf8, like
+club_results_parquet/). Stages 2a/2b read those tables directly.
 
-Converts `tournaments/sessions/*.session.json` files to per-session `.session.sql`
-files, then loads those SQL scripts into a SQLite database.
+With --build-sqlite it also runs the original path below, which converts the
+JSON files to per-session `.session.sql` files and loads them into
+`acbl_tournament_results.sqlite`. That took 23m for 150,000 session files.
 
 This is a script version of `acbl_tournament_session_json_to_sql.ipynb`, and is
 structured similarly to `acbl_club_json_to_sql.py`.
@@ -36,6 +39,7 @@ import traceback
 from collections import defaultdict
 from typing import Iterable, Optional
 
+import polars as pl
 import sqlalchemy
 import sqlalchemy_utils
 
@@ -156,6 +160,196 @@ def _finalize_unique_indexes(conn) -> None:
         if commit is not None:
             commit()
     print(f"Unique indexes ready in {time.time() - t0:.1f}s", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# JSON -> Parquet (default since 2026-10-24; SQLite only with --build-sqlite)
+# ---------------------------------------------------------------------------
+DEFAULT_PARQUET_SUBDIR = "tournament_results_parquet"
+DEFAULT_SHARD_SUBDIR = "tournament_results_parquet_shards"
+DEFAULT_PARQUET_WORKERS = 32
+DEFAULT_PARQUET_FLUSH_EVERY = 1000
+_ORDER_COL = "__load_order"
+_CREATE_TABLE_RE = re.compile(r'CREATE TABLE\s+"?([A-Za-z_][A-Za-z0-9_]*)"?\s*\(', re.IGNORECASE)
+_COLUMN_RE = re.compile(r'^\s*"([^"]+)"\s+[A-Za-z]+')
+
+
+def parse_schema_columns(schema_file: pathlib.Path) -> dict[str, tuple[frozenset, frozenset]]:
+    """{table: (columns, not_null_columns)} from the tournament schema SQL."""
+    out: dict[str, tuple[frozenset, frozenset]] = {}
+    table = None
+    cols: set[str] = set()
+    not_null: set[str] = set()
+    for line in schema_file.read_text(encoding="utf-8").splitlines():
+        m = _CREATE_TABLE_RE.search(line)
+        if m:
+            table, cols, not_null = m.group(1), set(), set()
+            continue
+        if table is None:
+            continue
+        if line.strip().startswith(");"):
+            out[table] = (frozenset(cols), frozenset(not_null))
+            table = None
+            continue
+        c = _COLUMN_RE.match(line)
+        if c:
+            cols.add(c.group(1))
+            if "NOT NULL" in line.upper():
+                not_null.add(c.group(1))
+    return out
+
+
+def session_rows_from_json(json_file: pathlib.Path) -> tuple[Optional[dict], Optional[str]]:
+    """Rows per table for one session file, using the same walk and the same
+    accept/skip rules as generate_sql_files(). Returns (rows, None) or
+    (None, reason)."""
+    import mlBridge.mlBridgeAcblLib as mlBridgeLib  # type: ignore
+    from mlBridge.mlBridgeLib import tables_to_db_rows  # type: ignore
+
+    try:
+        with open(json_file, "r", encoding="utf-8") as f:
+            data_json = json.load(f)
+    except Exception as e:
+        return None, f"unreadable JSON ({type(e).__name__}: {e})"
+    tables = defaultdict(lambda: defaultdict(dict))
+    if "id" in data_json:
+        mlBridgeLib.json_to_sql_walk(tables, "session", "", "", data_json, ["id"])
+    elif "session_id" in data_json:
+        if isinstance(data_json.get("session"), dict) or len(data_json.get("session", [])) == 0:
+            return None, "session is dict or empty"
+        mlBridgeLib.json_to_sql_walk(tables, "session", "", "", data_json, ["id"])
+    else:
+        return None, "missing both id and session"
+    return tables_to_db_rows(tables), None
+
+
+def schema_violation(rows: dict, schema: dict) -> Optional[str]:
+    """Why SQLite would reject this session's script, else None.
+
+    The SQLite load runs one script per session; any unknown table, unknown
+    column, or NULL in a NOT NULL column fails the whole script and the
+    session is dropped. The Parquet path drops the same sessions.
+    """
+    for table, table_rows in rows.items():
+        if table not in schema:
+            return f"no such table: {table}"
+        cols, not_null = schema[table]
+        for row in table_rows:
+            extra = set(row) - cols
+            if extra:
+                return f"table {table} has no column(s) {sorted(extra)[:3]}"
+            for col in not_null:
+                if row.get(col) is None:
+                    return f"NULL in NOT NULL column {table}.{col}"
+    return None
+
+
+def _parquet_worker(
+    indexed_paths: list[tuple[int, str]],
+    shard_dir: str,
+    batch_id: int,
+    schema_file: str,
+) -> tuple[int, int, list[str]]:
+    """Process one batch of session files into per-table Parquet shards.
+
+    Each row carries __load_order = (file index, row index) so the merge can
+    keep the first row per id, the same row the SQLite load keeps.
+    """
+    from acbl_club_json_to_parquet_sql import _rows_to_utf8_df
+
+    schema = parse_schema_columns(pathlib.Path(schema_file))
+    buffers: dict[str, list[dict]] = defaultdict(list)
+    ok = 0
+    skipped: list[str] = []
+    for file_index, path_str in indexed_paths:
+        path = pathlib.Path(path_str)
+        rows, reason = session_rows_from_json(path)
+        if rows is not None:
+            reason = schema_violation(rows, schema)
+        if reason:
+            skipped.append(f"{path.as_posix()}: {reason}")
+            continue
+        ok += 1
+        for table, table_rows in rows.items():
+            for row_index, row in enumerate(table_rows):
+                buffers[table].append({**row, _ORDER_COL: file_index * 1_000_000 + row_index})
+    shard_path = pathlib.Path(shard_dir)
+    shard_path.mkdir(parents=True, exist_ok=True)
+    for table, table_rows in buffers.items():
+        df = _rows_to_utf8_df(table_rows).with_columns(pl.col(_ORDER_COL).cast(pl.Int64))
+        df.write_parquet(shard_path.joinpath(f"{table}__{batch_id:06d}.parquet"), compression="zstd")
+    return ok, len(skipped), skipped
+
+
+def build_parquet_from_session_json(
+    json_files: list[pathlib.Path],
+    parquet_dir: pathlib.Path,
+    shard_dir: pathlib.Path,
+    schema_file: pathlib.Path,
+    workers: int = DEFAULT_PARQUET_WORKERS,
+    flush_every: int = DEFAULT_PARQUET_FLUSH_EVERY,
+    keep_shards: bool = False,
+) -> list[str]:
+    """Session JSON -> per-table Parquet (all Utf8, like club_results_parquet/).
+
+    Duplicate ids keep the first row in sorted file order, matching the
+    SQLite heap load + "keep MIN(rowid)" dedup in _finalize_unique_indexes.
+    """
+    import shutil
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    from acbl_club_json_to_parquet_sql import _batches, _max_process_workers, _progress_line
+
+    t0 = time.time()
+    if shard_dir.exists():
+        shutil.rmtree(shard_dir)
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    parquet_dir.mkdir(parents=True, exist_ok=True)
+
+    indexed = [(i, str(p)) for i, p in enumerate(json_files)]
+    n_files = len(indexed)
+    workers = max(1, min(workers, _max_process_workers(), n_files or 1))
+    batches = _batches(indexed, max(1, flush_every))
+    print(f"[parquet] session files={n_files:,} workers={workers} batches={len(batches):,}")
+
+    total_ok = total_skipped = files_done = 0
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_parquet_worker, batch, str(shard_dir), i, str(schema_file)): len(batch)
+            for i, batch in enumerate(batches)
+        }
+        for fut in as_completed(futures):
+            ok, n_skipped, skipped = fut.result()
+            total_ok += ok
+            total_skipped += n_skipped
+            files_done += futures[fut]
+            for msg in skipped[:5]:
+                print(f"  SKIP {msg}", flush=True)
+            print(_progress_line("parquet", files_done, n_files, t0,
+                                 extra=f"ok={total_ok:,} skipped={total_skipped:,}"), flush=True)
+
+    tables = sorted({p.name.split("__", 1)[0] for p in shard_dir.glob("*.parquet")})
+    for table in tables:
+        t_table = time.time()
+        parts = sorted(shard_dir.glob(f"{table}__*.parquet"))
+        df = (
+            pl.concat([pl.read_parquet(p) for p in parts], how="diagonal_relaxed")
+            .sort(_ORDER_COL)
+        )
+        if "id" in df.columns:
+            df = df.unique(subset=["id"], keep="first", maintain_order=True)
+        df = df.drop(_ORDER_COL)
+        out = parquet_dir.joinpath(f"{table}.parquet")
+        df.write_parquet(out, compression="zstd")
+        print(f"[parquet] {out.name}: rows={df.height:,} cols={df.width} "
+              f"in {time.time() - t_table:.1f}s", flush=True)
+        del df
+
+    if not keep_shards:
+        shutil.rmtree(shard_dir, ignore_errors=True)
+    print(f"[parquet] done: ok={total_ok:,} skipped={total_skipped:,} tables={len(tables)} "
+          f"in {time.time() - t0:.1f}s", flush=True)
+    return tables
 
 
 class ACBLTournamentSessionSqliteBuilder:
@@ -517,8 +711,37 @@ class ACBLTournamentSessionSqliteBuilder:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Convert ACBL tournament session JSON to SQL and load into SQLite"
+        description=(
+            "Convert ACBL tournament session JSON to Parquet tables "
+            "(default) and optionally to SQL + SQLite (--build-sqlite)"
+        )
     )
+    parser.add_argument(
+        "--parquet-dir",
+        default=DEFAULT_PARQUET_SUBDIR,
+        help=f"Parquet output subdirectory relative to {acblPath} (default: {DEFAULT_PARQUET_SUBDIR})",
+    )
+    parser.add_argument(
+        "--skip-parquet",
+        action="store_true",
+        help="Do not build the Parquet tables",
+    )
+    parser.add_argument(
+        "--build-sqlite",
+        action="store_true",
+        help="Also generate .session.sql files and build the SQLite DB (off by default)",
+    )
+    parser.add_argument(
+        "--skip-sqlite",
+        action="store_true",
+        help="Accepted for old command lines; skipping SQLite is now the default.",
+    )
+    parser.add_argument("--workers", type=int, default=DEFAULT_PARQUET_WORKERS,
+                        help=f"Parquet worker processes (default: {DEFAULT_PARQUET_WORKERS})")
+    parser.add_argument("--flush-every", type=int, default=DEFAULT_PARQUET_FLUSH_EVERY,
+                        help=f"Session files per Parquet shard batch (default: {DEFAULT_PARQUET_FLUSH_EVERY})")
+    parser.add_argument("--keep-shards", action="store_true",
+                        help="Keep the intermediate Parquet shards")
     parser.add_argument(
         "--sessions-dir",
         default="tournaments/sessions",
@@ -656,18 +879,21 @@ def main() -> int:
     )
 
     args = parser.parse_args()
+    if args.build_sqlite and args.skip_sqlite:
+        parser.error("--build-sqlite and --skip-sqlite contradict each other")
 
     sessions_dir = acblPath.joinpath(args.sessions_dir)
+    parquet_dir = acblPath.joinpath(args.parquet_dir)
     schema_file = pathlib.Path(__file__).with_name(args.schema_file)
     db_file = acblPath.joinpath(args.db_file)
 
     print("=" * 70)
-    print("ACBL Tournament Sessions JSON -> SQLite")
+    print("ACBL Tournament Sessions JSON -> Parquet" + (" + SQLite" if args.build_sqlite else ""))
     print("=" * 70)
     print(f"Sessions dir: {sessions_dir}")
     print(f"Schema file:  {schema_file}")
-    print(f"DB file:      {db_file}")
-    print(f"Write direct: {args.write_direct_to_disk}")
+    print(f"Parquet dir:  {parquet_dir}{' (skipped)' if args.skip_parquet else ''}")
+    print(f"DB file:      {db_file}{'' if args.build_sqlite else ' (skipped; pass --build-sqlite)'}")
     print()
 
     builder = ACBLTournamentSessionSqliteBuilder(
@@ -677,6 +903,28 @@ def main() -> int:
         write_direct_to_disk=args.write_direct_to_disk,
         create_engine_echo=args.echo,
     )
+
+    if not args.skip_parquet:
+        json_files = builder.find_session_json_files()
+        if args.end:
+            json_files = json_files[args.start:args.end]
+        elif args.start:
+            json_files = json_files[args.start:]
+        build_parquet_from_session_json(
+            json_files,
+            parquet_dir,
+            acblPath.joinpath(DEFAULT_SHARD_SUBDIR),
+            schema_file,
+            workers=args.workers,
+            flush_every=args.flush_every,
+            keep_shards=args.keep_shards,
+        )
+
+    if not args.build_sqlite:
+        print()
+        print("[sqlite] skipped (default; pass --build-sqlite to build it)")
+        print("Done!")
+        return 0
 
     if not args.no_generate_sql:
         builder.generate_sql_files(

@@ -32,7 +32,7 @@ import time
 import re
 import sys
 
-from acbl_sqlite_read import read_parquet_query, read_sqlite_query
+from acbl_sqlite_read import read_parquet_query
 
 _SRC_DIR = pathlib.Path(__file__).resolve().parent.parent
 _MLBRIDGE = _SRC_DIR / 'mlBridge'
@@ -345,8 +345,8 @@ def club_hand_records_clean():
     return hrs_df
 
 
-def tournament_hand_records_clean():
-
+def get_tournament_hand_records_schemas():
+    """Tournament SQL selects and column types used by tournament_hand_records_clean."""
     sql_selects_d = {
         'handrecord': 'SELECT id AS hand_record_id, session AS session_id, board_number AS board, north_spades, north_hearts, north_diamonds, north_clubs, east_spades, east_hearts, east_diamonds, east_clubs, south_spades, south_hearts, south_diamonds, south_clubs, west_spades, west_hearts, west_diamonds, west_clubs, double_dummy_north_south AS double_dummy_ns, double_dummy_east_west AS double_dummy_ew, double_dummy_par_score AS par, dealer, vulnerability FROM handrecord',
         'session': 'SELECT id AS session_id, session_number, start_date, start_time FROM session',
@@ -387,6 +387,12 @@ def tournament_hand_records_clean():
             'start_time': pl.String,
         },
     }
+    return sql_selects_d, schema_d
+
+
+def tournament_hand_records_clean():
+
+    sql_selects_d, schema_d = get_tournament_hand_records_schemas()
     # make tournament columns conform to club columns to simplify sharing of code.
     # todo: replace hrs_to_brss in mlBridgeLib with this one.
     def hrs_to_brss(hrs_df,void: str = "", ten: str = "10") -> pl.Expr:
@@ -408,15 +414,16 @@ def tournament_hand_records_clean():
         )
         #return hrs_df.with_columns(board_record_string=hrs_to_brss(void="", ten="10"))
         
-    # using pathlib to create sqlite path.
-    db_connection_string = 'sqlite:///'+acblPath.joinpath(f'acbl_tournament_results.sqlite').as_posix()
-    print(f"Database connection string: {db_connection_string}")
+    # Read 1e's parquet tables, not acbl_tournament_results.sqlite (1e builds
+    # SQLite only with --build-sqlite since 2026-10-24). Same SQL and casts;
+    # check with acbl_compare_sqlite_vs_parquet.py --side tournament.
+    parquet_dir = acblPath.joinpath('tournament_results_parquet').as_posix()
+    print(f"Reading tournament tables from: {parquet_dir}")
 
-    uri = db_connection_string
     dfs_adbc = {}
     for table,schema in schema_d.items():
         print(f"Reading table:{table}")
-        dfs_adbc[table] = read_sqlite_query(uri, sql_selects_d[table], schema)
+        dfs_adbc[table] = read_parquet_query(parquet_dir, sql_selects_d[table], schema)
     print(f"Tables read: {list(dfs_adbc.keys())}")
     # usage
     hrs_df = dfs_adbc["handrecord"]

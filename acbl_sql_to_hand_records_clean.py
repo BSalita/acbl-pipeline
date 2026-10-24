@@ -279,8 +279,8 @@ def clean_hand_records(hrs_df):
     return hrs_df
 
 
-def club_hand_records_clean():
-
+def get_club_hand_records_schemas():
+    """Club SQL selects and column types used by club_hand_records_clean."""
     sql_selects_d = {
         'hand_records': 'SELECT board, board_record_string, hand_record_set_id AS hand_record_id, dealer, vulnerability, double_dummy_ew, double_dummy_ns, par FROM hand_records',
         # Must use sessions.id (not event_id) as session_id: board_results/sections reference sessions.id,
@@ -306,6 +306,12 @@ def club_hand_records_clean():
             'game_date': pl.String, # pl.Datetime, # using String because some dates are not valid DateTime () e.g. 2024-04-29 00:00:00
         },
     }
+    return sql_selects_d, schema_d
+
+
+def club_hand_records_clean():
+
+    sql_selects_d, schema_d = get_club_hand_records_schemas()
 
     # using pathlib to create sqlite path.
     db_connection_string = 'sqlite:///'+acblPath.joinpath(f'acbl_club_results.sqlite').as_posix()

@@ -273,8 +273,9 @@ if errorlevel 1 goto :error
 ::         acbl/SavedModels/{model_name}.pth                        -> Chatbot
 ::         acbl/SavedModels/*model_shard_*.pt                       (transient)
 ::         acbl/SavedModels/{model_name}_importance.csv
-::         acbl/debug_input_{club,tournament}_{target}.parquet
 ::         acbl/debug_predictions_{club,tournament}_{target}.parquet
+::         acbl/debug_input_{club,tournament}_{target}.parquet  (only with
+::           --save-debug-input since 2026-10-24; ~27 GB per club target)
 ::         acbl/acbl_{club,tournament}_prediction_rank_metrics.json  (after
 ::           Pct_NS: Spearman per section/direction vs a seat-Elo line,
 ::           via acbl_prediction_rank_eval.py; ~1 min.)

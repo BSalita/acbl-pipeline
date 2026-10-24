@@ -318,6 +318,12 @@ def _parse_cli_args():
               "shards. Use after an OOM/reboot mid-5c. Later targets without "
               "shards still rebuild as usual."),
     )
+    parser.add_argument(
+        "--save-debug-input", action="store_true",
+        help=("Also write debug_input_{club,tournament}_{target}.parquet (the full "
+              "test frame, ~27 GB per club target). Off by default; the "
+              "debug_predictions_* files are always written."),
+    )
     args = parser.parse_args()
     if not args.club and not args.tournament:
         modes = ["club", "tournament"]
@@ -328,7 +334,7 @@ def _parse_cli_args():
         if args.tournament:
             modes.append("tournament")
     targets = args.target if args.target else list(y_names)
-    return modes, targets, args.input_suffix, args.reuse_shards
+    return modes, targets, args.input_suffix, args.reuse_shards, args.save_debug_input
 
 
 def _reusable_shards(saved_models_path: pathlib.Path, model_name: str):
@@ -398,7 +404,8 @@ def _prepare_target_frame(df: pl.DataFrame, y_name: str, *, for_training: bool) 
 
 
 def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
-                      input_suffix: str = "_v2", reuse_shards: bool = False):
+                      input_suffix: str = "_v2", reuse_shards: bool = False,
+                      save_debug_input: bool = False):
     """Train ACBL prediction models for the requested targets (default: all three).
 
     `targets` controls which y-variables are trained this run. Targets are still
@@ -731,10 +738,13 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         input_capture_path = acblPath.joinpath(
             f"debug_input_{club_or_tournament}_{y_name.lower()}.parquet"
         )
-        working_test_df.write_parquet(input_capture_path)
-        print(f"âœ… Input data saved to: {input_capture_path}")
-        print(f"   Shape: {working_test_df.shape}")
-        print(f"   Columns: {len(working_test_df.columns)}")
+        if save_debug_input:
+            working_test_df.write_parquet(input_capture_path)
+            print(f"âœ… Input data saved to: {input_capture_path}")
+            print(f"   Shape: {working_test_df.shape}")
+            print(f"   Columns: {len(working_test_df.columns)}")
+        else:
+            print(f"Skipping {input_capture_path.name} (pass --save-debug-input to write it)")
 
         # === Schema alignment + prediction ===
         import json
@@ -783,7 +793,7 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         features_df = working_test_df.select(expected_features)
 
         # Predict on features-only df
-        prediction_df = predict_model(savedModelsPath, model_name, features_df)
+        prediction_df = predict_model(savedModelsPath, model_name, features_df, device=device)
 
         # Attach target back for evaluation/analysis (if preserved)
         if y_series is not None:
@@ -870,10 +880,11 @@ if __name__ == "__main__":
     program_start_time = print_started()
 
     try:
-        cli_modes, cli_targets, cli_suffix, cli_reuse_shards = _parse_cli_args()
+        cli_modes, cli_targets, cli_suffix, cli_reuse_shards, cli_save_debug_input = _parse_cli_args()
         for club_or_tournament in cli_modes:
             train_predictions(club_or_tournament, targets=cli_targets,
-                              input_suffix=cli_suffix, reuse_shards=cli_reuse_shards)
+                              input_suffix=cli_suffix, reuse_shards=cli_reuse_shards,
+                              save_debug_input=cli_save_debug_input)
     except KeyboardInterrupt:
         print("Interrupted during training", file=sys.stderr, flush=True)
         sys.exit(130)

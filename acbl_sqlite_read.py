@@ -45,6 +45,47 @@ def read_sqlite_query(
         frame = con.sql(_sqlite_casts(query)).pl()
     finally:
         con.close()
+    return _apply_schema(frame, schema_overrides)
+
+
+def read_parquet_query(
+    parquet_dir: str,
+    query: str,
+    schema_overrides: dict[str, pl.DataType] | None = None,
+) -> pl.DataFrame:
+    """Run the same SELECT as read_sqlite_query against 1b's parquet tables.
+
+    Each <table>.parquet in parquet_dir is exposed as a view named <table>,
+    with every column as VARCHAR to match `sqlite_all_varchar = true`. The
+    CAST rewrites and Polars casts are identical, so the result can be
+    compared row for row with the SQLite read.
+    """
+    import pathlib
+
+    con = duckdb.connect()
+    try:
+        for table in _query_tables(query):
+            path = pathlib.Path(parquet_dir, f"{table}.parquet").as_posix().replace("'", "''")
+            con.execute(
+                f'CREATE VIEW "{table}" AS SELECT COLUMNS(*)::VARCHAR FROM read_parquet(\'{path}\')'
+            )
+        frame = con.sql(_sqlite_casts(query)).pl()
+    finally:
+        con.close()
+    return _apply_schema(frame, schema_overrides)
+
+
+_FROM_TABLE = re.compile(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+
+
+def _query_tables(query: str) -> list[str]:
+    return sorted(set(_FROM_TABLE.findall(query)))
+
+
+def _apply_schema(
+    frame: pl.DataFrame,
+    schema_overrides: dict[str, pl.DataType] | None,
+) -> pl.DataFrame:
     if not schema_overrides:
         return frame
     missing = [name for name in schema_overrides if name not in frame.columns]

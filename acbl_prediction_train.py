@@ -65,11 +65,43 @@ from mlBridge.mlBridgeAiLib import (
 )
 # Feature-pruning rules for Pct_NS (kept in the HP search lib so that
 # acbl_prediction_train.py and acbl_hp_search_pct_ns.py prune identically).
-from acbl_hp_search_lib import prune_pct_ns_features
+from acbl_hp_search_lib import PCT_NS_DROP_PATTERNS, prune_pct_ns_features
 
 rootPath = pathlib.Path('e:/bridge/data')
 acblPath = rootPath.joinpath('acbl')
 savedModelsPath = acblPath.joinpath('SavedModels')
+# Where debug_input_*/debug_predictions_* and rank metrics go. --out-dir
+# moves these and savedModelsPath elsewhere (e.g. for an A/B run that must
+# not overwrite the models postmortem-acbl serves).
+outputPath = acblPath
+
+# Model inputs that are exact copies of other inputs. Each
+# EV_<pair>_<dir>_<strain>_<level>_<vul>_<tricks>_<score> is defined as
+# Probs_<pair>_<dir>_<strain>_<tricks> * score (mlBridgeAugmentLib, the
+# per-trick EV terms), so after z-scoring it is the Probs column again, up to
+# sign. 3,920 of ~6,040 columns; checked 2026-10-24 on 57,912 tournament rows
+# (max relative gap 4e-8). Not read at all, which also keeps the club train
+# frame from paging (~1.4 TB decoded with them, ~0.35 TB without). Pct_NS
+# already pruned these. The per-contract EV sums and *_Max columns stay.
+DUPLICATE_INPUT_PATTERNS = [
+    r'^EV_(NS|EW)_[NESW]_[CDHSN]_[1-7]_(V|NV)_\d+_-?\d+$',
+]
+
+
+def _input_columns(parquet_file: pathlib.Path, y_name: str, *, keep_ev_duplicates: bool) -> list:
+    """Columns to read for y_name: drop the duplicate EV inputs (unless asked
+    not to) and, for Pct_NS, the families prune_pct_ns_features drops anyway."""
+    import re
+    patterns = [] if keep_ev_duplicates else list(DUPLICATE_INPUT_PATTERNS)
+    if y_name == 'Pct_NS':
+        patterns += PCT_NS_DROP_PATTERNS
+    regexes = [re.compile(p) for p in patterns]
+    names = list(pl.read_parquet_schema(parquet_file))
+    keep = [c for c in names if not any(rx.match(c) for rx in regexes)]
+    print(f"   Reading {len(keep):,} of {len(names):,} columns from {parquet_file.name} "
+          f"({len(names) - len(keep):,} skipped: duplicate EV inputs"
+          f"{' + Pct_NS pruned families' if y_name == 'Pct_NS' else ''})")
+    return keep
 
 y_names = ['Declarer_Direction', 'Contract', 'Pct_NS']
 
@@ -324,6 +356,17 @@ def _parse_cli_args():
               "test frame, ~27 GB per club target). Off by default; the "
               "debug_predictions_* files are always written."),
     )
+    parser.add_argument(
+        "--keep-ev-duplicates", action="store_true",
+        help=("Also train on the 3,920 EV_..._<tricks>_<score> columns, which are "
+              "scaled copies of Probs_* columns (the behavior before 2026-10-24)."),
+    )
+    parser.add_argument(
+        "--out-dir", type=pathlib.Path, default=None,
+        help=("Write models, schemas, shards and importances to OUT_DIR/SavedModels "
+              "and debug_*/rank-metric files to OUT_DIR, instead of e:/bridge/data/acbl. "
+              "Use for experiments so the served models are not overwritten."),
+    )
     args = parser.parse_args()
     if not args.club and not args.tournament:
         modes = ["club", "tournament"]
@@ -334,7 +377,8 @@ def _parse_cli_args():
         if args.tournament:
             modes.append("tournament")
     targets = args.target if args.target else list(y_names)
-    return modes, targets, args.input_suffix, args.reuse_shards, args.save_debug_input
+    return (modes, targets, args.input_suffix, args.reuse_shards, args.save_debug_input,
+            args.keep_ev_duplicates, args.out_dir)
 
 
 def _reusable_shards(saved_models_path: pathlib.Path, model_name: str):
@@ -405,7 +449,7 @@ def _prepare_target_frame(df: pl.DataFrame, y_name: str, *, for_training: bool) 
 
 def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
                       input_suffix: str = "_v2", reuse_shards: bool = False,
-                      save_debug_input: bool = False):
+                      save_debug_input: bool = False, keep_ev_duplicates: bool = False):
     """Train ACBL prediction models for the requested targets (default: all three).
 
     `targets` controls which y-variables are trained this run. Targets are still
@@ -588,7 +632,11 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         else:
             _log_mem(f"{club_or_tournament}/{y_name} before train load")
             print(f"Loading {acbl_prediction_data_train_filename} for {y_name} shards...")
-            working_df_for_training = pl.read_parquet(acbl_prediction_data_train_file)
+            working_df_for_training = pl.read_parquet(
+                acbl_prediction_data_train_file,
+                columns=_input_columns(acbl_prediction_data_train_file, y_name,
+                                       keep_ev_duplicates=keep_ev_duplicates),
+            )
             print(f"Loaded {acbl_prediction_data_train_filename}: "
                   f"shape:{working_df_for_training.shape} "
                   f"size:{acbl_prediction_data_train_file.stat().st_size}")
@@ -723,7 +771,11 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
 
         _log_mem(f"{club_or_tournament}/{y_name} after train, before test load")
         print(f"Loading {acbl_prediction_data_test_filename} for {y_name} eval...")
-        working_test_df = pl.read_parquet(acbl_prediction_data_test_file)
+        working_test_df = pl.read_parquet(
+            acbl_prediction_data_test_file,
+            columns=_input_columns(acbl_prediction_data_test_file, y_name,
+                                   keep_ev_duplicates=keep_ev_duplicates),
+        )
         print(f"Loaded {acbl_prediction_data_test_filename}: "
               f"shape:{working_test_df.shape} "
               f"size:{acbl_prediction_data_test_file.stat().st_size}")
@@ -735,7 +787,7 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         print(f"Capturing input data for model: {model_name}")
 
         # Save input data for debugging
-        input_capture_path = acblPath.joinpath(
+        input_capture_path = outputPath.joinpath(
             f"debug_input_{club_or_tournament}_{y_name.lower()}.parquet"
         )
         if save_debug_input:
@@ -800,7 +852,7 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
             prediction_df = prediction_df.with_columns([y_series.alias(y_name)])
 
         # Save predictions for debugging
-        predictions_capture_path = acblPath.joinpath(
+        predictions_capture_path = outputPath.joinpath(
             f"debug_predictions_{club_or_tournament}_{y_name.lower()}.parquet"
         )
         prediction_df.write_parquet(predictions_capture_path)
@@ -862,8 +914,9 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
     if 'Pct_NS' in selected_targets:
         import json
         import acbl_prediction_rank_eval
-        ranking = acbl_prediction_rank_eval.evaluate_ranking(club_or_tournament, input_suffix)
-        rank_path = acblPath.joinpath(f"acbl_{club_or_tournament}_prediction_rank_metrics.json")
+        ranking = acbl_prediction_rank_eval.evaluate_ranking(
+            club_or_tournament, input_suffix, predictions_dir=outputPath)
+        rank_path = outputPath.joinpath(f"acbl_{club_or_tournament}_prediction_rank_metrics.json")
         rank_path.write_text(json.dumps({"side": club_or_tournament, "ranking": ranking}, indent=2), encoding="utf-8")
         print(f"{club_or_tournament} section-rank Spearman: model {ranking['model_raw']['mean_spearman']:.4f}, "
               f"Elo line {ranking['elo_line_raw']['mean_spearman']:.4f}. Wrote {rank_path}")
@@ -874,17 +927,24 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
 
 if __name__ == "__main__":
     mlBridge.pd_options_display()
+    (cli_modes, cli_targets, cli_suffix, cli_reuse_shards, cli_save_debug_input,
+     cli_keep_ev_duplicates, cli_out_dir) = _parse_cli_args()
+    if cli_out_dir is not None:
+        outputPath = cli_out_dir
+        savedModelsPath = cli_out_dir.joinpath('SavedModels')
+        outputPath.mkdir(parents=True, exist_ok=True)
+        print(f"Writing models to {savedModelsPath} and debug/rank files to {outputPath}")
     savedModelsPath.mkdir(parents=True, exist_ok=True)
 
     from mlBridge import print_started, print_ended
     program_start_time = print_started()
 
     try:
-        cli_modes, cli_targets, cli_suffix, cli_reuse_shards, cli_save_debug_input = _parse_cli_args()
         for club_or_tournament in cli_modes:
             train_predictions(club_or_tournament, targets=cli_targets,
                               input_suffix=cli_suffix, reuse_shards=cli_reuse_shards,
-                              save_debug_input=cli_save_debug_input)
+                              save_debug_input=cli_save_debug_input,
+                              keep_ev_duplicates=cli_keep_ev_duplicates)
     except KeyboardInterrupt:
         print("Interrupted during training", file=sys.stderr, flush=True)
         sys.exit(130)

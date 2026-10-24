@@ -174,13 +174,15 @@ def section_rank_quality(frame: pl.DataFrame, columns: list[str]) -> dict:
     return result
 
 
-def evaluate_ranking(side: str, suffix: str) -> dict:
+def evaluate_ranking(side: str, suffix: str, predictions_dir: Path | None = None) -> dict:
+    """predictions_dir: where debug_predictions_<side>_pct_ns.parquet is
+    (default ACBL_DIR; acbl_prediction_train.py --out-dir passes its own)."""
     test_path = ACBL_DIR / f"acbl_{side}_prediction_data_test{suffix}.parquet"
     missing = sorted(set(META_COLUMNS) - set(pl.read_parquet_schema(test_path)))
     if missing:
         raise ValueError(f"{test_path.name} lacks {missing}; sections cannot be ranked")
     train_path = ACBL_DIR / f"acbl_{side}_prediction_data_train{suffix}.parquet"
-    predictions_path = ACBL_DIR / f"debug_predictions_{side}_pct_ns.parquet"
+    predictions_path = Path(predictions_dir or ACBL_DIR) / f"debug_predictions_{side}_pct_ns.parquet"
     meta = pl.read_parquet(test_path, columns=list(META_COLUMNS))
     predicted = pl.read_parquet(predictions_path)
     if predicted.height != meta.height:

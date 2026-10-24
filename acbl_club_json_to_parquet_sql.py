@@ -10,9 +10,15 @@ query results), and the build took ~7h20m. Pass --build-sqlite to also
 write acbl_club_results.sqlite.
 
 Pipeline:
-  1) ProcessPool over *.data.json in batches of --flush-every files
-     (each batch writes Parquet shards then frees buffers)
-  2) Stream-merge shards -> one Parquet file per table under club_results_parquet/
+  1) Parse cache (default): files are grouped into chunks of up to
+     --cache-chunk-files files within one club, fingerprinted by their
+     (path, size, mtime_ns) list and the extraction code. Only new or
+     changed chunks are parsed (ProcessPool); the rest are reused from
+     club_results_parquet_cache/. --rebuild-cache re-parses everything;
+     --no-cache uses the old path (batches of --flush-every files).
+  2) Stream-merge shards in file order -> one Parquet file per table under
+     club_results_parquet/ (same rule as a full rebuild; tables whose
+     shard list is unchanged since the last merge are skipped)
   3) Only with --build-sqlite: apply acbl_club_results_schema.sql and bulk
      INSERT from Parquet (batched)
 
@@ -32,16 +38,20 @@ Resource notes (64-core / 128-thread, 512 GB RAM):
 from __future__ import annotations
 
 import argparse
+import hashlib
+import inspect
 import json
 import os
 import pathlib
+import platform
 import shutil
 import sqlite3
 import sys
 import time
 import traceback
+import types
 from collections import Counter, defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import polars as pl
@@ -53,10 +63,17 @@ DEFAULT_SCHEMA = pathlib.Path(__file__).resolve().parent.joinpath("acbl_club_res
 DEFAULT_PARQUET_DIR = acblPath.joinpath("club_results_parquet")
 DEFAULT_SHARD_DIR = acblPath.joinpath("club_results_parquet_shards")
 DEFAULT_DB = acblPath.joinpath("acbl_club_results.sqlite")
+DEFAULT_CLUB_RESULTS_DIR = acblPath.joinpath("club-results")
+DEFAULT_CACHE_DIR = acblPath.joinpath("club_results_parquet_cache")
 
 # Conservative defaults after a pagefile thrash with 61 workers holding full chunks.
 DEFAULT_WORKERS = 32
 DEFAULT_FLUSH_EVERY = 1000
+
+# Parse cache: files per cached chunk (runs of files within one details dir).
+DEFAULT_CHUNK_FILES = 200
+# Bump to invalidate every cached chunk.
+CACHE_VERSION = 1
 
 
 def _extract_tables_from_json(json_path: pathlib.Path) -> Dict[str, List[dict]]:
@@ -467,6 +484,15 @@ def _worker_process_batch(
     shard_path = pathlib.Path(shard_dir)
     shard_path.mkdir(parents=True, exist_ok=True)
 
+    buffers, ok, err, errors = _parse_json_files(json_paths)
+    _write_table_shards(buffers, shard_path, batch_id)
+    return ok, err, len(json_paths), errors
+
+
+def _parse_json_files(
+    json_paths: Sequence[str],
+) -> Tuple[Dict[str, List[dict]], int, int, List[str]]:
+    """Parse files in order. Returns (rows by table, ok, err, first errors)."""
     buffers: Dict[str, List[dict]] = defaultdict(list)
     ok = 0
     err = 0
@@ -484,9 +510,45 @@ def _worker_process_batch(
             err += 1
             if len(errors) < 5:
                 errors.append(f"{path.as_posix()}: {type(e).__name__}: {e}")
+    return buffers, ok, err, errors
 
-    _write_table_shards(buffers, shard_path, batch_id)
-    return ok, err, len(json_paths), errors
+
+def _worker_process_chunk(
+    json_paths: Sequence[str],
+    tmp_dir: str,
+    final_dir: str,
+) -> Tuple[int, int, int, List[str], Dict[str, List[List[str]]]]:
+    """
+    Parse one cache chunk into tmp_dir/{table}.parquet + _meta.json, then
+    rename tmp_dir -> final_dir. A chunk dir is only ever seen complete.
+    Returns (files_ok, files_err, n_files, error_messages, {table: schema}).
+    """
+    tmp = pathlib.Path(tmp_dir)
+    final = pathlib.Path(final_dir)
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    tmp.mkdir(parents=True)
+
+    buffers, ok, err, errors = _parse_json_files(json_paths)
+    tables: Dict[str, List[List[str]]] = {}
+    for table in sorted(t for t, rows in buffers.items() if rows):
+        df = _rows_to_utf8_df(buffers[table])
+        df.write_parquet(tmp.joinpath(f"{table}.parquet"), compression="zstd")
+        tables[table] = [[c, str(d)] for c, d in df.schema.items()]
+    buffers.clear()
+    meta = {
+        "version": CACHE_VERSION,
+        "n_files": len(json_paths),
+        "ok": ok,
+        "err": err,
+        "errors": errors,
+        "tables": tables,
+    }
+    tmp.joinpath("_meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    if final.exists():
+        shutil.rmtree(final)
+    os.rename(tmp, final)
+    return ok, err, len(json_paths), errors, tables
 
 
 def _max_process_workers() -> int:
@@ -555,7 +617,515 @@ def discover_json_files(club_results_dir: pathlib.Path, limit: int = 0) -> List[
     return files
 
 
+def _shard_schema(path: pathlib.Path) -> List[List[str]]:
+    return [[c, str(d)] for c, d in pl.read_parquet_schema(path).items()]
+
+
+def _unified_utf8_schema(schemas: Sequence[List[List[str]]]) -> Optional[pl.Schema]:
+    """
+    Schema pl.concat(how="diagonal_relaxed") gives for these shard schemas:
+    columns in first-seen order; String if any shard has String, else Null.
+    None if a shard has another dtype (then the caller uses concat).
+    """
+    unified: Dict[str, str] = {}
+    for schema in schemas:
+        for col, dt in schema:
+            if dt not in ("String", "Null"):
+                return None
+            if unified.get(col, "Null") == "Null":
+                unified[col] = dt
+    return pl.Schema({c: (pl.String if d == "String" else pl.Null) for c, d in unified.items()})
+
+
+def _merge_table_shards(
+    parts_by_table: Dict[str, List[pathlib.Path]],
+    parquet_dir: pathlib.Path,
+    skip_tables: Optional[set] = None,
+    schemas_by_table: Optional[Dict[str, List[List[List[str]]]]] = None,
+) -> Dict[str, int]:
+    """
+    Merge each table's shards (given in global file order) into
+    parquet_dir/{table}.parquet. Tables in skip_tables are left as they are.
+    schemas_by_table holds each part's schema (else read from the files).
+    Returns {table: rows} for tables written.
+    """
+    tables = sorted(t for t, parts in parts_by_table.items() if parts)
+    n_shards = sum(len(parts_by_table[t]) for t in tables)
+    skip_tables = skip_tables or set()
+    print(
+        f"[parquet] merging {n_shards:,} shards -> {len(tables)} tables "
+        f"({len(skip_tables & set(tables))} unchanged, skipped)",
+        flush=True,
+    )
+    written: Dict[str, int] = {}
+    for ti, table in enumerate(tables, 1):
+        if table in skip_tables:
+            continue
+        parts = parts_by_table[table]
+        t_table = time.time()
+        schemas = (schemas_by_table or {}).get(table)
+        if schemas is None:
+            with ThreadPoolExecutor(max_workers=16) as tp:
+                schemas = list(tp.map(_shard_schema, parts))
+        unified = _unified_utf8_schema(schemas)
+        if unified is not None:
+            # One multi-file scan: linear in shard count. A concat of one
+            # scan per shard gets quadratic (5k shards: 1s vs 200s).
+            lf = pl.scan_parquet(
+                [str(p) for p in parts],
+                schema=unified,
+                missing_columns="insert",
+                hive_partitioning=False,
+            )
+        else:
+            lazy = [pl.scan_parquet(str(p)) for p in parts]
+            lf = pl.concat(lazy, how="diagonal_relaxed")
+        if "id" in lf.collect_schema().names():
+            lf = lf.unique(subset=["id"], keep="last")
+        out = parquet_dir.joinpath(f"{table}.parquet")
+        # Prefer streaming sink to avoid holding the full table in the parent.
+        try:
+            lf.sink_parquet(str(out), compression="zstd")
+            n = pl.scan_parquet(str(out)).select(pl.len()).collect().item()
+        except Exception:
+            df = lf.collect()
+            df.write_parquet(out, compression="zstd")
+            n = df.height
+        written[table] = n
+        print(
+            f"[parquet] merge {ti}/{len(tables)} {out.name}: rows={n:,} "
+            f"shards={len(parts)} in {_fmt_duration(time.time() - t_table)}",
+            flush=True,
+        )
+    return written
+
+
+# ---------------------------------------------------------------------------
+# Parse cache
+#
+# Files are grouped into chunks: runs of up to chunk_files files within one
+# details dir, in the same sorted order as discover_json_files. Each chunk is
+# stored at cache_dir/chunks/{fp}/ ({table}.parquet + _meta.json), where fp
+# hashes the code fingerprint and the chunk's (rel path, size, mtime_ns)
+# list. A chunk is parsed in cache_dir/tmp/ and renamed into place when
+# complete, so any dir under chunks/ is trusted. manifest.json is written
+# last; it indexes chunk tables and records merged outputs so unchanged
+# tables can skip the merge.
+# ---------------------------------------------------------------------------
+
+
+def _safe_repr(obj: Any) -> str:
+    r = repr(obj)
+    if " at 0x" in r:
+        return f"{type(obj).__module__}.{type(obj).__qualname__}"
+    return r
+
+
+def _code_closure(mod: types.ModuleType, seeds: Sequence[str]) -> Dict[str, str]:
+    """Source of the seed functions plus every module global they reference."""
+    out: Dict[str, str] = {}
+    stack = list(seeds)
+    while stack:
+        name = stack.pop()
+        # Skip dunders: co_names also holds attribute names like __name__.
+        if name in out or name.startswith("__") or not hasattr(mod, name):
+            continue
+        obj = getattr(mod, name)
+        if inspect.isfunction(obj) and obj.__module__ == mod.__name__:
+            out[name] = inspect.getsource(obj)
+            codes = [obj.__code__]
+            while codes:
+                co = codes.pop()
+                stack.extend(co.co_names)
+                codes.extend(c for c in co.co_consts if isinstance(c, types.CodeType))
+        elif inspect.isfunction(obj) or inspect.isclass(obj):
+            out[name] = f"{obj.__module__}.{obj.__qualname__}"
+        elif inspect.ismodule(obj):
+            out[name] = f"module {obj.__name__}"
+        else:
+            out[name] = _safe_repr(obj)
+    return out
+
+
+def _code_fingerprint() -> str:
+    """Hash of everything that shapes a chunk's shards."""
+    import mlBridge.mlBridgeLib as lib
+
+    me = sys.modules[__name__]
+    parts = {
+        "cache_version": CACHE_VERSION,
+        "python": ".".join(platform.python_version_tuple()[:2]),
+        "polars": pl.__version__,
+        "script": _code_closure(me, ["_worker_process_chunk"]),
+        "mlBridgeLib": _code_closure(lib, ["json_to_sql_walk", "tables_to_db_rows"]),
+    }
+    blob = json.dumps(parts, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def _stat_json_files(files: Sequence[pathlib.Path]) -> List[Tuple[int, int]]:
+    """(size, mtime_ns) per file, via one scandir per dir (cheap on Windows)."""
+    by_dir: Dict[pathlib.Path, Dict[str, Tuple[int, int]]] = {}
+    out: List[Tuple[int, int]] = []
+    for p in files:
+        entries = by_dir.get(p.parent)
+        if entries is None:
+            entries = {}
+            with os.scandir(p.parent) as it:
+                for e in it:
+                    st = e.stat()
+                    entries[e.name] = (st.st_size, st.st_mtime_ns)
+            by_dir[p.parent] = entries
+        v = entries.get(p.name)
+        if v is None:
+            st = p.stat()
+            v = (st.st_size, st.st_mtime_ns)
+        out.append(v)
+    return out
+
+
+def _plan_chunks(
+    files: Sequence[pathlib.Path],
+    stats: Sequence[Tuple[int, int]],
+    root: pathlib.Path,
+    chunk_files: int,
+    code_fp: str,
+) -> List[dict]:
+    """Split files (already in global order) into fingerprinted chunks."""
+    chunks: List[dict] = []
+    next_idx: Counter = Counter()
+    cur: Optional[dict] = None
+    # String prefix, not Path.relative_to (80s for 1.3M paths).
+    prefix = str(root).rstrip("\\/") + os.sep
+    for p, (size, mtime_ns) in zip(files, stats):
+        s = str(p)
+        rel = s[len(prefix):] if s.startswith(prefix) else s
+        rel = rel.replace("\\", "/")
+        parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
+        if cur is None or cur["dir"] != parent or len(cur["paths"]) >= chunk_files:
+            cur = {"dir": parent, "idx": next_idx[parent], "paths": [], "lines": []}
+            next_idx[parent] += 1
+            chunks.append(cur)
+        cur["paths"].append(str(p))
+        cur["lines"].append(f"{rel}\t{size}\t{mtime_ns}")
+    for c in chunks:
+        h = hashlib.sha256(code_fp.encode("utf-8"))
+        h.update("\n".join(c.pop("lines")).encode("utf-8"))
+        c["fp"] = h.hexdigest()[:32]
+        c["key"] = f"{c['dir']}#{c['idx']}"
+    return chunks
+
+
+def _read_json(path: pathlib.Path) -> Optional[dict]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _write_json_atomic(path: pathlib.Path, obj: Any) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _encode_manifest_chunks(index: Dict[str, dict]) -> Tuple[Dict[str, dict], Dict[str, list]]:
+    """Store each distinct shard schema once; chunks refer to it by id."""
+    schema_ids: Dict[str, str] = {}
+    schema_table: Dict[str, list] = {}
+    out: Dict[str, dict] = {}
+    for fp, m in index.items():
+        tables = {}
+        for table, schema in m["tables"].items():
+            key = json.dumps(schema)
+            sid = schema_ids.get(key)
+            if sid is None:
+                sid = str(len(schema_ids))
+                schema_ids[key] = sid
+                schema_table[sid] = schema
+            tables[table] = sid
+        entry = {k: v for k, v in m.items() if k not in ("tables", "errors")}
+        entry["tables"] = tables
+        out[fp] = entry
+    return out, schema_table
+
+
+def _decode_manifest_chunks(manifest: dict) -> Dict[str, dict]:
+    """Inverse of _encode_manifest_chunks; drops entries it cannot resolve."""
+    schema_table = manifest.get("schemas", {})
+    out: Dict[str, dict] = {}
+    for fp, entry in manifest.get("chunks", {}).items():
+        tables = entry.get("tables")
+        if not isinstance(tables, dict) or any(s not in schema_table for s in tables.values()):
+            continue
+        m = dict(entry)
+        m["tables"] = {t: schema_table[s] for t, s in tables.items()}
+        out[fp] = m
+    return out
+
+
+def _parts_hash(parts: Sequence[pathlib.Path], code_fp: str) -> str:
+    """Identifies a merged table: its shard list (content-addressed) + code."""
+    h = hashlib.sha256(code_fp.encode("utf-8"))
+    for fn in (_merge_table_shards, _unified_utf8_schema):
+        h.update(inspect.getsource(fn).encode("utf-8"))
+    for p in parts:
+        h.update(p.as_posix().encode("utf-8") + b"\n")
+    return h.hexdigest()
+
+
+def _build_parquet_cached(
+    json_files: Sequence[pathlib.Path],
+    club_results_dir: pathlib.Path,
+    parquet_dir: pathlib.Path,
+    cache_dir: pathlib.Path,
+    workers: int,
+    chunk_files: int = DEFAULT_CHUNK_FILES,
+    rebuild_cache: bool = False,
+    prune: bool = True,
+) -> List[str]:
+    """
+    Incremental JSON -> per-table Parquet. Parses only chunks whose
+    fingerprint is not in the cache, then merges every chunk's shards in
+    global file order exactly as the uncached path does.
+    """
+    t0 = time.time()
+    chunks_dir = cache_dir.joinpath("chunks")
+    tmp_root = cache_dir.joinpath("tmp")
+    manifest_path = cache_dir.joinpath("manifest.json")
+    if rebuild_cache and chunks_dir.exists():
+        print(f"[cache] --rebuild-cache: clearing {chunks_dir}", flush=True)
+        shutil.rmtree(chunks_dir)
+        if manifest_path.exists():
+            manifest_path.unlink()
+    if tmp_root.exists():
+        shutil.rmtree(tmp_root, ignore_errors=True)
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    parquet_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest = _read_json(manifest_path) or {}
+    if manifest.get("version") != CACHE_VERSION:
+        manifest = {}
+    known = _decode_manifest_chunks(manifest)
+
+    code_fp = _code_fingerprint()
+    t_stat = time.time()
+    stats = _stat_json_files(json_files)
+    chunks = _plan_chunks(json_files, stats, club_results_dir, chunk_files, code_fp)
+    on_disk = {e.name for e in os.scandir(chunks_dir) if e.is_dir()}
+    t_plan = time.time()
+
+    # Reused chunks: tables from the manifest, else from the chunk's _meta.json.
+    meta_by_fp: Dict[str, dict] = {}
+    need_meta = []
+    for c in chunks:
+        if c["fp"] not in on_disk:
+            continue
+        m = known.get(c["fp"])
+        if m is not None:
+            meta_by_fp[c["fp"]] = m
+        else:
+            need_meta.append(c["fp"])
+    if need_meta:
+        with ThreadPoolExecutor(max_workers=16) as tp:
+            for fp, m in zip(
+                need_meta,
+                tp.map(lambda f: _read_json(chunks_dir.joinpath(f, "_meta.json")), need_meta),
+            ):
+                if (
+                    m is not None
+                    and m.get("version") == CACHE_VERSION
+                    and isinstance(m.get("tables"), dict)
+                ):
+                    meta_by_fp[fp] = m
+    todo = [c for c in chunks if c["fp"] not in meta_by_fp]
+    n_files = len(json_files)
+    n_todo_files = sum(len(c["paths"]) for c in todo)
+    print(
+        f"[cache] dir={cache_dir} code_fp={code_fp[:12]} chunk_files={chunk_files}",
+        flush=True,
+    )
+    print(
+        f"[cache] files={n_files:,} chunks={len(chunks):,}: "
+        f"reused {len(chunks) - len(todo):,} chunks / {n_files - n_todo_files:,} files, "
+        f"parsing {len(todo):,} chunks / {n_todo_files:,} files "
+        f"(stat+plan {_fmt_duration(t_plan - t_stat)})",
+        flush=True,
+    )
+
+    # Parse new or changed chunks.
+    t_parse = time.time()
+    total_ok = 0
+    total_err = 0
+    if todo:
+        workers = max(1, min(workers, _max_process_workers(), len(todo)))
+        files_done = 0
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    _worker_process_chunk,
+                    c["paths"],
+                    str(tmp_root.joinpath(c["fp"])),
+                    str(chunks_dir.joinpath(c["fp"])),
+                ): c
+                for c in todo
+            }
+            for i, fut in enumerate(as_completed(futures), 1):
+                c = futures[fut]
+                try:
+                    ok, err, n_in, errors, tables = fut.result()
+                except Exception as e:
+                    print(f"[cache] CHUNK FAIL {c['key']}: {type(e).__name__}: {e}")
+                    traceback.print_exc()
+                    raise
+                meta_by_fp[c["fp"]] = {
+                    "version": CACHE_VERSION,
+                    "n_files": n_in,
+                    "ok": ok,
+                    "err": err,
+                    "errors": errors,
+                    "tables": tables,
+                }
+                total_ok += ok
+                total_err += err
+                files_done += n_in
+                if i == len(todo) or i % 50 == 0:
+                    print(
+                        _progress_line(
+                            "parse", files_done, n_todo_files, t_parse,
+                            extra=f"chunks={i}/{len(todo)} ok={total_ok:,} err={total_err:,}",
+                        ),
+                        flush=True,
+                    )
+                for msg in errors:
+                    print(f"  ERROR {msg}", flush=True)
+    t_parse_done = time.time()
+    todo_fps = {c["fp"] for c in todo}
+    cached_err = sum(
+        meta_by_fp[c["fp"]].get("err", 0) for c in chunks if c["fp"] not in todo_fps
+    )
+    if cached_err:
+        print(f"[cache] reused chunks hold {cached_err:,} files that failed to parse "
+              f"(see their _meta.json)", flush=True)
+
+    # Merge every chunk's shards in global order.
+    parts_by_table: Dict[str, List[pathlib.Path]] = defaultdict(list)
+    schemas_by_table: Dict[str, List[List[List[str]]]] = defaultdict(list)
+    for c in chunks:
+        for table, schema in meta_by_fp[c["fp"]]["tables"].items():
+            parts_by_table[table].append(chunks_dir.joinpath(c["fp"], f"{table}.parquet"))
+            schemas_by_table[table].append(schema)
+    out_key = str(parquet_dir.resolve())
+    outputs: Dict[str, dict] = manifest.get("outputs", {}).get(out_key, {})
+    skip = set()
+    for table, parts in parts_by_table.items():
+        prev = outputs.get(table)
+        out = parquet_dir.joinpath(f"{table}.parquet")
+        if prev and prev.get("parts") == _parts_hash(parts, code_fp) and out.is_file():
+            st = out.stat()
+            if prev.get("size") == st.st_size and prev.get("mtime_ns") == st.st_mtime_ns:
+                skip.add(table)
+    t_merge = time.time()
+    _merge_table_shards(
+        parts_by_table, parquet_dir, skip_tables=skip, schemas_by_table=schemas_by_table
+    )
+    t_merge_done = time.time()
+
+    # Manifest last: chunk index (current chunks only when pruning) + outputs.
+    new_outputs = {}
+    for table, parts in parts_by_table.items():
+        out = parquet_dir.joinpath(f"{table}.parquet")
+        if out.is_file():
+            st = out.stat()
+            new_outputs[table] = {
+                "parts": _parts_hash(parts, code_fp),
+                "size": st.st_size,
+                "mtime_ns": st.st_mtime_ns,
+            }
+    current = {c["fp"] for c in chunks}
+    index = {} if prune else dict(known)
+    index.update({fp: meta_by_fp[fp] for fp in current})
+    all_outputs = dict(manifest.get("outputs", {}))
+    all_outputs[out_key] = new_outputs
+    chunk_index, schema_table = _encode_manifest_chunks(index)
+    _write_json_atomic(
+        manifest_path,
+        {
+            "version": CACHE_VERSION,
+            "code_fp": code_fp,
+            "chunk_files": chunk_files,
+            "club_results_dir": str(club_results_dir),
+            "written": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "schemas": schema_table,
+            "chunks": chunk_index,
+            "outputs": all_outputs,
+        },
+    )
+
+    # Drop cache entries for chunks that no longer exist (not with --limit).
+    n_pruned = 0
+    if prune:
+        for name in on_disk - current:
+            shutil.rmtree(chunks_dir.joinpath(name), ignore_errors=True)
+            n_pruned += 1
+    shutil.rmtree(tmp_root, ignore_errors=True)
+
+    tables = sorted(t for t, parts in parts_by_table.items() if parts)
+    print(
+        f"[cache] done: parsed {len(todo):,} chunks / {n_todo_files:,} files "
+        f"(ok={total_ok:,} err={total_err:,}), reused {len(chunks) - len(todo):,} chunks, "
+        f"pruned {n_pruned:,} stale chunks, tables={len(tables)} "
+        f"(merged {len(tables) - len(skip & set(tables))}, unchanged {len(skip & set(tables))})",
+        flush=True,
+    )
+    print(
+        f"[cache] timings: stat+plan={_fmt_duration(t_plan - t_stat)} "
+        f"parse={_fmt_duration(t_parse_done - t_parse)} "
+        f"merge={_fmt_duration(t_merge_done - t_merge)} "
+        f"total={_fmt_duration(time.time() - t0)}",
+        flush=True,
+    )
+    return tables
+
+
 def build_parquet_from_json(
+    json_files: Sequence[pathlib.Path],
+    parquet_dir: pathlib.Path,
+    shard_dir: pathlib.Path,
+    workers: int,
+    flush_every: int = DEFAULT_FLUSH_EVERY,
+    keep_shards: bool = False,
+    cache_dir: Optional[pathlib.Path] = None,
+    club_results_dir: pathlib.Path = DEFAULT_CLUB_RESULTS_DIR,
+    chunk_files: int = DEFAULT_CHUNK_FILES,
+    rebuild_cache: bool = False,
+    prune_cache: bool = True,
+) -> List[str]:
+    """
+    JSON -> merged per-table Parquet. With cache_dir, only new or changed
+    chunks are parsed; without it, every file is parsed (the old path).
+    Returns sorted list of table names written.
+    """
+    if cache_dir is not None:
+        if keep_shards:
+            print("[cache] --keep-shards ignored: cached chunk shards are always kept")
+        return _build_parquet_cached(
+            json_files,
+            club_results_dir,
+            parquet_dir,
+            cache_dir,
+            workers,
+            chunk_files=chunk_files,
+            rebuild_cache=rebuild_cache,
+            prune=prune_cache,
+        )
+    return _build_parquet_no_cache(
+        json_files, parquet_dir, shard_dir, workers, flush_every, keep_shards
+    )
+
+
+def _build_parquet_no_cache(
     json_files: Sequence[pathlib.Path],
     parquet_dir: pathlib.Path,
     shard_dir: pathlib.Path,
@@ -582,7 +1152,7 @@ def build_parquet_from_json(
     n_batches = len(batches)
 
     print(
-        f"[parquet] JSON files={n_files:,} workers={workers} "
+        f"[parquet] no cache: JSON files={n_files:,} workers={workers} "
         f"flush_every={flush_every:,} batches={n_batches:,}"
     )
     print(f"[parquet] shard_dir={shard_dir}")
@@ -630,37 +1200,20 @@ def build_parquet_from_json(
             for msg in errors:
                 print(f"  ERROR {msg}", flush=True)
 
+    t_parse_done = time.time()
     # Merge shards per table (streaming sink when possible)
     shard_files = list(shard_dir.glob("*.parquet"))
     tables = sorted({p.name.split("__", 1)[0] for p in shard_files})
+    parts_by_table = {
+        t: sorted(shard_dir.glob(f"{t}__*.parquet")) for t in tables
+    }
+    t_merge = time.time()
+    _merge_table_shards(parts_by_table, parquet_dir)
     print(
-        f"[parquet] merging {len(shard_files):,} shards -> {len(tables)} tables",
+        f"[parquet] parse={_fmt_duration(t_parse_done - t0)} "
+        f"merge={_fmt_duration(time.time() - t_merge)}",
         flush=True,
     )
-    t_merge = time.time()
-    for ti, table in enumerate(tables, 1):
-        parts = sorted(shard_dir.glob(f"{table}__*.parquet"))
-        if not parts:
-            continue
-        t_table = time.time()
-        lazy = [pl.scan_parquet(str(p)) for p in parts]
-        lf = pl.concat(lazy, how="diagonal_relaxed")
-        if "id" in lf.collect_schema().names():
-            lf = lf.unique(subset=["id"], keep="last")
-        out = parquet_dir.joinpath(f"{table}.parquet")
-        # Prefer streaming sink to avoid holding the full table in the parent.
-        try:
-            lf.sink_parquet(str(out), compression="zstd")
-            n = pl.scan_parquet(str(out)).select(pl.len()).collect().item()
-        except Exception:
-            df = lf.collect()
-            df.write_parquet(out, compression="zstd")
-            n = df.height
-        print(
-            f"[parquet] merge {ti}/{len(tables)} {out.name}: rows={n:,} "
-            f"shards={len(parts)} in {_fmt_duration(time.time() - t_table)}",
-            flush=True,
-        )
 
     if not keep_shards:
         print(f"[parquet] removing shard dir {shard_dir}", flush=True)
@@ -964,7 +1517,41 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=50_000,
         help="SQLite executemany / Parquet slice batch size.",
     )
+    parser.add_argument(
+        "--club-results-dir",
+        type=pathlib.Path,
+        default=DEFAULT_CLUB_RESULTS_DIR,
+        help="Input dir holding {club_id}/details/*.data.json.",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=pathlib.Path,
+        default=DEFAULT_CACHE_DIR,
+        help="Parse cache dir (chunk shards + manifest.json).",
+    )
+    parser.add_argument(
+        "--rebuild-cache",
+        action="store_true",
+        help="Clear the parse cache and re-parse every file.",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Old path: parse every file in --flush-every batches, no cache.",
+    )
+    parser.add_argument(
+        "--cache-chunk-files",
+        type=int,
+        default=DEFAULT_CHUNK_FILES,
+        help=(
+            f"Files per cached chunk within a club (default: {DEFAULT_CHUNK_FILES}). "
+            "Changing it re-parses everything."
+        ),
+    )
     args = parser.parse_args(argv)
+    if args.no_cache and args.rebuild_cache:
+        parser.error("--no-cache and --rebuild-cache contradict each other")
+    args.cache_chunk_files = max(1, args.cache_chunk_files)
     if args.build_sqlite and args.skip_sqlite:
         parser.error("--build-sqlite and --skip-sqlite contradict each other")
     if not args.workers or args.workers <= 0:
@@ -987,7 +1574,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("ACBL Club JSON -> Parquet -> SQLite")
     print("=" * 70)
     print(f"workers:      {args.workers} (Windows ProcessPool cap is 61)")
-    print(f"flush_every:  {args.flush_every:,}")
+    print(f"flush_every:  {args.flush_every:,}" + ("" if args.no_cache else " (only with --no-cache)"))
+    print(f"input:        {args.club_results_dir}")
+    print(f"cache_dir:    {'(off)' if args.no_cache else args.cache_dir}")
     print(f"parquet_dir:  {args.parquet_dir}")
     print(f"db:           {args.db}")
     print(f"schema:       {args.schema}")
@@ -998,9 +1587,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print_ended(t_prog)
             return 0
         if not args.skip_parquet:
-            json_files = discover_json_files(
-                acblPath.joinpath("club-results"), args.limit
-            )
+            json_files = discover_json_files(args.club_results_dir, args.limit)
             if not json_files:
                 print("ERROR: no *.data.json files found under club-results/")
                 return 1
@@ -1011,6 +1598,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                 workers=args.workers,
                 flush_every=args.flush_every,
                 keep_shards=args.keep_shards,
+                cache_dir=None if args.no_cache else args.cache_dir,
+                club_results_dir=args.club_results_dir,
+                chunk_files=args.cache_chunk_files,
+                rebuild_cache=args.rebuild_cache,
+                # --limit sees part of the corpus; keep the rest of the cache.
+                prune_cache=args.limit <= 0,
             )
         else:
             print(f"[parquet] skipped; using {args.parquet_dir}")

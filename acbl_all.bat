@@ -61,14 +61,18 @@ if errorlevel 1 goto :error
 :: ---- 1b ----
 :: READS:  acbl/club-results/*/details/*.data.json
 :: WRITES: acbl/club_results_parquet/*.parquet
-::         acbl/acbl_club_results.sqlite   (same schema as legacy)
-:: TIME:   MEASURED 2026-10-01 22:45 -^> 10-02 06:40: 28533s (7h 56m).
-::         1,335,293 JSON files, err=0. Parquet merge 16m20s, sqlite
-::         preflight 6m44s, table load ~7h20m. Wrote acbl_club_results.sqlite
-::         139.34 GB. xmlFiles.parquet skipped (no schema table).
+::         (acbl/acbl_club_results.sqlite is no longer built here; see below)
+:: TIME:   ~16 min expected with --skip-sqlite (Parquet merge was 16m20s).
+::         MEASURED 2026-10-01 22:45 -^> 10-02 06:40 WITH the SQLite build:
+::         28533s (7h 56m). 1,335,293 JSON files, err=0. Parquet merge
+::         16m20s, sqlite preflight 6m44s, table load ~7h20m, 139.34 GB.
+::         --skip-sqlite since 2026-10-24: 2a/2b read the parquets directly.
+::         acbl_compare_sqlite_vs_parquet.py showed all 9 club queries give
+::         identical results from both. The 2026-10-02 sqlite is left as is
+::         (stale). To rebuild it, run this step without --skip-sqlite.
 ::         Use: python acbl_club_json_to_sql.py --legacy-sql-scripts
-echo   [1b] Loading club JSON into SQLite (via Parquet)...
-call :pyrun 1b acbl_club_json_to_sql.py
+echo   [1b] Converting club JSON to Parquet (SQLite build skipped)...
+call :pyrun 1b acbl_club_json_to_sql.py --skip-sqlite
 if errorlevel 1 goto :error
 
 :: ---- 1c ----
@@ -115,7 +119,7 @@ echo.
 echo [Stage 2] Cleaning...
 
 :: ---- 2a ----
-:: READS:  acbl/acbl_club_results.sqlite        (tables: hand_records, sessions)
+:: READS:  acbl/club_results_parquet/{hand_records,sessions}.parquet
 ::         acbl/acbl_tournament_results.sqlite   (tables: handrecord, session)
 :: WRITES: acbl/acbl_club_hand_records_cleaned.parquet
 ::         acbl/acbl_tournament_hand_records_cleaned.parquet
@@ -126,7 +130,7 @@ call :pyrun 2a acbl_sql_to_hand_records_clean.py
 if errorlevel 1 goto :error
 
 :: ---- 2b ----
-:: READS:  acbl/acbl_club_results.sqlite        (tables: events, board_results, boards, ...)
+:: READS:  acbl/club_results_parquet/{events,board_results,boards,...}.parquet
 ::         acbl/acbl_tournament_results.sqlite
 ::         acbl/acbl_club_board_results_cleaned.parquet  (for tournament enrichment)
 :: WRITES: acbl/acbl_club_board_results_cleaned.parquet

@@ -39,7 +39,7 @@ import pathlib
 import time
 import sys
 
-from acbl_sqlite_read import read_sqlite_query
+from acbl_sqlite_read import read_parquet_query, read_sqlite_query
 
 _SRC_DIR = pathlib.Path(__file__).resolve().parent.parent
 _MLBRIDGE = _SRC_DIR / 'mlBridge'
@@ -246,15 +246,17 @@ def club_board_results_clean():
     print("Processing club board results...")
     
     sql_selects_d, schema_d = get_club_schemas()
-    
-    db_connection_string = 'sqlite:///'+acblPath.joinpath(f'acbl_club_results.sqlite').as_posix()
-    print(f"Database connection string: {db_connection_string}")
-    
-    uri = db_connection_string
+
+    # Read 1b's parquet tables, not acbl_club_results.sqlite (1b now runs
+    # with --skip-sqlite). Same SQL and casts; acbl_compare_sqlite_vs_parquet.py
+    # showed identical results for every query on 2026-10-24.
+    parquet_dir = acblPath.joinpath('club_results_parquet').as_posix()
+    print(f"Reading club tables from: {parquet_dir}")
+
     dfs_adbc = {}
     for table, schema in schema_d.items():
         print(f"Reading table: {table}")
-        dfs_adbc[table] = read_sqlite_query(uri, sql_selects_d[table], schema)
+        dfs_adbc[table] = read_parquet_query(parquet_dir, sql_selects_d[table], schema)
     print(f"Tables read: {list(dfs_adbc.keys())}")
     
     # takes 1m30s/1m

@@ -1081,6 +1081,22 @@ def get_all_clubs() -> Optional[List[str]]:
         return None
 
 
+_last_session_request_start = None
+
+
+def _rate_limit_session_requests(min_interval_seconds: float) -> None:
+    """Sleep until min_interval_seconds have passed since the previous
+    session request started, then mark this request's start."""
+    global _last_session_request_start
+    now = time.monotonic()
+    if _last_session_request_start is not None:
+        wait = min_interval_seconds - (now - _last_session_request_start)
+        if wait > 0:
+            print(f"  -> Sleeping {wait:.1f} seconds before request...")
+            time.sleep(wait)
+    _last_session_request_start = time.monotonic()
+
+
 def process_single_session(session: dict, output_dir: str, session_num: int, total_sessions: int, club_id: Optional[str] = None, refresh: bool = False, sleep_seconds: int = 2, start_date: Optional[str] = None, end_date: Optional[str] = None) -> tuple:
     """
     Process a single session
@@ -1139,12 +1155,12 @@ def process_single_session(session: dict, output_dir: str, session_num: int, tot
     
     print(f"[{session_num}/{total_sessions}] Processing {session_id} ({session_name})...")
     
-    # Sleep BEFORE making request to rate limit properly
-    # Skip sleep for first session
-    if session_num > 1:
-        print(f"  -> Sleeping {sleep_seconds} seconds before request...")
-        time.sleep(sleep_seconds)
-    
+    # Rate limit: at most one session request per sleep_seconds. Only the
+    # part of the interval not already spent on the previous page load is
+    # slept, so politeness is unchanged but the old fixed 2 s sleep on top of
+    # a ~2 s page load (~4 h per full sweep) is gone.
+    _rate_limit_session_requests(sleep_seconds)
+
     # Construct URL and extract JSON
     url = f"https://my.acbl.org/club-results/details/{session_id}"
     

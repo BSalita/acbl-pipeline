@@ -71,7 +71,12 @@ if errorlevel 1 goto :error
 :: READS:  acbl/club-results/*/details/*.data.json
 :: WRITES: acbl/club_results_parquet/*.parquet
 ::         (acbl/acbl_club_results.sqlite only with --build-sqlite; see below)
-:: TIME:   ~16 min expected without the SQLite build (Parquet merge was 16m20s).
+:: TIME:   Since 2026-10-24 parsed JSON is cached per 200-file chunk in
+::         acbl/club_results_parquet_cache/ (~20 GB); only new or changed files
+::         are re-parsed (--rebuild-cache forces a full parse). Measured on the
+::         full corpus: nothing new 45 s; cold (first run) ~38 min; a typical
+::         run with a few thousand new files ~7-8 min (merge is the floor).
+::         Before the cache: ~16 min without the SQLite build (2026-10-01).
 ::         MEASURED 2026-10-01 22:45 -^> 10-02 06:40 WITH the SQLite build:
 ::         28533s (7h 56m). 1,335,293 JSON files, err=0. Parquet merge
 ::         16m20s, sqlite preflight 6m44s, table load ~7h20m, 139.34 GB.

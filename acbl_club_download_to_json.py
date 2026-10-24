@@ -446,7 +446,8 @@ def shutdown_acbl_browser() -> None:
 
 def _shutdown_browser() -> None:
     """Close the shared browser context and stop Playwright (best effort)."""
-    global _PW, _CONTEXT, _PAGE
+    global _PW, _CONTEXT, _PAGE, _SESSION_TABS
+    _SESSION_TABS = []
     try:
         if _CONTEXT is not None:
             _CONTEXT.close()
@@ -588,6 +589,38 @@ def extract_embedded_json(url: str) -> Optional[dict]:
         return None
 
 
+def _read_cleared_content(page) -> str:
+    """Return the page HTML once any Cloudflare/WAF check has cleared.
+
+    In the usual case (no challenge) the HTML read for the challenge check is
+    returned as is, so the page is serialized once instead of twice.
+    """
+    content = ""
+    try:
+        content = page.content()
+    except Exception:
+        pass
+    if content and not _is_cloudflare_challenge(page, content):
+        return content
+    # Raises Forbidden403Error if the check never clears.
+    _wait_through_cloudflare(page)
+    page.wait_for_selector('body', timeout=10000)
+    return page.content()
+
+
+def _session_json_from_page(page) -> Optional[dict]:
+    """Parse the embedded ``var data = {...};`` JSON from a loaded details page."""
+    content = _read_cleared_content(page)
+
+    match = re.search(r'var data = (\{.*?\});', content, re.DOTALL)
+    if not match:
+        print("ERROR: Could not find 'var data = {...}' in page")
+        return None
+
+    json_str = match.group(1).replace(r'\/', '/')
+    return json.loads(json_str)
+
+
 def extract_with_playwright(url: str) -> Optional[dict]:
     """
     Fetch ACBL results page using Playwright and extract embedded JSON data
@@ -601,44 +634,20 @@ def extract_with_playwright(url: str) -> Optional[dict]:
     if not PLAYWRIGHT_AVAILABLE:
         print("ERROR: Playwright is not available")
         return None
-    
+
     try:
         print(f"Fetching with Playwright: {url}")
-        
+
         # Reuse the shared persistent page (launched once, kept alive for the run)
         page = _get_browser_page()
-        
+
         # Navigate to page
         response = page.goto(url, wait_until='domcontentloaded', timeout=60000)
         status = response.status if response else None
         print(f"Response status: {status}")
-        
-        # The initial response may be a Cloudflare 403 challenge page; wait
-        # for it to clear (raises Forbidden403Error if it never does).
-        _wait_through_cloudflare(page)
-        
-        # Wait for content to load
-        page.wait_for_selector('body', timeout=10000)
-        
-        # Get page content
-        content = page.content()
-        
-        # Extract embedded JSON
-        pattern = r'var data = (\{.*?\});'
-        match = re.search(pattern, content, re.DOTALL)
-        
-        if not match:
-            print("ERROR: Could not find 'var data = {...}' in page")
-            return None
-        
-        # Clean up and parse JSON
-        json_str = match.group(1)
-        json_str = json_str.replace(r'\/', '/')
-        
-        data = json.loads(json_str)
-        
-        return data
-    
+
+        return _session_json_from_page(page)
+
     except KeyboardInterrupt:
         print("\n\nKeyboardInterrupt detected in extract_with_playwright")
         _shutdown_browser()
@@ -693,6 +702,46 @@ def extract_from_file(html_file: str) -> Optional[dict]:
         return None
     except Exception as e:
         print(f"ERROR: Unexpected error: {e}")
+        return None
+
+
+# Listing pages are a DataTables table (10 rows per page, client-side paging).
+# Ready means the table is initialized and shows session links or its
+# empty-table row. The result is a marker (info text + first link) so that,
+# after a "next" click, we can wait until the table shows a different page.
+_LISTING_READY_JS = """(previous) => {
+    const table = document.querySelector('table.dataTable');
+    if (!table) return false;
+    const link = table.querySelector('a[href^="/club-results/details/"]');
+    const empty = table.querySelector('td.dt-empty, td.dataTables_empty');
+    if (!link && !empty) return false;
+    const info = document.querySelector('.dt-info, .dataTables_info');
+    const marker = (info ? info.textContent : '') + '|' + (link ? link.getAttribute('href') : '');
+    if (previous !== null && marker === previous) return false;
+    return marker;
+}"""
+
+# Upper bound on waiting for a listing page. On timeout the page is read
+# anyway, as the old fixed 2 s sleep did.
+LISTING_WAIT_TIMEOUT_MS = 8000
+
+
+def _wait_for_listing(page, previous_marker: Optional[str] = None, timeout_ms: int = LISTING_WAIT_TIMEOUT_MS) -> Optional[str]:
+    """Wait until a club/player listing page shows its results table.
+
+    With ``previous_marker`` (from the page before a "next" click), also wait
+    until the table shows different rows. Returns the new marker, or None on
+    timeout (the caller then reads whatever is on the page).
+    """
+    try:
+        handle = page.wait_for_function(
+            _LISTING_READY_JS, arg=previous_marker, timeout=timeout_ms, polling=100
+        )
+        return handle.json_value()
+    except Forbidden403Error:
+        raise
+    except Exception as exc:
+        print(f"  Results table not seen after {timeout_ms / 1000:.0f}s ({type(exc).__name__}); reading the page anyway")
         return None
 
 
@@ -763,22 +812,29 @@ def get_club_sessions(club_number: str, output_dir: pathlib.Path, refresh: bool 
                 all_content = []
                 page_num = 1
                 details_dir = pathlib.Path(output_dir) / club_number / "details"
-                
+                marker = None
+                previous_page_sessions = None
+
                 while True:
                     print(f"  Fetching page {page_num}...")
-                    
-                    # Wait for content to load
-                    time.sleep(2)
-                    
+
+                    # Wait for this page's rows (not the previous page's)
+                    marker = _wait_for_listing(page, marker)
+
                     # Get current page content
                     content = page.content()
+                    page_sessions = re.findall(r'href="/club-results/details/(\d+)"', content)
+                    if page_num > 1 and page_sessions and page_sessions == previous_page_sessions:
+                        # The "next" click did not change the table; stop
+                        # instead of reading the same page again.
+                        print(f"  Page {page_num} shows the same rows as page {page_num - 1}; stopping pagination")
+                        break
+                    previous_page_sessions = page_sessions
                     all_content.append(content)
-                    
+
                     # Check if any sessions on this page already exist (optimization)
                     # Since sessions are sorted by date, if we find existing sessions, we can stop
                     if details_dir.exists():
-                        page_pattern = r'href="/club-results/details/(\d+)"'
-                        page_sessions = re.findall(page_pattern, content)
                         existing_count = 0
                         for session_id in page_sessions:
                             session_file = details_dir / f"{session_id}.data.json"
@@ -794,8 +850,9 @@ def get_club_sessions(club_number: str, output_dir: pathlib.Path, refresh: bool 
                     # Check if any session on this page is before start_date
                     if start_date:
                         # Extract Unix timestamps from data-sort attributes in <td> tags
-                        # Pattern: <td data-sort="1574035200">11/18/2019</td>
-                        timestamp_pattern = r'<td data-sort="(\d+)">'
+                        # Pattern: <td data-sort="1574035200" class="dt-type-numeric sorting_1">11/18/2019</td>
+                        # (DataTables adds the class, so do not require '>' right after the number.)
+                        timestamp_pattern = r'<td data-sort="(\d+)"'
                         timestamps = re.findall(timestamp_pattern, content)
                         
                         if timestamps:
@@ -932,15 +989,22 @@ def get_player_sessions(player_id: str) -> Optional[List[dict]]:
         # Collect all session links across all pages
         all_content = []
         page_num = 1
-        
+        marker = None
+        previous_page_sessions = None
+
         while True:
             print(f"  Fetching page {page_num}...")
-            
-            # Wait for content to load
-            time.sleep(2)
-            
+
+            # Wait for this page's rows (not the previous page's)
+            marker = _wait_for_listing(page, marker)
+
             # Get current page content
             content = page.content()
+            page_sessions = re.findall(r'href="/club-results/details/(\d+)"', content)
+            if page_num > 1 and page_sessions and page_sessions == previous_page_sessions:
+                print(f"  Page {page_num} shows the same rows as page {page_num - 1}; stopping pagination")
+                break
+            previous_page_sessions = page_sessions
             all_content.append(content)
             
             # Check if there's a "Next" button and if it's enabled
@@ -1097,10 +1161,123 @@ def _rate_limit_session_requests(min_interval_seconds: float) -> None:
     _last_session_request_start = time.monotonic()
 
 
+def _session_request_wait_seconds(min_interval_seconds: float) -> float:
+    """Seconds left before the next session request may start (same limiter
+    as _rate_limit_session_requests, without sleeping)."""
+    if _last_session_request_start is None:
+        return 0.0
+    return max(0.0, min_interval_seconds - (time.monotonic() - _last_session_request_start))
+
+
+def _mark_session_request_start() -> None:
+    global _last_session_request_start
+    _last_session_request_start = time.monotonic()
+
+
+# Details page URL. Tests point it at a local server.
+SESSION_URL_TEMPLATE = "https://my.acbl.org/club-results/details/{session_id}"
+
+
+def _session_url(session_id: str) -> str:
+    return SESSION_URL_TEMPLATE.format(session_id=session_id)
+
+
+def _session_skip_check(session: dict, output_dir, session_num: int, total_sessions: int, club_id: Optional[str]) -> Optional[tuple]:
+    """Return (session_id, 'skipped') when the session file already exists,
+    else None. Makes no request."""
+    session_id = session['id']
+    session_name = session['name']
+
+    if club_id:
+        output_file = pathlib.Path(output_dir) / club_id / "details" / f"{session_id}.data.json"
+        if output_file.exists():
+            print(f"[{session_num}/{total_sessions}] SKIP - {session_id} ({session_name}) - already exists")
+            return (session_id, 'skipped')
+        return None
+
+    # No club ID: check every club directory (player/session modes)
+    base_dir = pathlib.Path(output_dir)
+    if base_dir.exists():
+        for club_dir in base_dir.iterdir():
+            if club_dir.is_dir() and club_dir.name.isdigit():
+                session_file = club_dir / "details" / f"{session_id}.data.json"
+                if session_file.exists():
+                    print(f"[{session_num}/{total_sessions}] SKIP - {session_id} ({session_name}) - already exists at {session_file}")
+                    return (session_id, 'skipped')
+    return None
+
+
+def _finish_session(data: Optional[dict], session: dict, output_dir, session_num: int, total_sessions: int, club_id: Optional[str], start_date: Optional[str], end_date: Optional[str]) -> tuple:
+    """Apply date filters to fetched session data and save it.
+
+    Returns (session_id, status) as described in process_single_session.
+    """
+    session_id = session['id']
+
+    if not data:
+        print(f"  -> FAILED to extract data")
+        # If this is the first session and extraction failed, skip the entire club
+        if session_num == 1:
+            print(f"  -> First session failed - skipping entire club")
+            return (session_id, 'skip_club')
+        return (session_id, 'failed')
+
+    # Check date filters AFTER fetching (to avoid fetching outside date range)
+    session_date = data.get('start_date')
+    if session_date and (start_date or end_date):
+        try:
+            # Parse ACBL date format (MM/DD/YYYY)
+            dt = datetime.strptime(session_date, '%m/%d/%Y')
+            session_date_comparable = dt.strftime('%Y-%m-%d')
+
+            # Check if session is BEFORE start_date - STOP processing (sessions sorted by date, newest first)
+            if start_date and session_date_comparable < start_date:
+                print(f"  -> Session date {session_date} is before start_date {start_date}")
+                print(f"  -> STOPPING: All remaining sessions are older than start_date")
+                return (session_id, 'stop')
+
+            # Check if session is AFTER end_date - skip this session but continue
+            if end_date and session_date_comparable > end_date:
+                print(f"  -> Session date {session_date} is after end_date {end_date}, skipping")
+                return (session_id, 'skipped')
+
+        except Exception as e:
+            print(f"  -> WARNING: Could not parse session date '{session_date}': {e}")
+
+    # Extract club_id from JSON if not provided
+    if not club_id:
+        club_id = str(data.get('club_id_number', ''))
+        if not club_id:
+            print(f"  -> WARNING: No club_id_number found in JSON, cannot organize properly")
+            return (session_id, 'failed')
+
+    # Now save to proper location: club-results/<club_id>/details/<session_id>.data.json
+    details_dir = pathlib.Path(output_dir) / club_id / "details"
+    details_dir.mkdir(parents=True, exist_ok=True)
+    output_file = details_dir / f"{session_id}.data.json"
+
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+    file_size = output_file.stat().st_size
+    print(f"  -> Saved [{session_num}/{total_sessions}]: {output_file} ({file_size:,} bytes)")
+
+    return (session_id, 'processed')
+
+
+def _session_error_result(session_id: str, session_num: int, exc: Exception) -> tuple:
+    print(f"  -> ERROR: {exc}")
+    # If this is the first session and extraction failed, skip the entire club
+    if session_num == 1:
+        print(f"  -> First session failed - skipping entire club")
+        return (session_id, 'skip_club')
+    return (session_id, 'failed')
+
+
 def process_single_session(session: dict, output_dir: str, session_num: int, total_sessions: int, club_id: Optional[str] = None, refresh: bool = False, sleep_seconds: int = 2, start_date: Optional[str] = None, end_date: Optional[str] = None) -> tuple:
     """
     Process a single session
-    
+
     Args:
         session: Session dict with 'id' and 'name'
         output_dir: Directory to save JSON files
@@ -1111,7 +1288,7 @@ def process_single_session(session: dict, output_dir: str, session_num: int, tot
         sleep_seconds: Seconds to sleep between requests (default: 2)
         start_date: Filter sessions on/after this date (YYYY-MM-DD) - stops processing if session is before this
         end_date: Filter sessions on/before this date (YYYY-MM-DD)
-        
+
     Returns:
         Tuple of (session_id, status) where status is:
             'processed' - successfully extracted and saved
@@ -1122,112 +1299,219 @@ def process_single_session(session: dict, output_dir: str, session_num: int, tot
     """
     session_id = session['id']
     session_name = session['name']
-    
+
     # Determine club ID from session data if available
     if not club_id and 'club_id' in session:
         club_id = session['club_id']
-    
-    # For player/session modes without club_id, we need to fetch first to determine club_id
-    # Check common locations for existing file
-    possible_locations = []
-    
-    if club_id:
-        # We know the club ID, use standard location
-        details_dir = pathlib.Path(output_dir) / club_id / "details"
-        output_file = details_dir / f"{session_id}.data.json"
-        possible_locations.append(output_file)
-    else:
-        # Check if file exists in any club directory (from previous downloads)
-        base_dir = pathlib.Path(output_dir)
-        if base_dir.exists():
-            for club_dir in base_dir.iterdir():
-                if club_dir.is_dir() and club_dir.name.isdigit():
-                    details_dir = club_dir / "details"
-                    session_file = details_dir / f"{session_id}.data.json"
-                    if session_file.exists():
-                        print(f"[{session_num}/{total_sessions}] SKIP - {session_id} ({session_name}) - already exists at {session_file}")
-                        return (session_id, 'skipped')
-    
-    # Check if file exists at known location
-    if club_id and output_file.exists():
-        print(f"[{session_num}/{total_sessions}] SKIP - {session_id} ({session_name}) - already exists")
-        return (session_id, 'skipped')
-    
+
+    skip = _session_skip_check(session, output_dir, session_num, total_sessions, club_id)
+    if skip:
+        return skip
+
     print(f"[{session_num}/{total_sessions}] Processing {session_id} ({session_name})...")
-    
+
     # Rate limit: at most one session request per sleep_seconds. Only the
     # part of the interval not already spent on the previous page load is
     # slept, so politeness is unchanged but the old fixed 2 s sleep on top of
     # a ~2 s page load (~4 h per full sweep) is gone.
     _rate_limit_session_requests(sleep_seconds)
 
-    # Construct URL and extract JSON
-    url = f"https://my.acbl.org/club-results/details/{session_id}"
-    
+    url = _session_url(session_id)
+
     try:
         data = extract_with_playwright(url)
-        
-        if data:
-            # Check date filters AFTER fetching (to avoid fetching outside date range)
-            session_date = data.get('start_date')
-            if session_date and (start_date or end_date):
-                try:
-                    # Parse ACBL date format (MM/DD/YYYY)
-                    dt = datetime.strptime(session_date, '%m/%d/%Y')
-                    session_date_comparable = dt.strftime('%Y-%m-%d')
-                    
-                    # Check if session is BEFORE start_date - STOP processing (sessions sorted by date, newest first)
-                    if start_date and session_date_comparable < start_date:
-                        print(f"  -> Session date {session_date} is before start_date {start_date}")
-                        print(f"  -> STOPPING: All remaining sessions are older than start_date")
-                        return (session_id, 'stop')
-                    
-                    # Check if session is AFTER end_date - skip this session but continue
-                    if end_date and session_date_comparable > end_date:
-                        print(f"  -> Session date {session_date} is after end_date {end_date}, skipping")
-                        return (session_id, 'skipped')
-                        
-                except Exception as e:
-                    print(f"  -> WARNING: Could not parse session date '{session_date}': {e}")
-            
-            # Extract club_id from JSON if not provided
-            if not club_id:
-                club_id = str(data.get('club_id_number', ''))
-                if not club_id:
-                    print(f"  -> WARNING: No club_id_number found in JSON, cannot organize properly")
-                    return (session_id, 'failed')
-            
-            # Now save to proper location: club-results/<club_id>/details/<session_id>.data.json
-            details_dir = pathlib.Path(output_dir) / club_id / "details"
-            details_dir.mkdir(parents=True, exist_ok=True)
-            output_file = details_dir / f"{session_id}.data.json"
-            
-            # Save to file
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            
-            # Get file size
-            file_size = output_file.stat().st_size
-            print(f"  -> Saved [{session_num}/{total_sessions}]: {output_file} ({file_size:,} bytes)")
-            
-            return (session_id, 'processed')
-        else:
-            print(f"  -> FAILED to extract data")
-            # If this is the first session and extraction failed, skip the entire club
-            if session_num == 1:
-                print(f"  -> First session failed - skipping entire club")
-                return (session_id, 'skip_club')
-            return (session_id, 'failed')
-            
+        return _finish_session(data, session, output_dir, session_num, total_sessions, club_id, start_date, end_date)
     except Forbidden403Error:
         raise
     except Exception as e:
-        print(f"  -> ERROR: {e}")
-        # If this is the first session and extraction failed, skip the entire club
-        if session_num == 1:
-            print(f"  -> First session failed - skipping entire club")
-            return (session_id, 'skip_club')
-        return (session_id, 'failed')
+        return _session_error_result(session_id, session_num, e)
+
+
+# --- Opt-in concurrent session downloads (--concurrency N) --------------------
+# All tabs live in the one persistent context, so they share cf_clearance.
+# Playwright's sync API is single-threaded, so one loop drives every tab: it
+# starts a navigation without waiting for it, then collects whichever tab
+# finishes first. Requests still start at most once per --sleep seconds.
+
+SESSION_NAV_TIMEOUT_S = 60.0  # same as the goto timeout in extract_with_playwright
+
+
+class _SessionTab:
+    """One browser tab that loads session details pages without blocking."""
+
+    def __init__(self, page):
+        self.page = page
+        self.url = None
+        self.loaded = False
+        self.error = None
+        self.status = None
+        self.started = 0.0
+        page.on("domcontentloaded", self._on_domcontentloaded)
+        page.on("response", self._on_response)
+        page.on("requestfailed", self._on_request_failed)
+
+    def _is_main_navigation(self, request) -> bool:
+        try:
+            return request.is_navigation_request() and request.frame == self.page.main_frame
+        except Exception:
+            return False
+
+    def _on_domcontentloaded(self, _page) -> None:
+        if self.url is not None:
+            self.loaded = True
+
+    def _on_response(self, response) -> None:
+        if self.url is not None and self._is_main_navigation(response.request):
+            self.status = response.status
+
+    def _on_request_failed(self, request) -> None:
+        if self.url is not None and not self.loaded and self._is_main_navigation(request):
+            self.error = request.failure or "navigation request failed"
+
+    def start(self, url: str) -> None:
+        self.url = url
+        self.loaded = False
+        self.error = None
+        self.status = None
+        self.started = time.monotonic()
+        try:
+            # location.assign returns at once; the load runs in the browser.
+            self.page.evaluate("u => { window.location.assign(u); }", url)
+        except Exception as exc:
+            # The old document can be torn down before evaluate returns.
+            message = str(exc)
+            if "context was destroyed" not in message and "navigat" not in message.lower():
+                self.error = message
+
+    def ready(self) -> bool:
+        return (
+            self.loaded
+            or self.error is not None
+            or time.monotonic() - self.started > SESSION_NAV_TIMEOUT_S
+        )
+
+    def pump(self, seconds: float) -> None:
+        # Playwright delivers page events only inside API calls.
+        self.page.wait_for_timeout(max(1, int(seconds * 1000)))
+
+    def extract(self) -> Optional[dict]:
+        """Session JSON from the loaded page, or None (as extract_with_playwright)."""
+        if self.error is not None:
+            print(f"ERROR: Playwright extraction failed: {self.url}: {self.error}")
+            return None
+        if not self.loaded:
+            print(f"ERROR: Playwright extraction failed: {self.url}: no page load after {SESSION_NAV_TIMEOUT_S:.0f}s")
+            return None
+        print(f"Response status: {self.status} ({self.url})")
+        try:
+            return _session_json_from_page(self.page)
+        except Forbidden403Error:
+            raise
+        except Exception as e:
+            print(f"ERROR: Playwright extraction failed: {e}")
+            return None
+
+
+_SESSION_TABS: list = []
+
+
+def _page_is_closed(page) -> bool:
+    try:
+        return page.is_closed()
+    except Exception:
+        return True
+
+
+def _get_session_tabs(count: int) -> list:
+    """Tab 0 wraps the shared page; extra tabs open in the same context and
+    are reused for the rest of the run."""
+    global _SESSION_TABS
+    first = _get_browser_page()
+    head = next((t for t in _SESSION_TABS if t.page is first), None) or _SessionTab(first)
+    extra = [t for t in _SESSION_TABS if t.page is not first and not _page_is_closed(t.page)]
+    while len(extra) < count - 1:
+        extra.append(_SessionTab(_CONTEXT.new_page()))
+    _SESSION_TABS = [head] + extra
+    return _SESSION_TABS[:count]
+
+
+def download_sessions_concurrently(sessions: List[dict], output_dir, club_id: Optional[str], sleep_seconds: float, start_date: Optional[str], end_date: Optional[str], tabs: list) -> List[tuple]:
+    """Download sessions over several tabs; returns (session_id, status) in
+    list order, like the sequential loop in process_club_sessions.
+
+    - Skip-existing checks happen before a request, as in sequential mode.
+    - Session 1 is fetched alone, so the "first session failed -> skip club"
+      rule sees the same outcome as the sequential loop.
+    - After a 'stop' or 'skip_club' nothing new starts; tabs still loading are
+      drained and their later-in-list results are dropped (not saved).
+    - Forbidden403Error propagates at once, as in sequential mode.
+    """
+    total = len(sessions)
+    results: dict = {}
+    next_idx = 0
+    in_flight: dict = {}  # tab -> session index
+    idle = list(tabs)
+    halt_at = None        # index of the first 'stop' / 'skip_club'
+    first_pending = False # session 1 is loading; wait before starting others
+
+    while True:
+        # Start requests while a tab and a rate-limit slot are free.
+        wait = 0.0
+        while idle and next_idx < total and halt_at is None and not first_pending:
+            session = sessions[next_idx]
+            skip = _session_skip_check(session, output_dir, next_idx + 1, total, club_id)
+            if skip:
+                results[next_idx] = skip
+                next_idx += 1
+                continue
+            wait = _session_request_wait_seconds(sleep_seconds)
+            if wait > 0:
+                break
+            idx = next_idx
+            next_idx += 1
+            print(f"[{idx + 1}/{total}] Processing {session['id']} ({session['name']})...")
+            _mark_session_request_start()
+            tab = idle.pop(0)
+            url = _session_url(session['id'])
+            print(f"Fetching with Playwright: {url}")
+            tab.start(url)
+            in_flight[tab] = idx
+            if idx == 0:
+                first_pending = True
+
+        if not in_flight:
+            if next_idx >= total or halt_at is not None:
+                break
+            # Only the rate limit is holding us back.
+            time.sleep(max(wait, 0.01))
+            continue
+
+        done = [t for t in in_flight if t.ready()]
+        if not done:
+            pause = 0.05 if wait <= 0 else min(wait, 0.05)
+            next(iter(in_flight)).pump(pause)
+            continue
+
+        for tab in done:
+            idx = in_flight.pop(tab)
+            idle.append(tab)
+            session = sessions[idx]
+            if halt_at is not None and idx > halt_at:
+                print(f"  -> Dropping {session['id']}: processing stopped at session {halt_at + 1}")
+                continue
+            try:
+                result = _finish_session(tab.extract(), session, output_dir, idx + 1, total, club_id, start_date, end_date)
+            except Forbidden403Error:
+                raise
+            except Exception as e:
+                result = _session_error_result(session['id'], idx + 1, e)
+            results[idx] = result
+            if idx == 0:
+                first_pending = False
+            if result[1] in ('stop', 'skip_club'):
+                halt_at = idx if halt_at is None else min(halt_at, idx)
+
+    return [results[i] for i in sorted(results)]
 
 
 def filter_sessions(sessions: List[dict], start_date: Optional[str] = None, end_date: Optional[str] = None, limit: Optional[int] = None) -> List[dict]:
@@ -1319,7 +1603,7 @@ def filter_sessions_by_date(sessions: List[dict], start_date: Optional[str] = No
     return filtered
 
 
-def process_club_sessions(club_number: str, output_dir: pathlib.Path, start_date: Optional[str] = None, end_date: Optional[str] = None, limit: Optional[int] = None, refresh: bool = False, sleep_seconds: int = 2) -> int:
+def process_club_sessions(club_number: str, output_dir: pathlib.Path, start_date: Optional[str] = None, end_date: Optional[str] = None, limit: Optional[int] = None, refresh: bool = False, sleep_seconds: int = 2, concurrency: int = 1) -> int:
     """
     Process all sessions for a club and extract JSON for each
     
@@ -1331,13 +1615,14 @@ def process_club_sessions(club_number: str, output_dir: pathlib.Path, start_date
         limit: Maximum number of sessions to process
         refresh: If True, re-fetch club HTML to get latest session list
         sleep_seconds: Seconds to sleep between requests (default: 2)
-        
+        concurrency: Browser tabs for session downloads (default 1 = sequential)
+
     Returns:
         Number of sessions successfully processed
     """
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Get list of sessions (creates club directory; HTML marker is written at end on success)
     # Pass start_date to enable smart pagination (stops when encountering old sessions)
     club_sessions_result = get_club_sessions(club_number, output_dir, refresh, start_date)
@@ -1364,21 +1649,31 @@ def process_club_sessions(club_number: str, output_dir: pathlib.Path, start_date
     print(f"\nProcessing {len(sessions)} sessions...")
     print("=" * 70)
     
-    # Process sessions sequentially (no concurrent requests due to rate limiting)
     results = []
-    for i, session in enumerate(sessions):
-        result = process_single_session(session, output_dir, i + 1, len(sessions), club_number, refresh, sleep_seconds, start_date, end_date)
-        results.append(result)
-        
-        # Check if we should skip the entire club (first session failed to extract)
-        if result[1] == 'skip_club':
+    if concurrency > 1 and len(sessions) > 1:
+        # Several tabs, one shared rate limit (see download_sessions_concurrently)
+        tabs = _get_session_tabs(min(concurrency, len(sessions)))
+        results = download_sessions_concurrently(sessions, output_dir, club_number, sleep_seconds, start_date, end_date, tabs)
+        statuses = {status for _, status in results}
+        if 'skip_club' in statuses:
             print(f"\nSkipping entire club - first session failed to extract data")
-            break
-        
-        # Check if we should stop processing (session date before start_date)
-        if result[1] == 'stop':
+        elif 'stop' in statuses:
             print(f"\nStopping session processing - reached sessions older than start_date")
-            break
+    else:
+        # Process sessions sequentially (no concurrent requests due to rate limiting)
+        for i, session in enumerate(sessions):
+            result = process_single_session(session, output_dir, i + 1, len(sessions), club_number, refresh, sleep_seconds, start_date, end_date)
+            results.append(result)
+
+            # Check if we should skip the entire club (first session failed to extract)
+            if result[1] == 'skip_club':
+                print(f"\nSkipping entire club - first session failed to extract data")
+                break
+
+            # Check if we should stop processing (session date before start_date)
+            if result[1] == 'stop':
+                print(f"\nStopping session processing - reached sessions older than start_date")
+                break
     
     # Count results
     processed = sum(1 for _, status in results if status == 'processed')
@@ -1472,7 +1767,7 @@ def process_player_sessions(player_id: str, output_dir: pathlib.Path, start_date
     return processed
 
 
-def process_all_clubs(output_dir: pathlib.Path, start_date: Optional[str] = None, end_date: Optional[str] = None, limit: Optional[int] = None, refresh: bool = False, sleep_seconds: int = 2, starting_club: Optional[int] = None, skip_if_html_exists: bool = False, sleep_403_seconds: int = 300) -> int:
+def process_all_clubs(output_dir: pathlib.Path, start_date: Optional[str] = None, end_date: Optional[str] = None, limit: Optional[int] = None, refresh: bool = False, sleep_seconds: int = 2, starting_club: Optional[int] = None, skip_if_html_exists: bool = False, sleep_403_seconds: int = 300, concurrency: int = 1) -> int:
     """
     Process all clubs from ACBL and extract sessions for each
     
@@ -1535,7 +1830,7 @@ def process_all_clubs(output_dir: pathlib.Path, start_date: Optional[str] = None
         
         while True:
             try:
-                processed = process_club_sessions(club_id, output_dir, start_date, end_date, limit, refresh, sleep_seconds)
+                processed = process_club_sessions(club_id, output_dir, start_date, end_date, limit, refresh, sleep_seconds, concurrency)
                 total_processed += processed
                 break
             except Forbidden403Error as e:
@@ -1575,7 +1870,8 @@ def main():
     starting_club = None  # In all-clubs mode, start at this club number (inclusive)
     skip_if_html_exists = False  # Default: process all clubs; individual sessions skip if data.json exists
     remove_all_html_files = False  # Default: keep <club>/<club>.html cache on startup
-    
+    concurrency = 1    # Browser tabs for club session downloads (1 = sequential)
+
     # Show usage if --help
     if '--help' in sys.argv or '-h' in sys.argv:
         print("=" * 70)
@@ -1630,6 +1926,12 @@ def main():
         print("  --end-date <date>      Filter sessions on/before date (YYYY-MM-DD) (default: today)")
         print("  --limit <n>            Limit number of sessions to fetch per club (default: unlimited)")
         print("  --sleep <seconds>      Delay between session requests (default: 2 seconds)")
+        print("  --concurrency <n>      Browser tabs for a club's session downloads (default: 1 = sequential).")
+        print("                         All tabs share one rate limit: requests still start at most")
+        print("                         once per --sleep seconds. This only helps when a page takes")
+        print("                         longer than --sleep to load; a real speedup needs a lower")
+        print("                         --sleep too, which makes more requests to ACBL (your call).")
+        print("                         Club and all-clubs modes only.")
         print("  --sleep-403 <seconds>  Wait time before retry on 403 (default: 300 seconds / 5 minutes)")
         print("  --starting-club <n>    In all-clubs mode, start at club >= n (default: none)")
         print("  --skip-if-html-exists  Skip clubs where <club>/details/*.data.json already exists")
@@ -1716,6 +2018,20 @@ def main():
                     return 1
             else:
                 print("ERROR: --sleep requires a number of seconds")
+                return 1
+        elif arg == '--concurrency':
+            if i + 1 < len(sys.argv):
+                try:
+                    concurrency = int(sys.argv[i + 1])
+                    if concurrency < 1:
+                        print("ERROR: --concurrency requires an integer >= 1")
+                        return 1
+                    i += 2
+                except ValueError:
+                    print("ERROR: --concurrency requires an integer")
+                    return 1
+            else:
+                print("ERROR: --concurrency requires a number of tabs")
                 return 1
         elif arg == '--sleep-403':
             if i + 1 < len(sys.argv):
@@ -1810,6 +2126,9 @@ def main():
         else:
             output_dir = out_path
 
+    if concurrency > 1:
+        print(f"Concurrency: {concurrency} tabs, requests at most once per {sleep_seconds}s (club modes only)")
+
     # Startup cleanup: remove all <club>/<club>.html under the output directory
     if remove_all_html_files:
         remove_club_html_files_on_startup(pathlib.Path(output_dir))
@@ -1855,6 +2174,7 @@ def main():
             starting_club=starting_club,
             skip_if_html_exists=skip_if_html_exists,
             sleep_403_seconds=sleep_403_seconds,
+            concurrency=concurrency,
         )
         return 0 if processed > 0 else 1
     
@@ -1892,7 +2212,7 @@ def main():
         
         while True:
             try:
-                processed = process_club_sessions(club_number, output_dir, start_date, end_date, limit, refresh, sleep_seconds)
+                processed = process_club_sessions(club_number, output_dir, start_date, end_date, limit, refresh, sleep_seconds, concurrency)
                 break
             except Forbidden403Error as e:
                 print(f"\n403 Forbidden while processing club {club_number}: {e}")

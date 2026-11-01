@@ -217,6 +217,8 @@ def create_elo_ratings(club_or_tournament, out_dir=None):
             'mp_color', 'mp_rating',  # tournament platinum identity; unused on club
             # Opening lead and its scores (club only; tournaments record no lead).
             'Direction_OnLead', 'OnLead$', 'Lead$', 'DD_Lead_Cost', 'Lead_Is_DD_Best', 'SD_Lead_',
+            # SuitC (3a --suitc): declarer's guess cost and guess-adjusted DD difference.
+            'SC_Guess_Declarer$', 'DD_Tricks_Diff_SC$',
         ]
     read_cols = [col for col in df.columns if any(re.match(regex, col) for regex in regex_cols)]
     

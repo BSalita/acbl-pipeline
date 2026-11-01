@@ -2422,6 +2422,7 @@ _POSTMORTEM_BOARD_COLUMNS = [
     "Result", "Tricks", "Score_NS", "Score_EW", "Pct_NS", "Pct_EW",
     "MP_NS", "MP_EW", "MP_Top", "Par_NS",
     "Par_Contract_NS", "Par_Contract_EW", "Is_Sacrifice_Opportunity",
+    "Lead", "DD_Lead_Cost", "Lead_Is_DD_Best",  # club only
     "Pair_Number_NS", "Pair_Number_EW", "PBN",
 ]
 _POSTMORTEM_CONTEXT_COLUMNS = [

@@ -185,8 +185,14 @@ echo [Stage 3] Augmentation...
 ::         input, cache rows, code and versions match
 ::         acbl_{club,tournament}_hand_records_augmented_manifest.json;
 ::         --force recomputes. The first run after this change recomputes.
-echo   [3a] Augmenting hand records (DD + SD + Par)...
-call :pyrun 3a acbl_hand_records_augment.py
+:: OPTION: set ACBL_SUITC=1 to add the SC_* SuitC single-suit columns (needs
+::         ..\SuitC\build\Release\SuitC.exe). Holdings are cached in
+::         E:\bridge\data\suitc\combos\ (shared with FFBridge); the first run
+::         solves ~800k holdings (~1-2 h). Changing it recomputes 3a and 3c.
+set "SUITC_ARGS="
+if "%ACBL_SUITC%"=="1" set "SUITC_ARGS=--suitc"
+echo   [3a] Augmenting hand records (DD + SD + Par; SuitC %ACBL_SUITC%)...
+call :pyrun 3a acbl_hand_records_augment.py %SUITC_ARGS%
 if errorlevel 1 goto :error
 
 :: ---- 3b ----
@@ -207,8 +213,14 @@ if errorlevel 1 goto :error
 ::         Club 47221s, 70,827,715 rows, 82.4 GB. Tournament 11970s,
 ::         18,667,922 rows, 19.6 GB. Club Date max 2026-09-09.
 ::         Joins ~6k-col hand-record features into board results.
-echo   [3c] Augmenting board results (step 2: join hand records + full augmentation)...
-call :pyrun 3c acbl_board_results_augment_step2.py
+:: OPTION: set ACBL_SD_LEAD_SAMPLES=20 to add the single-dummy lead score
+::         (SD_Lead_* columns, club only: tournaments record no lead). The first
+::         club run solves ~5.7M lead positions, ~33 h at 20 (48 positions/s);
+::         acbl/acbl_club_sd_lead_cache/ keeps them, so later runs solve only new
+::         ones. Changing the value recomputes every year shard.
+if not defined ACBL_SD_LEAD_SAMPLES set "ACBL_SD_LEAD_SAMPLES=0"
+echo   [3c] Augmenting board results (step 2: join hand records + full augmentation; SD lead samples %ACBL_SD_LEAD_SAMPLES%)...
+call :pyrun 3c acbl_board_results_augment_step2.py --sd-lead-samples %ACBL_SD_LEAD_SAMPLES%
 if errorlevel 1 goto :error
 
 :: ====================================================================

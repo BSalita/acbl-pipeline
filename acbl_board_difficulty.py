@@ -152,7 +152,17 @@ def add_par_side(df: pl.DataFrame) -> pl.DataFrame:
     ).drop("_making")
 
 
-def load_tables(side: str, max_rows: int | None) -> pl.DataFrame:
+PLAY_TARGETS = {
+    # tricks taken minus double-dummy tricks
+    "dd": "DD_Tricks_Diff",
+    # the same plus the declaring side's SuitC guess cost: tricks taken against
+    # what a declarer who cannot see the defenders' cards should expect
+    # (augmented board results built with SuitC, mlBridgeSuitCLib)
+    "sc": "DD_Tricks_Diff_SC",
+}
+
+
+def load_tables(side: str, max_rows: int | None, play_target: str = "dd") -> pl.DataFrame:
     """Join Elo rows to contract and matchpoint columns from the augmented file."""
     elo_path = ACBL_DATA_DIR / f"acbl_{side}_elo_ratings.parquet"
     aug_path = ACBL_DATA_DIR / f"acbl_{side}_board_results_augmented.parquet"
@@ -182,7 +192,13 @@ def load_tables(side: str, max_rows: int | None) -> pl.DataFrame:
         "DD_Tricks_Diff",
     ]
     elo_cols = list(dict.fromkeys(keys + analysis_cols))
-    aug_cols = list(dict.fromkeys(keys + ["Contract", "MP_Par_NS", "MP_DD_Score_NS"]))
+    aug_extra = ["Contract", "MP_Par_NS", "MP_DD_Score_NS"]
+    if play_target != "dd":
+        target = PLAY_TARGETS[play_target]
+        if target not in aug_names:
+            raise RuntimeError(f"{side}: {aug_path.name} has no {target}; rebuild with SuitC (ACBL_SUITC=1)")
+        aug_extra.append(target)
+    aug_cols = list(dict.fromkeys(keys + aug_extra))
 
     print(f"reading {elo_path.name}", flush=True)
     elo_lf = pl.scan_parquet(elo_path).select(elo_cols)
@@ -220,7 +236,7 @@ def load_tables(side: str, max_rows: int | None) -> pl.DataFrame:
     return df
 
 
-def prepare_rows(df: pl.DataFrame) -> pl.DataFrame:
+def prepare_rows(df: pl.DataFrame, play_target: str = "dd") -> pl.DataFrame:
     """Par side, scaled Elo, and the three bidding / one play outcomes."""
     df = add_par_side(df)
     for col in ("Elo_R_NS_Before", "Elo_R_EW_Before"):
@@ -253,7 +269,7 @@ def prepare_rows(df: pl.DataFrame) -> pl.DataFrame:
         .otherwise(pl.col("MP_DD_Score_NS") - pl.col("MP_Par_NS"))
         .cast(pl.Float64)
         .alias("y_mp"),
-        pl.col("DD_Tricks_Diff").cast(pl.Float64).alias("y_tricks"),
+        pl.col(PLAY_TARGETS[play_target]).cast(pl.Float64).alias("y_tricks"),
     )
     df = df.with_columns(
         _skill("elo_par").alias("s_par"),
@@ -702,11 +718,11 @@ def print_summary(side: str, report: dict, meta: dict) -> None:
     )
 
 
-def analyze(side: str, max_rows: int | None) -> tuple[pl.DataFrame, dict]:
+def analyze(side: str, max_rows: int | None, play_target: str = "dd") -> tuple[pl.DataFrame, dict]:
     t0 = time.time()
-    print(f"\n=== {side} ===")
+    print(f"\n=== {side} (play target {PLAY_TARGETS[play_target]}) ===")
     print(f"start: {datetime.now().isoformat(timespec='seconds')}")
-    df = prepare_rows(load_tables(side, max_rows))
+    df = prepare_rows(load_tables(side, max_rows, play_target), play_target)
 
     print("bidding slopes", flush=True)
     boards = df.group_by(GROUP_KEYS).agg(
@@ -804,10 +820,12 @@ def analyze(side: str, max_rows: int | None) -> tuple[pl.DataFrame, dict]:
     return boards, meta
 
 
-def write_outputs(side: str, boards: pl.DataFrame, meta: dict, out_dir: pathlib.Path) -> None:
+def write_outputs(side: str, boards: pl.DataFrame, meta: dict, out_dir: pathlib.Path, play_target: str = "dd") -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    parquet_path = out_dir / f"acbl_{side}_board_difficulty.parquet"
-    json_path = out_dir / f"acbl_{side}_board_difficulty_summary.json"
+    suffix = "" if play_target == "dd" else f"_{play_target}"  # keep the DD-target files
+    parquet_path = out_dir / f"acbl_{side}_board_difficulty{suffix}.parquet"
+    json_path = out_dir / f"acbl_{side}_board_difficulty{suffix}_summary.json"
+    meta = {**meta, "play_target": PLAY_TARGETS[play_target]}
     boards.write_parquet(parquet_path)
     json_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(f"wrote {parquet_path}")
@@ -910,6 +928,13 @@ def _parse_args() -> argparse.Namespace:
         help="Read only the first N Elo rows (smoke test)",
     )
     parser.add_argument(
+        "--play-target",
+        choices=sorted(PLAY_TARGETS),
+        default="dd",
+        help="Play outcome: dd = DD_Tricks_Diff; sc = DD_Tricks_Diff_SC (adds the SuitC guess "
+             "cost, needs board results built with SuitC). sc writes *_board_difficulty_sc*.",
+    )
+    parser.add_argument(
         "--self-test",
         action="store_true",
         help="Check the slope math and exit",
@@ -933,8 +958,8 @@ def main() -> None:
 
     overall = time.time()
     for side in sides:
-        boards, meta = analyze(side, args.max_rows)
-        write_outputs(side, boards, meta, args.out_dir)
+        boards, meta = analyze(side, args.max_rows, args.play_target)
+        write_outputs(side, boards, meta, args.out_dir, args.play_target)
     print(f"\nTOTAL elapsed: {_fmt_elapsed(overall)}")
 
 

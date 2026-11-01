@@ -169,9 +169,18 @@ def _check_skip(manifest, fingerprint, hrs_df, outputs, cache_file):
     return True, 'inputs, code and parameters unchanged; cache rewritten but rows for this side unchanged', updated
 
 
-def augment_hand_records(club_or_tournament='club', acbl_path=None, force=False):
-    """Augment hand records with DD analysis and probabilities."""
+def augment_hand_records(club_or_tournament='club', acbl_path=None, force=False, suitc=False):
+    """Augment hand records with DD analysis and probabilities.
+
+    suitc: add the SC_* single-suit SuitC columns (mlBridgeSuitCLib); holdings are
+    cached in the shared SuitC cache (SUITC_CACHE_DIR), so later runs reuse them.
+    """
     print(f"Processing {club_or_tournament} hand records augmentation...")
+    suitc_cache = None
+    if suitc:
+        from mlBridge import mlBridgeSuitCLib
+        suitc_cache = mlBridgeSuitCLib.SuitCCache()
+        print(f"SuitC columns on: cache {suitc_cache.directory}, {suitc_cache.workers} workers")
     acbl_path = acblPath if acbl_path is None else pathlib.Path(acbl_path)
     outputs = _output_files(acbl_path, club_or_tournament)
     manifest_file = acbl_path.joinpath(f'acbl_{club_or_tournament}_hand_records_augmented_manifest.json')
@@ -188,7 +197,8 @@ def augment_hand_records(club_or_tournament='club', acbl_path=None, force=False)
     t = time.time()
     fingerprint = {
         **_code_fingerprint(),
-        'params': PARAMS,
+        # Turning SuitC on or off recomputes the outputs.
+        'params': {**PARAMS, 'suitc': _suitc_version() if suitc else 'off'},
         'input': _hash_rows(hrs_df),
     }
     if force:
@@ -249,7 +259,7 @@ def augment_hand_records(club_or_tournament='club', acbl_path=None, force=False)
     loaded_cache_df = hrs_cache_df
     side_pbns = hrs_df.select('PBN')
     input_unordered = _hash_rows(hrs_df, ordered=False)
-    all_augmentations = mlBridgeAugmentLib.AllHandRecordAugmentations(hrs_df,hrs_cache_df,sd_productions=PARAMS['sd_productions'],max_dd_adds=PARAMS['max_dd_adds'],max_sd_adds=PARAMS['max_sd_adds'],cache_file_path=acbl_club_hand_records_cache_df_file)
+    all_augmentations = mlBridgeAugmentLib.AllHandRecordAugmentations(hrs_df,hrs_cache_df,sd_productions=PARAMS['sd_productions'],max_dd_adds=PARAMS['max_dd_adds'],max_sd_adds=PARAMS['max_sd_adds'],cache_file_path=acbl_club_hand_records_cache_df_file,suitc=suitc_cache)
     hrs_df, hrs_cache_df = all_augmentations.perform_all_hand_record_augmentations()
 
     assert hrs_df['PBN'].null_count() == 0, hrs_df['PBN'].null_count()
@@ -311,6 +321,11 @@ def augment_hand_records(club_or_tournament='club', acbl_path=None, force=False)
 
     return
 
+def _suitc_version() -> int:
+    from mlBridge import mlBridgeSuitCLib
+    return mlBridgeSuitCLib.SC_CACHE_VERSION
+
+
 def _parse_args():
     import argparse
     parser = argparse.ArgumentParser(description="Augment ACBL hand records with DD/SD analysis.")
@@ -318,6 +333,8 @@ def _parse_args():
     parser.add_argument("--tournament", action="store_true", help="Process tournament data only")
     parser.add_argument("--force", action="store_true", help="Recompute even if inputs are unchanged")
     parser.add_argument("--data-dir", default=str(acblPath), help=f"Folder with the input, cache and output files (default {acblPath})")
+    parser.add_argument("--suitc", action="store_true",
+                        help="Add SC_* SuitC single-suit columns (needs SuitC.exe; first run ~1-2 h to fill the shared cache)")
     args = parser.parse_args()
     if not args.club and not args.tournament:
         args.modes = ["club", "tournament"]
@@ -334,7 +351,7 @@ if __name__ == "__main__":
     args = _parse_args()
     for club_or_tournament in args.modes:
         t = time.time()
-        augment_hand_records(club_or_tournament, acbl_path=args.data_dir, force=args.force)
+        augment_hand_records(club_or_tournament, acbl_path=args.data_dir, force=args.force, suitc=args.suitc)
         print(f"{club_or_tournament} elapsed time in seconds: {time.time()-t}")
         print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
         print("-" * 70, "\n")

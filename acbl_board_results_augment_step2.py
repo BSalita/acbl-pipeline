@@ -449,14 +449,16 @@ def _shard_ok(entry: dict, cache_dir: pathlib.Path, fingerprint: str) -> bool:
         return False
 
 
-def _augment_club_year(part_brs_df: pl.DataFrame, hrs_df: pl.DataFrame, y) -> pl.DataFrame:
+def _augment_club_year(part_brs_df: pl.DataFrame, hrs_df: pl.DataFrame, y, sd_lead=None) -> pl.DataFrame:
     """Same steps as before the cache was added; returns None if the join is empty."""
     part_brs_df = part_brs_df.join(hrs_df, left_on=JOIN_KEYS, right_on=JOIN_KEYS, how='inner')
     print(part_brs_df)
     #assert part_brs_df.select('^.*_right$').is_empty(), part_brs_df.select('^.*_right$')
     if part_brs_df.is_empty():
         return None
-    part_brs_df = mlBridgeAugmentLib.AllBoardResultsAugmentations(part_brs_df).perform_all_board_results_augmentations()
+    part_brs_df = mlBridgeAugmentLib.AllBoardResultsAugmentations(part_brs_df, sd_lead=sd_lead).perform_all_board_results_augmentations()
+    if sd_lead is not None:
+        sd_lead.flush()  # keep solved positions even if a later year fails
     non_object_columns = [col for col, dtype in zip(part_brs_df.columns, part_brs_df.dtypes) if dtype != pl.Object]
     part_brs_df = part_brs_df.select(non_object_columns)
     part_brs_df = drop_out_of_range_pct(part_brs_df, f"club year {y}")
@@ -477,7 +479,11 @@ def _write_shard(df: pl.DataFrame, path: pathlib.Path):
     os.replace(tmp, path)
 
 
-def _augment_club_by_year(brs_df: pl.DataFrame, hrs_file: pathlib.Path, out_file: pathlib.Path, rebuild_all: bool):
+def _sd_lead_fingerprint(sd_lead) -> str:
+    return 'sd_lead=off' if sd_lead is None else f'sd_lead={sd_lead.samples}:{sd_lead.mode}'
+
+
+def _augment_club_by_year(brs_df: pl.DataFrame, hrs_file: pathlib.Path, out_file: pathlib.Path, rebuild_all: bool, sd_lead=None):
     cache_dir = out_file.with_name(out_file.stem + '_years')
     cache_dir.mkdir(parents=True, exist_ok=True)
     manifest_file = cache_dir / 'manifest.json'
@@ -496,7 +502,8 @@ def _augment_club_by_year(brs_df: pl.DataFrame, hrs_file: pathlib.Path, out_file
 
     t = time.time()
     hrs_schema = pl.read_parquet_schema(hrs_file)
-    common = _sha(_code_fingerprint(), _schema_str(brs_df.schema), _schema_str(hrs_schema))
+    # Turning the SD lead score on or off (or changing its samples) recomputes every year.
+    common = _sha(_code_fingerprint(), _schema_str(brs_df.schema), _schema_str(hrs_schema), _sd_lead_fingerprint(sd_lead))
     hrs_hashes = _hrs_row_hashes(hrs_file)
     print(f"hashed {len(hrs_hashes)} hand records in {time.time()-t:.1f}s")
 
@@ -525,7 +532,7 @@ def _augment_club_by_year(brs_df: pl.DataFrame, hrs_file: pathlib.Path, out_file
         t = time.time()
         part_brs_df = brs_df.filter(pl.col('Date').dt.year() == y) # or group_by()?
         print(f"\nProcessing year {y}: part_brs_df shape:{part_brs_df.shape}")
-        part_brs_df = _augment_club_year(part_brs_df, hrs_df, y)
+        part_brs_df = _augment_club_year(part_brs_df, hrs_df, y, sd_lead)
         shard_name = f'year_{y}.parquet'
         if part_brs_df is None:
             print(f"No data for year {y}")
@@ -592,11 +599,22 @@ def _augment_club_by_year(brs_df: pl.DataFrame, hrs_file: pathlib.Path, out_file
     print(f"Saved {out_file.name}: {total_rows} total rows, size:{st.st_size}, assembled from {len(shards)} shards in {time.time()-t:.1f}s")
 
 
-def augment_board_results_step2(club_or_tournament, data_path=None, recent_path=None, rebuild_all=False):
-    """Perform final augmentation on board results by joining with hand records."""
+def augment_board_results_step2(club_or_tournament, data_path=None, recent_path=None, rebuild_all=False,
+                                sd_lead_samples=0, sd_lead_mode='contract'):
+    """Perform final augmentation on board results by joining with hand records.
+
+    sd_lead_samples > 0 adds the single-dummy lead score (SD_Lead_* columns) to
+    boards with an opening lead. Solved positions are kept in
+    acbl_{club|tournament}_sd_lead_cache/, so later runs only solve new ones.
+    """
     print(f"Processing {club_or_tournament} board results augmentation step 2...")
     data_path = acblPath if data_path is None else pathlib.Path(data_path)
     recent_path = recentPath if recent_path is None else pathlib.Path(recent_path)
+    sd_lead = None
+    if sd_lead_samples > 0:
+        sd_lead = mlBridgeAugmentLib.SDLeadCache(
+            sd_lead_samples, sd_lead_mode, data_path / f'acbl_{club_or_tournament}_sd_lead_cache')
+        print(f"SD lead score on: {sd_lead_samples} samples, {sd_lead_mode} mode, cache {sd_lead.directory}")
 
     # Load step 1 augmented board results
     acbl_board_results_step1_filename = f'acbl_{club_or_tournament}_board_results_augmented_step1.parquet'
@@ -633,7 +651,7 @@ def augment_board_results_step2(club_or_tournament, data_path=None, recent_path=
     if club_or_tournament == 'club':
         #hrs_df = hrs_df.with_columns(pl.col('hand_record_id').cast(pl.Int64)) # todo: temp until previous step is corrected. issue is 'SHUFFLE' in hand_record_id for session.
         # Hand records are loaded inside, and only when some year must be recomputed.
-        _augment_club_by_year(brs_df, acbl_hand_records_augmented_file, acbl_board_results_augmented_file, rebuild_all)
+        _augment_club_by_year(brs_df, acbl_hand_records_augmented_file, acbl_board_results_augmented_file, rebuild_all, sd_lead)
     elif club_or_tournament == 'tournament':
         hrs_df = pl.read_parquet(acbl_hand_records_augmented_file)
         print(f"Loaded {acbl_hand_records_augmented_filename}: shape:{hrs_df.shape}, size:{acbl_hand_records_augmented_file.stat().st_size}")
@@ -646,7 +664,9 @@ def augment_board_results_step2(club_or_tournament, data_path=None, recent_path=
         if brs_df.is_empty():
             print("No data to process.")
         else:
-            brs_df = mlBridgeAugmentLib.AllBoardResultsAugmentations(brs_df).perform_all_board_results_augmentations()
+            brs_df = mlBridgeAugmentLib.AllBoardResultsAugmentations(brs_df, sd_lead=sd_lead).perform_all_board_results_augmentations()
+            if sd_lead is not None:
+                sd_lead.flush()
             non_object_columns = [col for col, dtype in zip(brs_df.columns, brs_df.dtypes) if dtype != pl.Object]
             brs_df = brs_df.select(non_object_columns)
             _validate_percentage_columns(brs_df, "tournament")
@@ -673,15 +693,23 @@ def _parse_club_tournament_args():
     parser.add_argument("--club", action="store_true", help="Process club data only")
     parser.add_argument("--tournament", action="store_true", help="Process tournament data only")
     parser.add_argument("--rebuild-all", action="store_true", help="Club: recompute every year, ignoring the year cache")
+    parser.add_argument("--sd-lead-samples", type=int, default=0,
+                        help="Add the single-dummy lead score with this many layouts per lead (0 = off; 20 recommended). "
+                             "First club run: about 33 h at 20.")
+    parser.add_argument("--sd-lead-mode", choices=mlBridgeAugmentLib.SD_LEAD_MODES, default="contract",
+                        help="contract: layouts keep declaring side HCP (+/-2) and trump length; hand: leader's hand only")
     args = parser.parse_args()
+    if args.sd_lead_samples < 0:
+        parser.error("--sd-lead-samples must be 0 or more")
     if not args.club and not args.tournament:
-        return ["club", "tournament"], args.rebuild_all
-    modes = []
-    if args.club:
-        modes.append("club")
-    if args.tournament:
-        modes.append("tournament")
-    return modes, args.rebuild_all
+        modes = ["club", "tournament"]
+    else:
+        modes = []
+        if args.club:
+            modes.append("club")
+        if args.tournament:
+            modes.append("tournament")
+    return modes, args
 
 
 if __name__ == "__main__":
@@ -689,10 +717,11 @@ if __name__ == "__main__":
     from mlBridge import print_started, print_ended
     program_start_time = print_started()
 
-    modes, rebuild_all = _parse_club_tournament_args()
+    modes, args = _parse_club_tournament_args()
     for club_or_tournament in modes:
         t = time.time()
-        augment_board_results_step2(club_or_tournament, rebuild_all=rebuild_all)
+        augment_board_results_step2(club_or_tournament, rebuild_all=args.rebuild_all,
+                                    sd_lead_samples=args.sd_lead_samples, sd_lead_mode=args.sd_lead_mode)
         print(f"{club_or_tournament} elapsed time in seconds: {time.time()-t}")
         print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
         print("-" * 70, "\n")

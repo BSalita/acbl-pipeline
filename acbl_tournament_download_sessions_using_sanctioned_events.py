@@ -36,6 +36,7 @@ import pathlib
 import sys
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
@@ -51,10 +52,21 @@ DEFAULT_CONNECT_TIMEOUT_SECONDS = 15
 UNAVAILABLE_HTTP_STATUSES = frozenset({400, 404})
 AUTH_HTTP_STATUSES = frozenset({401, 403})
 JWT_EXPIRY_LEEWAY_SECONDS = 60
+# Default --sleep: seconds between API requests, or after each scorecard page
+# on the live.acbl.org path. 0 = no pause. (Briefly 3.3, the club value, on
+# 2026-11-12; put back to 0 the same day: no 403 seen from live.acbl.org.)
+# test_acbl_download_delay.py --target tournament measures it and, with
+# --apply, rewrites this line.
+DEFAULT_SLEEP_SECONDS = 0.0
 
 
 class AcblApiAuthError(RuntimeError):
     """ACBL API rejected the bearer token (HTTP 401/403 or expired JWT)."""
+
+
+# Reading the saved *.sanction.json files to build the session list.
+EVENT_READ_THREADS = 16
+EVENT_READ_PROGRESS_EVERY = 20000
 
 
 def _iter_files_sorted(paths: Iterable[pathlib.Path]) -> list[pathlib.Path]:
@@ -137,9 +149,15 @@ def canonical_event_id(event: Mapping[str, Any]) -> str:
     return event_id
 
 
-def build_session_ids_from_sanctioned_events(events_dir: pathlib.Path) -> list[str]:
+def build_session_ids_from_sanctioned_events(
+    events_dir: pathlib.Path,
+    event_info: dict[str, tuple[str, str]] | None = None,
+) -> list[str]:
     """
     Read `*.sanction.json` files and return unique session ids (sorted desc).
+
+    ``event_info``, when given, is filled with ``event id -> (game_type,
+    start_date)`` for :func:`web_team_sessions_to_skip`.
 
     Use the event API's canonical ``id`` as the session-id prefix. Rebuilding
     the prefix from ``sanction`` + ``event_code`` is wrong for NABCs: for
@@ -150,12 +168,32 @@ def build_session_ids_from_sanctioned_events(events_dir: pathlib.Path) -> list[s
     event_files = _load_sanction_event_files(events_dir)
     sessions: list[str] = []
     invalid_files: list[str] = []
+    total = len(event_files)
+    started = time.time()
+    print(f"Reading {total:,} sanctioned-event files...")
 
-    for fp in event_files:
+    def _read_event(fp: pathlib.Path) -> Any:
         try:
             with open(fp, "r", encoding="utf-8") as f:
-                event = json.load(f)
+                return json.load(f)
         except (OSError, json.JSONDecodeError):
+            return None
+
+    # The files are small (about 600 bytes) and the time goes to opening them:
+    # 116,037 files took 15 minutes one at a time on a cold disk cache with
+    # nothing printed (2026-11-12). Threads read them over 10x faster.
+    with ThreadPoolExecutor(max_workers=EVENT_READ_THREADS) as pool:
+        events = pool.map(_read_event, event_files)
+        loaded: list[Any] = []
+        for count, event in enumerate(events, 1):
+            loaded.append(event)
+            if count % EVENT_READ_PROGRESS_EVERY == 0 and count < total:
+                elapsed = time.time() - started
+                print(f"  read {count:,}/{total:,} ({count / elapsed:,.0f} files/s)")
+    print(f"Read {total:,} sanctioned-event files in {time.time() - started:.0f}s")
+
+    for fp, event in zip(event_files, loaded):
+        if not isinstance(event, Mapping):
             invalid_files.append(fp.as_posix())
             continue
 
@@ -171,6 +209,8 @@ def build_session_ids_from_sanctioned_events(events_dir: pathlib.Path) -> list[s
             invalid_files.append(fp.as_posix())
             continue
 
+        if event_info is not None:
+            event_info[event_id] = (str(event.get("game_type") or ""), str(event.get("start_date") or ""))
         for c in range(1, sc + 1):
             sessions.append(f"{event_id}-{c}")
 
@@ -219,6 +259,85 @@ def sessions_still_needed(
     return pending, saved
 
 
+# --- Team sessions the webpage path cannot save --------------------------------
+# The live.acbl.org path builds a session from pair scorecards. A team event's
+# recap page links to none, so the session can never be saved that way; only
+# the API delivers it. On 2026-11-12 about 5,800 such sessions were requested
+# again on every run (close to an hour) for nothing.
+#
+# A session is skipped on the webpage path only when all of these hold:
+#   - its event is a team game type,
+#   - an earlier run loaded its recap page and found no pair scorecard links,
+#   - that check was made at least WEB_SETTLE_DAYS after the event started,
+#     so the page was final.
+# Game type alone is not enough: the webpage path has saved a few sessions
+# typed Teams, BAM and Swiss that do have pair scorecards. The API path never
+# skips anything, and --recheck-web-unavailable asks for them all again.
+WEB_TEAM_GAME_TYPES = frozenset({"Swiss", "Teams", "KO", "Compact KO", "Swiss Q & KO Final", "BAM"})
+WEB_NO_SCORECARDS_FILE = "_web_no_pair_scorecards.json"
+WEB_SETTLE_DAYS = 30
+
+
+def session_event_id(session_id: str) -> str:
+    return session_id.rpartition("-")[0]
+
+
+def is_team_session(session_id: str, event_info: Mapping[str, tuple[str, str]]) -> bool:
+    game_type, _start = event_info.get(session_event_id(session_id), ("", ""))
+    return game_type in WEB_TEAM_GAME_TYPES
+
+
+def load_web_no_scorecards(sessions_dir: pathlib.Path) -> dict[str, str]:
+    """``session id -> date checked`` for recaps seen with no pair scorecards."""
+    try:
+        data = json.loads((sessions_dir / WEB_NO_SCORECARDS_FILE).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    sessions = data.get("sessions") if isinstance(data, Mapping) else None
+    if not isinstance(sessions, Mapping):
+        return {}
+    return {str(key): str(value) for key, value in sessions.items()}
+
+
+def save_web_no_scorecards(sessions_dir: pathlib.Path, checked: Mapping[str, str]) -> None:
+    payload = {
+        "note": (
+            "Team sessions whose live.acbl.org recap page had no pair scorecards on the date shown. "
+            "The webpage download path skips them; the API path does not. Delete this file, or pass "
+            "--recheck-web-unavailable, to have them requested again."
+        ),
+        "sessions": dict(sorted(checked.items())),
+    }
+    path = sessions_dir / WEB_NO_SCORECARDS_FILE
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+    temp.replace(path)
+
+
+def web_team_sessions_to_skip(
+    session_ids: Iterable[str],
+    event_info: Mapping[str, tuple[str, str]],
+    checked: Mapping[str, str],
+) -> set[str]:
+    """Team sessions already seen, after the event had settled, with no pair scorecards."""
+    skip: set[str] = set()
+    for session_id in session_ids:
+        when = checked.get(session_id)
+        if not when:
+            continue
+        game_type, start = event_info.get(session_event_id(session_id), ("", ""))
+        if game_type not in WEB_TEAM_GAME_TYPES:
+            continue
+        try:
+            checked_on = datetime.strptime(when[:10], "%Y-%m-%d")
+            started_on = datetime.strptime(start[:10], "%Y-%m-%d")
+        except ValueError:
+            continue
+        if (checked_on - started_on).days >= WEB_SETTLE_DAYS:
+            skip.add(session_id)
+    return skip
+
+
 def is_unavailable_http(status_code: int) -> bool:
     """True for permanent-for-this-run HTTP statuses (unpublished / no boards)."""
     return status_code in UNAVAILABLE_HTTP_STATUSES
@@ -232,7 +351,11 @@ class DownloadStats:
     unavailable: int = 0
     aborted: bool = False
     auth_rejected: bool = False
+    # Part of ``unavailable``: the ACBL sign-in page came back, not a result.
+    sign_in_required: int = 0
     unavailable_ids: list[str] = field(default_factory=list)
+    # Webpage path: sessions whose recap page loaded and linked no pair scorecards.
+    no_scorecard_ids: list[str] = field(default_factory=list)
 
     def failed(self) -> bool:
         return self.aborted or self.errors > 0
@@ -469,8 +592,8 @@ def main() -> int:
     parser.add_argument(
         "--sleep",
         type=float,
-        default=0.0,
-        help="Seconds to sleep between requests (default: 0.0)",
+        default=DEFAULT_SLEEP_SECONDS,
+        help=f"Seconds to sleep between requests (default: {DEFAULT_SLEEP_SECONDS})",
     )
     parser.add_argument(
         "--start",
@@ -518,6 +641,14 @@ def main() -> int:
         action="store_true",
         help="Download from live.acbl.org instead of the API",
     )
+    parser.add_argument(
+        "--recheck-web-unavailable",
+        action="store_true",
+        help=(
+            "Webpage path: also request team sessions already seen with no pair scorecards "
+            f"(listed in {WEB_NO_SCORECARDS_FILE}); they are skipped by default"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -547,10 +678,12 @@ def main() -> int:
             print("API PAT unavailable; using the live.acbl.org webpage fallback.")
     print()
 
+    event_info: dict[str, tuple[str, str]] = {}
+    web_skipped: list[str] = []
     session_ids = (
         sorted(set(args.session_id), reverse=True)
         if args.session_id
-        else build_session_ids_from_sanctioned_events(events_dir)
+        else build_session_ids_from_sanctioned_events(events_dir, event_info)
     )
     if args.session_id:
         print(f"Using {len(session_ids):,} explicitly requested session ids")
@@ -578,13 +711,35 @@ def main() -> int:
     def _web_download(ids: list[str]) -> DownloadStats:
         from acbl_tournament_live_download import download_sessions_from_web
 
-        return download_sessions_from_web(
-            session_ids=ids,
-            output_dir=sessions_dir,
-            sleep_seconds=args.sleep,
-            skip_if_json_exists=args.skip_if_json_exists,
-            skip_if_sql_exists=args.skip_if_sql_exists,
-        )
+        checked = load_web_no_scorecards(sessions_dir)
+        if not args.recheck_web_unavailable:
+            skip = web_team_sessions_to_skip(ids, event_info, checked)
+            if skip:
+                web_skipped.extend(sorted(skip))
+                ids = [session_id for session_id in ids if session_id not in skip]
+                print(
+                    f"Skipping {len(skip):,} team sessions: their recap pages have no pair scorecards, "
+                    f"so only the API can deliver them ({WEB_NO_SCORECARDS_FILE}). "
+                    f"Fetching {len(ids):,}."
+                )
+        web = DownloadStats()
+        try:
+            download_sessions_from_web(
+                session_ids=ids,
+                output_dir=sessions_dir,
+                sleep_seconds=args.sleep,
+                skip_if_json_exists=args.skip_if_json_exists,
+                skip_if_sql_exists=args.skip_if_sql_exists,
+                stats=web,
+            )
+        finally:
+            # Also after Ctrl+C: keep what this run learned.
+            found = [sid for sid in web.no_scorecard_ids if is_team_session(sid, event_info)]
+            if found:
+                today = datetime.now().strftime("%Y-%m-%d")
+                checked.update({sid: today for sid in found})
+                save_web_no_scorecards(sessions_dir, checked)
+        return web
 
     if use_web:
         stats = _web_download(selected_ids)
@@ -614,6 +769,7 @@ def main() -> int:
             stats.written += web.written
             stats.skipped += web.skipped
             stats.unavailable += web.unavailable
+            stats.sign_in_required += web.sign_in_required
             stats.unavailable_ids.extend(web.unavailable_ids)
             stats.errors = web.errors
             stats.aborted = web.aborted
@@ -622,7 +778,7 @@ def main() -> int:
     missing = audit_session_artifacts(
         audit_ids,
         sessions_dir,
-        unavailable_ids=stats.unavailable_ids,
+        unavailable_ids=stats.unavailable_ids + web_skipped,
     )
 
     print()
@@ -643,6 +799,16 @@ def main() -> int:
         print(
             f"OK with {stats.unavailable} unavailable session(s) "
             f"(HTTP 400/404). They will be retried on the next run."
+        )
+    if web_skipped:
+        print(
+            f"{len(web_skipped):,} team session(s) were not requested: live.acbl.org has no pair "
+            "scorecards for them. A valid ACBL_API_KEY fetches them through the API."
+        )
+    if stats.sign_in_required:
+        print(
+            f"{stats.sign_in_required} of them got the ACBL sign-in page instead of a result. "
+            "Sign in to ACBL in the downloader's Chrome window, then run this step again."
         )
     return 0
 

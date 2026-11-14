@@ -224,6 +224,105 @@ class LiveTournamentParseTests(unittest.TestCase):
         self.assertFalse(stats.aborted)
         self.assertFalse(stats.failed())
 
+    def test_sign_in_page_is_not_reported_as_no_results(self) -> None:
+        import acbl_tournament_live_download as live
+
+        pages = {
+            "/event/2604346/1001/1/recap": RECAP_HTML,
+            "/handrecords/2604346/04101000": HAND_HTML,
+            "/event/2604346/1001/1/scores/A/N/1": SCORE_NS,
+            "/event/2604346/1001/1/scores/A/E/7": SCORE_EW,
+        }
+
+        def fetch(url: str) -> str:
+            if url not in pages:
+                raise live.SignInRequiredError("ACBL sign-in page")
+            return pages[url]
+
+        ids = [f"1606017-0{n}01-1" for n in range(1, 8)] + ["2604346-1001-1"]
+        with tempfile.TemporaryDirectory() as tmp:
+            stats = download_sessions_from_web(ids, Path(tmp), fetch=fetch)
+            self.assertTrue((Path(tmp) / "2604346-1001-1.session.json").exists())
+        # Seven sign-in pages in a row do not stop the run or count as page failures.
+        self.assertEqual(stats.sign_in_required, 7)
+        self.assertEqual(stats.unavailable, 7)
+        self.assertEqual(stats.written, 1)
+        self.assertFalse(stats.aborted)
+        self.assertFalse(stats.failed())
+
+    def test_sign_in_page_on_a_scorecard_skips_the_session(self) -> None:
+        import acbl_tournament_live_download as live
+
+        def fetch(url: str) -> str:
+            if "/scores/" in url:
+                raise live.SignInRequiredError("ACBL sign-in page")
+            return {"/event/2604346/1001/1/recap": RECAP_HTML, "/handrecords/2604346/04101000": HAND_HTML}[url]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stats = download_sessions_from_web(["2604346-1001-1"], Path(tmp), fetch=fetch)
+            self.assertFalse((Path(tmp) / "2604346-1001-1.session.json").exists())
+        self.assertEqual(stats.sign_in_required, 1)
+        self.assertEqual(stats.written, 0)
+        self.assertFalse(stats.failed())
+
+    def test_sign_in_addresses(self) -> None:
+        from acbl_tournament_live_download import is_sign_in_url
+
+        self.assertTrue(is_sign_in_url("https://login.acbl.org/login"))
+        self.assertTrue(is_sign_in_url("https://web3.acbl.org/login?target=%2Fevent%2F1606017%2FSS03%2F4%2Frecap"))
+        self.assertFalse(is_sign_in_url("https://web3.acbl.org/event/1606017/SS03/4/recap"))
+        self.assertFalse(is_sign_in_url("https://live.acbl.org/event/1606017/SS03/4/scores/ZZ/A/1"))
+        self.assertFalse(is_sign_in_url(""))
+
+    def test_default_fetch_restarts_chrome_once_then_reports_sign_in(self) -> None:
+        import acbl_tournament_live_download as live
+
+        landed = ["https://login.acbl.org/login", "https://web3.acbl.org/event/1606017/SS03/4/recap"]
+        calls = {"fetch": 0, "restart": 0}
+
+        def fake_fetch(url: str) -> str:
+            calls["fetch"] += 1
+            return "<html>page</html>"
+
+        def fake_restart() -> None:
+            calls["restart"] += 1
+
+        saved = (live.fetch_acbl_page, live.last_fetched_url, live.shutdown_acbl_browser, live._last_sign_in_restart)
+        live.fetch_acbl_page = fake_fetch
+        live.last_fetched_url = lambda: landed[min(calls["fetch"], len(landed)) - 1]
+        live.shutdown_acbl_browser = fake_restart
+        live._last_sign_in_restart = 0.0
+        try:
+            # Sign-in page, Chrome restarted, then the real page.
+            self.assertEqual(live._default_fetch("/event/1606017/SS03/4/recap"), "<html>page</html>")
+            self.assertEqual(calls, {"fetch": 2, "restart": 1})
+            # Still the sign-in page soon after a restart: no second restart.
+            landed[:] = ["https://login.acbl.org/login"]
+            calls.update(fetch=0, restart=0)
+            with self.assertRaises(live.SignInRequiredError):
+                live._default_fetch("/event/1606017/SS03/4/recap")
+            self.assertEqual(calls, {"fetch": 1, "restart": 0})
+        finally:
+            live.fetch_acbl_page, live.last_fetched_url, live.shutdown_acbl_browser, live._last_sign_in_restart = saved
+
+    def test_team_scorecards_without_boards_stop_after_three(self) -> None:
+        links = "".join(f'<a href="/event/1606017/SS03/4/scores/ZZ/A/{n}">{n}</a>' for n in range(1, 61))
+        recap = f"<h1>Jun 5, 2016 - Sunday 10:00 am</h1><h2>Swiss Teams Scores</h2>{links}"
+        fetched: list[str] = []
+
+        def fetch(url: str) -> str:
+            fetched.append(url)
+            if url.endswith("/recap"):
+                return recap
+            return "<h4>Team 1</h4><table><tr><td>Match 1</td><td>20</td></tr></table>"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stats = download_sessions_from_web(["1606017-SS03-4"], Path(tmp), fetch=fetch)
+        self.assertEqual(len(fetched), 4)  # the recap and three scorecards, not all sixty
+        self.assertEqual(stats.unavailable, 1)
+        self.assertEqual(stats.written, 0)
+        self.assertFalse(stats.failed())
+
     def test_five_consecutive_page_failures_stop_the_run(self) -> None:
         def fetch(url: str) -> str:
             raise RuntimeError("Page.goto: net::ERR_ABORTED")
@@ -280,6 +379,24 @@ class LiveTournamentParseTests(unittest.TestCase):
         self.assertFalse(_is_cloudflare_challenge(page, live))
         club = '<html><script>var data = {"x": 1};</script></html>'
         self.assertFalse(_is_cloudflare_challenge(page, club))
+
+    def test_cloudflare_script_on_an_ordinary_page_is_not_a_challenge(self) -> None:
+        # Cloudflare adds this script to every acbl.org page. A recap page has
+        # no other known marker and was waited on for hours (2026-11-12).
+        injected = (
+            "<script>window.__CF$cv$params={r:'x'};"
+            "var u='/cdn-cgi/challenge-platform/scripts/jsd/main.js';</script>"
+        )
+        page = SimpleNamespace(title=lambda: "ACBL Live")
+        recap = f'<html><a href="/event/YNABC21/17Y/2/scores/A/N/1">1</a>{injected}</html>'
+        self.assertFalse(_is_cloudflare_challenge(page, recap))
+        not_found = f"<html><h1>A 404 error occurred</h1>{injected}</html>"
+        self.assertFalse(_is_cloudflare_challenge(page, not_found))
+        check = (
+            "<html><script>window._cf_chl_opt={};</script>"
+            '<script src="/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1"></script></html>'
+        )
+        self.assertTrue(_is_cloudflare_challenge(page, check))
 
     def test_forbidden_page_is_not_a_club_listing(self) -> None:
         from acbl_club_download_to_json import _page_has_acbl_payload

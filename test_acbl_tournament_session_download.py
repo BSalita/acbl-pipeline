@@ -233,5 +233,79 @@ class TournamentSessionDiscoveryTests(unittest.TestCase):
         )
 
 
+class WebTeamSessionSkipTests(unittest.TestCase):
+    """Team sessions the live.acbl.org path cannot save are skipped only on evidence."""
+
+    EVENTS = {
+        "2605102-201B": ("Swiss", "2026-05-20"),
+        "2610350-0101": ("Teams", "2026-10-31"),
+        "2605102-191A": ("Pairs", "2026-05-19"),
+        "2605102-NODT": ("KO", ""),
+    }
+
+    def test_skips_only_team_sessions_checked_after_the_event_settled(self) -> None:
+        from acbl_tournament_download_sessions_using_sanctioned_events import web_team_sessions_to_skip
+
+        checked = {
+            "2605102-201B-1": "2026-11-12",  # team, checked months later: skip
+            "2610350-0101-1": "2026-11-12",  # team, checked 12 days after the event: ask again
+            "2605102-191A-1": "2026-11-12",  # pairs: never skipped
+            "2605102-NODT-1": "2026-11-12",  # no event date: ask again
+            "9999999-XXXX-1": "2026-11-12",  # unknown event: ask again
+        }
+        ids = list(checked) + ["2605102-201B-2"]  # same team event, never checked
+        self.assertEqual(
+            web_team_sessions_to_skip(ids, self.EVENTS, checked),
+            {"2605102-201B-1"},
+        )
+
+    def test_checked_list_round_trip_and_unreadable_file(self) -> None:
+        from acbl_tournament_download_sessions_using_sanctioned_events import (
+            WEB_NO_SCORECARDS_FILE,
+            load_web_no_scorecards,
+            save_web_no_scorecards,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            self.assertEqual(load_web_no_scorecards(folder), {})
+            save_web_no_scorecards(folder, {"2605102-201B-1": "2026-11-12"})
+            self.assertEqual(load_web_no_scorecards(folder), {"2605102-201B-1": "2026-11-12"})
+            (folder / WEB_NO_SCORECARDS_FILE).write_text("not json", encoding="utf-8")
+            self.assertEqual(load_web_no_scorecards(folder), {})
+
+    def test_event_info_is_collected_with_the_session_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            events_dir = Path(tmp)
+            event = {
+                "id": "2605102-201B",
+                "session_count": 2,
+                "game_type": "Swiss",
+                "start_date": "2026-05-20",
+            }
+            (events_dir / "2605102-201B.sanction.json").write_text(json.dumps(event), encoding="utf-8")
+            info: dict[str, tuple[str, str]] = {}
+            ids = build_session_ids_from_sanctioned_events(events_dir, info)
+        self.assertEqual(ids, ["2605102-201B-2", "2605102-201B-1"])
+        self.assertEqual(info, {"2605102-201B": ("Swiss", "2026-05-20")})
+
+    def test_no_scorecards_is_remembered_only_for_a_real_results_page(self) -> None:
+        from acbl_tournament_live_download import download_sessions_from_web
+
+        recap = "<html><head><title>ACBL Live</title></head><body><h2>Swiss Teams</h2></body></html>"
+        pages = {
+            "/event/2605102/201B/1/recap": recap,
+            "/event/2605102/201B/2/recap": "<html><title>502</title>Bad Gateway</html>",
+            "/event/2605102/201B/3/recap": "<html><title>Something else</title></html>",
+        }
+        ids = ["2605102-201B-1", "2605102-201B-2", "2605102-201B-3"]
+        stats = DownloadStats()
+        with tempfile.TemporaryDirectory() as tmp:
+            returned = download_sessions_from_web(ids, Path(tmp), fetch=pages.__getitem__, stats=stats)
+        self.assertIs(returned, stats)
+        self.assertEqual(stats.unavailable, 3)
+        self.assertEqual(stats.no_scorecard_ids, ["2605102-201B-1"])
+
+
 if __name__ == "__main__":
     unittest.main()

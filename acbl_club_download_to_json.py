@@ -23,21 +23,54 @@ acblPath = rootPath.joinpath('acbl')
 # minimized or moved off-screen (the previous -32000,-32000 setup hung forever).
 PROFILE_DIR = acblPath.joinpath('playwright_profile')
 
-# Init script applied to every new document. Playwright sets navigator.webdriver
-# which Cloudflare treats as an automation hard-fail.
+# Init script for stock Playwright only. Playwright sets navigator.webdriver
+# which Cloudflare treats as an automation hard-fail. Real Chrome reports
+# false (not undefined) from the prototype getter. Patchright needs no script.
 _STEALTH_INIT_SCRIPT = """
-Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => false });
 """
 
+# Patchright is a drop-in Playwright fork that does not send CDP Runtime.enable,
+# the automation tell Cloudflare detects and no init script can hide. Stock
+# Playwright is the fallback where patchright is not installed.
+PATCHRIGHT_ACTIVE = False
 try:
-    from playwright.sync_api import sync_playwright
+    from patchright.sync_api import sync_playwright
     PLAYWRIGHT_AVAILABLE = True
+    PATCHRIGHT_ACTIVE = True
 except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
-    print("Warning: Playwright not available. Install with: pip install playwright && playwright install")
+    try:
+        from playwright.sync_api import sync_playwright
+        PLAYWRIGHT_AVAILABLE = True
+        print("Warning: patchright not installed; stock Playwright is easier for Cloudflare to detect. Install with: pip install patchright")
+    except ImportError:
+        PLAYWRIGHT_AVAILABLE = False
+        print("Warning: Playwright not available. Install with: pip install patchright")
 
 class Forbidden403Error(RuntimeError):
     """Raised when ACBL returns HTTP 403 (rate-limit / blocked)."""
+
+    # True for a plain "403 Forbidden" page: ACBL is refusing requests for a
+    # while (seen after ~120-200 requests at --sleep 2). Nothing to solve; back
+    # off. A 5 s pause between session loads appears to prevent it (2026-11-10).
+    rate_limited = False
+
+
+# Default --sleep: minimum seconds from the start of any page request (club
+# list, club listing page, session page) to the next request. The wait
+# happens right after each page is fetched.
+# test_acbl_download_delay.py measures the shortest value that avoids the 403
+# above and, with --apply, rewrites this line.
+DEFAULT_SLEEP_SECONDS = 3.3
+
+# Wait after a plain "403 Forbidden" when the page could not be re-checked
+# (closed tab, retry from a caller).
+FORBIDDEN_BACKOFF_S = 300
+# A plain 403 is waited out for as long as it takes to clear. The first
+# re-check comes after most of the time the previous block took (observed
+# 2026-11-10: about 2.5 minutes), then every FORBIDDEN_PROBE_S.
+FORBIDDEN_PROBE_S = 30
+_forbidden_clear_s = 150.0
 
 
 def _launch_browser_context(p):
@@ -68,14 +101,17 @@ def _launch_browser_context(p):
         ignore_default_args=["--enable-automation", "--no-sandbox"],
         # Keep args minimal: recent system Chrome flags --disable-blink-features
         # (and --no-sandbox) as "unsupported" infobars, which also hurt CF scores.
-        # Stealth is handled via ignore_default_args + _STEALTH_INIT_SCRIPT.
+        # Stealth is handled by patchright (or, on stock Playwright, by
+        # ignore_default_args + _STEALTH_INIT_SCRIPT).
         args=[
             '--no-first-run',
             '--no-default-browser-check',
             '--window-position=80,80',
             '--window-size=1280,900',
         ],
-        viewport={'width': 1280, 'height': 900},
+        # A fixed viewport turns on device-metrics emulation, which no longer
+        # matches the real window. The window size comes from --window-size.
+        no_viewport=True,
     )
 
 
@@ -101,40 +137,106 @@ def _page_has_acbl_payload(content: str) -> bool:
         or "tablesorter scorecard" in content
         or 'id="board-' in content
         or "/ajax/tourn-list/" in content
+        # live.acbl.org session recap: links to pair scorecards / hand records.
+        or re.search(r'href="[^"]*/(?:scores|handrecords)/', content) is not None
     )
 
 
-def _is_cloudflare_challenge(page, content: str) -> bool:
-    """
-    Detect an active Cloudflare or AWS WAF interstitial.
+# Text found only on a Cloudflare check page (captured from live.acbl.org,
+# 2026-11-12: title "Just a moment...", window._cf_chl_opt, a script from
+# /cdn-cgi/challenge-platform/h/.../orchestrate/chl_page, cf-turnstile-response).
+# "challenge-platform" alone is NOT one of them: Cloudflare adds
+# /cdn-cgi/challenge-platform/scripts/... (window.__CF$cv$params) to every
+# ordinary acbl.org page, so a page with no known ACBL marker (a session recap,
+# a "404 error occurred" page) looked like a check that never cleared.
+_CLOUDFLARE_CHECK_MARKERS = (
+    "_cf_chl_opt",
+    "challenge-platform/h/",
+    "challenge-error-text",
+    "cf-turnstile",
+    "cf-chl-",
+    "checking if the site connection is secure",
+)
+_CLOUDFLARE_CHECK_TITLES = ("just a moment", "checking your browser", "attention required", "verify you are human")
 
-    Do NOT treat bare 'cf-chl' / 'challenge-platform' substrings as sufficient
-    once real ACBL payload is present — cleared pages can still mention those
-    strings in leftover scripts and would otherwise loop forever.
-    A WAF page (gokuProps / challenge-container) is still a challenge even when
-    its title is empty and the Cloudflare markers are absent.
+
+def _challenge_reason(page, content: str) -> str:
+    """Why this page counts as a Cloudflare or AWS WAF check; "" when it does not.
+
+    An AWS WAF page (gokuProps / challenge-container) is a check even when its
+    title is empty. A page with real ACBL content is never one, whatever
+    leftover scripts it mentions.
     """
     if _is_aws_waf_challenge(content):
-        return True
+        return "AWS WAF page"
     if _page_has_acbl_payload(content):
-        return False
+        return ""
     title = ""
     try:
         title = (page.title() or "").lower()
     except Exception:
         pass
-    if any(s in title for s in ("just a moment", "checking your browser", "attention required", "verify you are human")):
-        return True
+    for text in _CLOUDFLARE_CHECK_TITLES:
+        if text in title:
+            return f"title {text!r}"
     if not content:
-        return True
-    markers = (
-        "cf-turnstile",
-        "challenge-platform",
-        "cf-chl-bypass",
-        "cdn-cgi/challenge-platform",
-        "checking if the site connection is secure",
-    )
-    return any(m in content for m in markers)
+        return "empty page"
+    for marker in _CLOUDFLARE_CHECK_MARKERS:
+        if marker in content:
+            return f"page contains {marker!r}"
+    return ""
+
+
+def _is_cloudflare_challenge(page, content: str) -> bool:
+    """True while the page is a Cloudflare or AWS WAF check (see _challenge_reason)."""
+    return bool(_challenge_reason(page, content))
+
+
+def _is_plain_403(page, content: str) -> bool:
+    """True for the server's own "403 Forbidden" page (a block, not a challenge)."""
+    if _page_has_acbl_payload(content) or _is_aws_waf_challenge(content):
+        return False
+    try:
+        title = (page.title() or "").lower()
+    except Exception:
+        return False
+    return "403 forbidden" in title
+
+
+def _wait_out_plain_403(page, deadline: float) -> None:
+    """Hold on a plain "403 Forbidden" page until ACBL serves pages again.
+
+    Raises Forbidden403Error (rate_limited) if the tab closes or the deadline
+    passes, so callers fall back to their fixed wait and retry.
+    """
+    global _forbidden_clear_s
+    started = time.time()
+    wait = max(60.0, 0.75 * _forbidden_clear_s)
+    print(f"  403 Forbidden: ACBL is refusing requests. Waiting {int(wait)}s, then checking every {FORBIDDEN_PROBE_S}s.")
+    while True:
+        time.sleep(wait)
+        wait = FORBIDDEN_PROBE_S
+        content = ""
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=90000)
+            content = page.content()
+        except Exception as exc:
+            if _closed_target_error(exc):
+                error = Forbidden403Error(f"Chrome tab closed while waiting out a 403 ({exc})")
+                error.rate_limited = True
+                raise error
+            print(f"  re-check failed ({exc}); still waiting")
+            continue
+        elapsed = time.time() - started
+        if content and not _is_plain_403(page, content):
+            _forbidden_clear_s = elapsed
+            print(f"  403 cleared after {int(elapsed)}s.")
+            return
+        if time.time() >= deadline:
+            error = Forbidden403Error(f"403 Forbidden did not clear after {int(elapsed)}s")
+            error.rate_limited = True
+            raise error
+        print(f"  ... still 403 ({int(elapsed)}s elapsed)")
 
 
 def _bring_page_window_forward(page) -> None:
@@ -157,30 +259,8 @@ def _bring_page_window_forward(page) -> None:
         pass
 
 
-def _try_click_turnstile(page) -> None:
-    """Best-effort click on a visible Turnstile checkbox / widget body."""
-    try:
-        for frame in page.frames:
-            url = (frame.url or "").lower()
-            if "turnstile" not in url and "challenges.cloudflare.com" not in url:
-                continue
-            for sel in ("input[type='checkbox']", "body"):
-                try:
-                    loc = frame.locator(sel)
-                    if loc.count() > 0:
-                        loc.first.click(timeout=1500, force=True)
-                        return
-                except Exception:
-                    continue
-    except Exception:
-        pass
-    try:
-        page.frame_locator(
-            "iframe[src*='turnstile'], iframe[src*='challenges.cloudflare']"
-        ).locator("body").first.click(timeout=1500, force=True)
-    except Exception:
-        pass
-
+# The Turnstile checkbox is never clicked from code: a synthetic click is
+# detectable and counts against the session. A person clicks it (noVNC).
 
 # Someone often is not at the machine when Turnstile appears. Three minutes
 # expired before the check could be clicked (2026-10-03, title stayed
@@ -188,6 +268,9 @@ def _try_click_turnstile(page) -> None:
 # interstitial once the clearance cookie is set.
 CHALLENGE_TIMEOUT_MS = 6 * 60 * 60 * 1000
 CHALLENGE_RELOAD_S = 30
+# Cloudflare's automatic check ("Just a moment...") usually passes within a
+# second or two. Say nothing about clicking until it has lasted this long.
+CHALLENGE_QUIET_S = 5
 
 # Phone alert (ntfy) when a challenge needs a human. postmortem_start.ps1 sets
 # both from the host config; without ACBL_CHALLENGE_NTFY_URL nothing is sent.
@@ -237,9 +320,10 @@ def _wait_through_cloudflare(
     deadline = time.time() + timeout_ms / 1000.0
     started = time.time()
     announced = False
+    seen_challenge = False
+    quiet_s = min(CHALLENGE_QUIET_S, max(reload_after_s, 0))
     last_status = 0.0
     last_reload = time.time()
-    clicked = False
     alerted = False
     global _last_challenge_alert
     while time.time() < deadline:
@@ -249,13 +333,21 @@ def _wait_through_cloudflare(
         except Exception:
             pass
 
-        if content and not _is_cloudflare_challenge(page, content):
+        if content and _is_plain_403(page, content):
+            # A block, not a challenge: wait it out, then judge the page again.
+            _wait_out_plain_403(page, deadline)
+            continue
+
+        reason = _challenge_reason(page, content) if content else "page not readable"
+        if not reason:
             try:
                 page.wait_for_load_state('domcontentloaded', timeout=10000)
             except Exception:
                 pass
             if announced:
                 print("  Cloudflare/WAF challenge cleared.")
+            elif seen_challenge:
+                print(f"  Cloudflare check passed on its own ({time.time() - started:.0f}s).")
             if alerted:
                 _send_challenge_alert(
                     "ACBL check cleared",
@@ -285,8 +377,13 @@ def _wait_through_cloudflare(
             alerted = True
             _last_challenge_alert = time.time()
 
+        seen_challenge = True
+        if not announced and time.time() - started < quiet_s:
+            page.wait_for_timeout(500)
+            continue
+
         if not announced:
-            print("  Cloudflare/WAF challenge detected; waiting for it to clear...")
+            print(f"  Cloudflare/WAF challenge detected ({reason}); waiting for it to clear...")
             print("  -> Chrome window should be visible. If you see 'Verify you are human', click it.")
             print(f"  -> Refreshing every {int(reload_after_s)}s. A reload often clears this without a click.")
             print(f"  -> This wait lasts up to {int(timeout_ms / 3600000)}h, so it is still here when you come back.")
@@ -294,10 +391,7 @@ def _wait_through_cloudflare(
             _bring_page_window_forward(page)
             announced = True
             last_reload = time.time()
-
-        if not clicked:
-            _try_click_turnstile(page)
-            clicked = True
+            last_status = time.time()
 
         now = time.time()
         if announced and reload_after_s >= 0 and now - last_reload >= reload_after_s:
@@ -307,8 +401,6 @@ def _wait_through_cloudflare(
             except Exception as exc:
                 print(f"  refresh failed ({exc}); still waiting")
             last_reload = time.time()
-            clicked = False
-            _try_click_turnstile(page)
             continue
 
         if now - last_status >= 15:
@@ -318,9 +410,8 @@ def _wait_through_cloudflare(
             except Exception:
                 pass
             elapsed_m = int((now - started) / 60)
-            print(f"  ... still waiting ({elapsed_m}m elapsed); title={title!r}")
+            print(f"  ... still waiting ({elapsed_m}m elapsed); title={title!r}; {reason}")
             _bring_page_window_forward(page)
-            _try_click_turnstile(page)
             last_status = now
 
         page.wait_for_timeout(1000)
@@ -348,13 +439,26 @@ def _get_browser_page():
     """
     global _PW, _CONTEXT, _PAGE
     if _PAGE is not None:
-        return _PAGE
+        if not _page_is_closed(_PAGE):
+            return _PAGE
+        # The tab, or Chrome itself, went away (closed window, crash). Without
+        # this every later club fails on the dead page and looks empty.
+        print("  Chrome tab is closed; reopening")
+        _reset_browser_page()
+        if _PAGE is not None:
+            return _PAGE
     _PW = sync_playwright().start()
     _CONTEXT = _launch_browser_context(_PW)
     try:
-        _CONTEXT.add_init_script(_STEALTH_INIT_SCRIPT)
-    except Exception:
-        pass
+        # Every load of a session page, in any tab, restarts the --sleep delay.
+        _CONTEXT.on("request", _note_page_request)
+    except Exception as e:
+        print(f"  Warning: could not watch session requests ({e}); reloads will not restart the delay")
+    if not PATCHRIGHT_ACTIVE:
+        try:
+            _CONTEXT.add_init_script(_STEALTH_INIT_SCRIPT)
+        except Exception:
+            pass
     # Reuse an existing tab from the persistent profile when present; otherwise
     # open one. Warm the origin so cf_clearance can be established before the
     # first details URL (helps when the profile is cold).
@@ -362,13 +466,28 @@ def _get_browser_page():
     try:
         if "my.acbl.org" not in (_PAGE.url or ""):
             print("  Warming Chrome session at https://my.acbl.org/ ...")
+            _mark_request_start()
             _PAGE.goto("https://my.acbl.org/", wait_until="domcontentloaded", timeout=60000)
             _wait_through_cloudflare(_PAGE)
+            # The warm-up is a request too: hold the first real one back.
+            _pause_after_request()
     except Forbidden403Error:
         raise
     except Exception as e:
         print(f"  Warning: session warm-up failed ({e}); continuing anyway")
     return _PAGE
+
+
+def _page_is_closed(page) -> bool:
+    try:
+        return page.is_closed()
+    except Exception:
+        return True
+
+
+def _closed_target_error(exc: BaseException) -> bool:
+    message = str(exc)
+    return "has been closed" in message or "Target closed" in message
 
 
 def _reset_browser_page() -> None:
@@ -403,6 +522,24 @@ def _transient_navigation_error(exc: BaseException) -> bool:
     )
 
 
+# Address the last fetch_acbl_page call ended on, after redirects. live.acbl.org
+# hands some events to web3.acbl.org, which sends a browser that is not signed
+# in to login.acbl.org/login: the HTML alone does not say which page came back.
+_LAST_PAGE_URL = ""
+
+
+def _page_url(page) -> str:
+    try:
+        return page.url or ""
+    except Exception:
+        return ""
+
+
+def last_fetched_url() -> str:
+    """Final address of the page the last :func:`fetch_acbl_page` call returned."""
+    return _LAST_PAGE_URL
+
+
 def fetch_acbl_page(url: str, timeout_ms: int = 180000) -> str:
     """
     Open ``url`` in the shared real-Chrome session and return its HTML.
@@ -412,6 +549,8 @@ def fetch_acbl_page(url: str, timeout_ms: int = 180000) -> str:
     on-screen window until a Cloudflare or AWS WAF interstitial finishes.
     A cancelled navigation (``net::ERR_ABORTED``) retries on a fresh tab.
     """
+    global _LAST_PAGE_URL
+    _LAST_PAGE_URL = ""
     last_error: Exception | None = None
     for attempt in range(1, 4):
         page = _get_browser_page()
@@ -420,13 +559,19 @@ def fetch_acbl_page(url: str, timeout_ms: int = 180000) -> str:
             _wait_through_cloudflare(page)
             for _ in range(8):
                 try:
-                    return page.content()
+                    content = page.content()
                 except Exception as exc:
                     last_error = exc
                     page.wait_for_timeout(400)
+                    continue
+                _LAST_PAGE_URL = _page_url(page)
+                return content
             raise Forbidden403Error(f"Could not read page content for {url}: {last_error}")
-        except Forbidden403Error:
-            raise
+        except Forbidden403Error as exc:
+            if not exc.rate_limited or attempt >= 3:
+                raise
+            print(f"  403 Forbidden for {url}; waiting {FORBIDDEN_BACKOFF_S} seconds, then retrying ({attempt}/3)")
+            time.sleep(FORBIDDEN_BACKOFF_S)
         except KeyboardInterrupt:
             raise
         except Exception as exc:
@@ -600,9 +745,9 @@ def _read_cleared_content(page) -> str:
         content = page.content()
     except Exception:
         pass
-    if content and not _is_cloudflare_challenge(page, content):
+    if content and not _is_plain_403(page, content) and not _is_cloudflare_challenge(page, content):
         return content
-    # Raises Forbidden403Error if the check never clears.
+    # Waits out a check or a plain 403. Raises Forbidden403Error if it never clears.
     _wait_through_cloudflare(page)
     page.wait_for_selector('body', timeout=10000)
     return page.content()
@@ -745,16 +890,17 @@ def _wait_for_listing(page, previous_marker: Optional[str] = None, timeout_ms: i
         return None
 
 
-def get_club_sessions(club_number: str, output_dir: pathlib.Path, refresh: bool = False, start_date: Optional[str] = None) -> Optional[tuple[List[dict], str, pathlib.Path]]:
+def get_club_sessions(club_number: str, output_dir: pathlib.Path, refresh: bool = False, start_date: Optional[str] = None, sleep_seconds: Optional[float] = None) -> Optional[tuple[List[dict], str, pathlib.Path]]:
     """
     Get list of all sessions for a club
-    
+
     Args:
         club_number: Club number
         output_dir: Base output directory
         refresh: If True, force refresh even if cached file exists
         start_date: If provided, stop pagination when encountering sessions before this date (YYYY-MM-DD)
-        
+        sleep_seconds: Delay after each listing page request (default: DEFAULT_SLEEP_SECONDS)
+
     Returns:
         List of session dictionaries with id and name, or None if failed
     """
@@ -794,10 +940,20 @@ def get_club_sessions(club_number: str, output_dir: pathlib.Path, refresh: bool 
             try:
                 # Reuse the shared persistent page (launched once for the run)
                 page = _get_browser_page()
-                
+
                 # Navigate to club results page
-                response = page.goto(url, wait_until='domcontentloaded', timeout=60000)
-                
+                _mark_request_start()
+                try:
+                    response = page.goto(url, wait_until='domcontentloaded', timeout=60000)
+                except Exception as exc:
+                    if not _closed_target_error(exc):
+                        raise
+                    # Chrome died under us: reopen it and try this club once more.
+                    print(f"  Chrome closed during navigation ({exc}); reopening")
+                    _reset_browser_page()
+                    page = _get_browser_page()
+                    response = page.goto(url, wait_until='domcontentloaded', timeout=60000)
+
                 print(f"Response status: {response.status if response else None}")
                 
                 # The initial response may be a Cloudflare 403 challenge
@@ -890,6 +1046,9 @@ def get_club_sessions(club_number: str, output_dir: pathlib.Path, refresh: bool 
                             
                             # Click next and wait for navigation
                             print(f"  Navigating to page {page_num + 1}...")
+                            # No wait when earlier clicks loaded nothing
+                            # (the table pages in the browser).
+                            _pause_after_request(sleep_seconds)
                             next_button.click()
                             page.wait_for_load_state('domcontentloaded', timeout=10000)
                             page_num += 1
@@ -897,12 +1056,12 @@ def get_club_sessions(club_number: str, output_dir: pathlib.Path, refresh: bool 
                             # No next button found - single page or last page
                             print(f"  No more pages (total: {page_num})")
                             break
-                            
+
                     except Exception as e:
                         # No pagination or error - assume single page
                         print(f"  Pagination check complete (total: {page_num} pages)")
                         break
-                
+
                 # Combine all page content and cache to disk
                 combined_content = '\n'.join(all_content)
                 content = combined_content
@@ -926,7 +1085,11 @@ def get_club_sessions(club_number: str, output_dir: pathlib.Path, refresh: bool 
                 print("\n\nKeyboardInterrupt detected in get_club_sessions")
                 _shutdown_browser()
                 os._exit(130)
-        
+            finally:
+                # Whatever happened, nothing else is requested until the
+                # delay since this listing request has passed.
+                _pause_after_request(sleep_seconds)
+
         # Parse session links from all pages
         # Look for links like: /club-results/details/{session_id}
         pattern = r'href="/club-results/details/(\d+)"[^>]*>([^<]+)</a>'
@@ -954,13 +1117,14 @@ def get_club_sessions(club_number: str, output_dir: pathlib.Path, refresh: bool 
         return None
 
 
-def get_player_sessions(player_id: str) -> Optional[List[dict]]:
+def get_player_sessions(player_id: str, sleep_seconds: Optional[float] = None) -> Optional[List[dict]]:
     """
     Get list of all sessions for a player
-    
+
     Args:
         player_id: Player ID (ACBL number)
-        
+        sleep_seconds: Delay after each listing page request (default: DEFAULT_SLEEP_SECONDS)
+
     Returns:
         List of session dictionaries with id and name, or None if failed
     """
@@ -976,6 +1140,7 @@ def get_player_sessions(player_id: str) -> Optional[List[dict]]:
         page = _get_browser_page()
         
         # Navigate to player results page
+        _mark_request_start()
         response = page.goto(url, wait_until='domcontentloaded', timeout=60000)
         
         print(f"Response status: {response.status if response else None}")
@@ -1023,6 +1188,7 @@ def get_player_sessions(player_id: str) -> Optional[List[dict]]:
                     
                     # Click next and wait for navigation
                     print(f"  Navigating to page {page_num + 1}...")
+                    _pause_after_request(sleep_seconds)
                     next_button.click()
                     page.wait_for_load_state('domcontentloaded', timeout=10000)
                     page_num += 1
@@ -1030,12 +1196,12 @@ def get_player_sessions(player_id: str) -> Optional[List[dict]]:
                     # No next button found - single page or last page
                     print(f"  No more pages (total: {page_num})")
                     break
-                    
+
             except Exception as e:
                 # No pagination or error - assume single page
                 print(f"  Pagination check complete (total: {page_num} pages)")
                 break
-        
+
         # Combine all page content
         combined_content = '\n'.join(all_content)
         
@@ -1068,12 +1234,17 @@ def get_player_sessions(player_id: str) -> Optional[List[dict]]:
     except Exception as e:
         print(f"ERROR: Failed to get player sessions: {e}")
         return None
+    finally:
+        _pause_after_request(sleep_seconds)
 
 
-def get_all_clubs() -> Optional[List[str]]:
+def get_all_clubs(sleep_seconds: Optional[float] = None) -> Optional[List[str]]:
     """
     Get list of all club IDs from ACBL main club results page
-    
+
+    Args:
+        sleep_seconds: Delay after the page request (default: DEFAULT_SLEEP_SECONDS)
+
     Returns:
         List of club ID strings, or None if failed
     """
@@ -1089,6 +1260,7 @@ def get_all_clubs() -> Optional[List[str]]:
         page = _get_browser_page()
         
         # Navigate to main club results page
+        _mark_request_start()
         response = page.goto(url, wait_until='domcontentloaded', timeout=60000)
         
         print(f"Response status: {response.status if response else None}")
@@ -1143,35 +1315,67 @@ def get_all_clubs() -> Optional[List[str]]:
     except Exception as e:
         print(f"ERROR: Failed to get club list: {e}")
         return None
+    finally:
+        _pause_after_request(sleep_seconds)
 
 
-_last_session_request_start = None
+_last_request_start = None
 
 
-def _rate_limit_session_requests(min_interval_seconds: float) -> None:
-    """Sleep until min_interval_seconds have passed since the previous
-    session request started, then mark this request's start."""
-    global _last_session_request_start
-    now = time.monotonic()
-    if _last_session_request_start is not None:
-        wait = min_interval_seconds - (now - _last_session_request_start)
-        if wait > 0:
-            print(f"  -> Sleeping {wait:.1f} seconds before request...")
-            time.sleep(wait)
-    _last_session_request_start = time.monotonic()
+def _pause_after_request(min_interval_seconds: Optional[float] = None) -> None:
+    """Right after a page is fetched, sleep whatever is left of
+    min_interval_seconds (default DEFAULT_SLEEP_SECONDS) since the latest
+    page request.
+
+    Rule: after any page request to ACBL (club list, club or player listing
+    page, session page), the next request starts at least
+    min_interval_seconds later. Every function that requests a page calls
+    this before it returns or raises, and _note_page_request counts reloads
+    as requests too.
+
+    Listing pages count toward ACBL's limit: on 2026-11-12 a run that
+    fetched 121 listing pages about 2 s apart, and no session, got the 403."""
+    if min_interval_seconds is None:
+        min_interval_seconds = DEFAULT_SLEEP_SECONDS
+    wait = _request_wait_seconds(min_interval_seconds)
+    if wait > 0:
+        print(f"  -> Sleeping {wait:.1f} seconds before the next request...")
+        time.sleep(wait)
 
 
-def _session_request_wait_seconds(min_interval_seconds: float) -> float:
-    """Seconds left before the next session request may start (same limiter
-    as _rate_limit_session_requests, without sleeping)."""
-    if _last_session_request_start is None:
+def _request_wait_seconds(min_interval_seconds: float) -> float:
+    """Seconds left of min_interval_seconds since the latest page request
+    (0 when none was made)."""
+    if _last_request_start is None:
         return 0.0
-    return max(0.0, min_interval_seconds - (time.monotonic() - _last_session_request_start))
+    return max(0.0, min_interval_seconds - (time.monotonic() - _last_request_start))
 
 
-def _mark_session_request_start() -> None:
-    global _last_session_request_start
-    _last_session_request_start = time.monotonic()
+def _mark_request_start() -> None:
+    global _last_request_start
+    _last_request_start = time.monotonic()
+
+
+def _note_page_request(request) -> None:
+    """Browser "request" listener: every page load from the ACBL results site
+    restarts the delay, in any tab. That covers what the callers cannot see:
+    a reload while a 403 is waited out, Cloudflare's own reload after its
+    check, and a "next page" click that loads a new page. Cloudflare's own
+    /cdn-cgi/ pages are not ACBL requests. Playwright delivers the event
+    inside a later API call, so the time noted is never earlier than the
+    request. Data requests (xhr/fetch) under /club-results count as well, in
+    case a listing loads its next page that way."""
+    try:
+        url = request.url
+        origin = SESSION_URL_TEMPLATE.split("/club-results", 1)[0]
+        if not url.startswith(origin + "/") or "/cdn-cgi/" in url:
+            return
+        if request.is_navigation_request() or (
+            request.resource_type in ("xhr", "fetch") and url.startswith(origin + "/club-results")
+        ):
+            _mark_request_start()
+    except Exception:
+        pass
 
 
 # Details page URL. Tests point it at a local server.
@@ -1274,7 +1478,7 @@ def _session_error_result(session_id: str, session_num: int, exc: Exception) -> 
     return (session_id, 'failed')
 
 
-def process_single_session(session: dict, output_dir: str, session_num: int, total_sessions: int, club_id: Optional[str] = None, refresh: bool = False, sleep_seconds: int = 2, start_date: Optional[str] = None, end_date: Optional[str] = None) -> tuple:
+def process_single_session(session: dict, output_dir: str, session_num: int, total_sessions: int, club_id: Optional[str] = None, refresh: bool = False, sleep_seconds: float = 2, start_date: Optional[str] = None, end_date: Optional[str] = None) -> tuple:
     """
     Process a single session
 
@@ -1310,21 +1514,23 @@ def process_single_session(session: dict, output_dir: str, session_num: int, tot
 
     print(f"[{session_num}/{total_sessions}] Processing {session_id} ({session_name})...")
 
-    # Rate limit: at most one session request per sleep_seconds. Only the
-    # part of the interval not already spent on the previous page load is
-    # slept, so politeness is unchanged but the old fixed 2 s sleep on top of
-    # a ~2 s page load (~4 h per full sweep) is gone.
-    _rate_limit_session_requests(sleep_seconds)
-
     url = _session_url(session_id)
 
+    # Rate limit: after each session download, wait until sleep_seconds have
+    # passed since the latest request for the session page (reloads count).
+    # Only the part of the interval not already spent on the page load is
+    # slept. Listing pages get the same wait (see _pause_after_request).
+    _mark_request_start()
     try:
         data = extract_with_playwright(url)
-        return _finish_session(data, session, output_dir, session_num, total_sessions, club_id, start_date, end_date)
+        result = _finish_session(data, session, output_dir, session_num, total_sessions, club_id, start_date, end_date)
     except Forbidden403Error:
+        _pause_after_request(sleep_seconds)
         raise
     except Exception as e:
-        return _session_error_result(session_id, session_num, e)
+        result = _session_error_result(session_id, session_num, e)
+    _pause_after_request(sleep_seconds)
+    return result
 
 
 # --- Opt-in concurrent session downloads (--concurrency N) --------------------
@@ -1464,13 +1670,13 @@ def download_sessions_concurrently(sessions: List[dict], output_dir, club_id: Op
                 results[next_idx] = skip
                 next_idx += 1
                 continue
-            wait = _session_request_wait_seconds(sleep_seconds)
+            wait = _request_wait_seconds(sleep_seconds)
             if wait > 0:
                 break
             idx = next_idx
             next_idx += 1
             print(f"[{idx + 1}/{total}] Processing {session['id']} ({session['name']})...")
-            _mark_session_request_start()
+            _mark_request_start()
             tab = idle.pop(0)
             url = _session_url(session['id'])
             print(f"Fetching with Playwright: {url}")
@@ -1502,6 +1708,7 @@ def download_sessions_concurrently(sessions: List[dict], output_dir, club_id: Op
             try:
                 result = _finish_session(tab.extract(), session, output_dir, idx + 1, total, club_id, start_date, end_date)
             except Forbidden403Error:
+                _pause_after_request(sleep_seconds)
                 raise
             except Exception as e:
                 result = _session_error_result(session['id'], idx + 1, e)
@@ -1511,6 +1718,9 @@ def download_sessions_concurrently(sessions: List[dict], output_dir, club_id: Op
             if result[1] in ('stop', 'skip_club'):
                 halt_at = idx if halt_at is None else min(halt_at, idx)
 
+    # Requests here are spaced by their start; the last one still has to be
+    # sleep_seconds old before the caller requests anything else.
+    _pause_after_request(sleep_seconds)
     return [results[i] for i in sorted(results)]
 
 
@@ -1603,7 +1813,7 @@ def filter_sessions_by_date(sessions: List[dict], start_date: Optional[str] = No
     return filtered
 
 
-def process_club_sessions(club_number: str, output_dir: pathlib.Path, start_date: Optional[str] = None, end_date: Optional[str] = None, limit: Optional[int] = None, refresh: bool = False, sleep_seconds: int = 2, concurrency: int = 1) -> int:
+def process_club_sessions(club_number: str, output_dir: pathlib.Path, start_date: Optional[str] = None, end_date: Optional[str] = None, limit: Optional[int] = None, refresh: bool = False, sleep_seconds: float = 2, concurrency: int = 1) -> int:
     """
     Process all sessions for a club and extract JSON for each
     
@@ -1625,7 +1835,7 @@ def process_club_sessions(club_number: str, output_dir: pathlib.Path, start_date
 
     # Get list of sessions (creates club directory; HTML marker is written at end on success)
     # Pass start_date to enable smart pagination (stops when encountering old sessions)
-    club_sessions_result = get_club_sessions(club_number, output_dir, refresh, start_date)
+    club_sessions_result = get_club_sessions(club_number, output_dir, refresh, start_date, sleep_seconds)
     
     if not club_sessions_result:
         print("No sessions found or error occurred")
@@ -1696,7 +1906,7 @@ def process_club_sessions(club_number: str, output_dir: pathlib.Path, start_date
     return processed
 
 
-def process_player_sessions(player_id: str, output_dir: pathlib.Path, start_date: Optional[str] = None, end_date: Optional[str] = None, limit: Optional[int] = None, refresh: bool = False, sleep_seconds: int = 2) -> int:
+def process_player_sessions(player_id: str, output_dir: pathlib.Path, start_date: Optional[str] = None, end_date: Optional[str] = None, limit: Optional[int] = None, refresh: bool = False, sleep_seconds: float = 2) -> int:
     """
     Process all sessions for a player and extract JSON for each
     
@@ -1716,7 +1926,7 @@ def process_player_sessions(player_id: str, output_dir: pathlib.Path, start_date
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Get list of sessions
-    sessions = get_player_sessions(player_id)
+    sessions = get_player_sessions(player_id, sleep_seconds)
     
     if not sessions:
         print("No sessions found or error occurred")
@@ -1767,7 +1977,7 @@ def process_player_sessions(player_id: str, output_dir: pathlib.Path, start_date
     return processed
 
 
-def process_all_clubs(output_dir: pathlib.Path, start_date: Optional[str] = None, end_date: Optional[str] = None, limit: Optional[int] = None, refresh: bool = False, sleep_seconds: int = 2, starting_club: Optional[int] = None, skip_if_html_exists: bool = False, sleep_403_seconds: int = 300, concurrency: int = 1) -> int:
+def process_all_clubs(output_dir: pathlib.Path, start_date: Optional[str] = None, end_date: Optional[str] = None, limit: Optional[int] = None, refresh: bool = False, sleep_seconds: float = 2, starting_club: Optional[int] = None, skip_if_html_exists: bool = False, sleep_403_seconds: int = 300, concurrency: int = 1) -> int:
     """
     Process all clubs from ACBL and extract sessions for each
     
@@ -1785,7 +1995,7 @@ def process_all_clubs(output_dir: pathlib.Path, start_date: Optional[str] = None
     # Get list of all clubs
     while True:
         try:
-            club_ids = get_all_clubs()
+            club_ids = get_all_clubs(sleep_seconds)
             break
         except Forbidden403Error as e:
             print(f"\n403 Forbidden while fetching club list: {e}")
@@ -1865,7 +2075,7 @@ def main():
     limit = None       # Limit number of sessions to fetch (None = unlimited)
     end_date_specified = False  # Track if user explicitly set end_date
     refresh = True     # Re-fetch club HTML to get latest sessions (default); --no-refresh to use cache
-    sleep_seconds = 2  # Seconds to sleep between requests
+    sleep_seconds = DEFAULT_SLEEP_SECONDS  # Minimum seconds between session requests
     sleep_403_seconds = 300  # Seconds to wait on HTTP 403 before retry (default: 5 minutes)
     starting_club = None  # In all-clubs mode, start at this club number (inclusive)
     skip_if_html_exists = False  # Default: process all clubs; individual sessions skip if data.json exists
@@ -1925,7 +2135,10 @@ def main():
         print("  --start-date <date>    Filter sessions on/after date (YYYY-MM-DD) (default: first available date)")
         print("  --end-date <date>      Filter sessions on/before date (YYYY-MM-DD) (default: today)")
         print("  --limit <n>            Limit number of sessions to fetch per club (default: unlimited)")
-        print("  --sleep <seconds>      Delay between session requests (default: 2 seconds)")
+        print(f"  --sleep <seconds>      Delay after every page request: club list, club listing pages and")
+        print(f"                         sessions (default: {DEFAULT_SLEEP_SECONDS} seconds; fractions allowed), counted")
+        print("                         from the start of the request. test_acbl_download_delay.py")
+        print("                         measures the shortest value that avoids 403 Forbidden.")
         print("  --concurrency <n>      Browser tabs for a club's session downloads (default: 1 = sequential).")
         print("                         All tabs share one rate limit: requests still start at most")
         print("                         once per --sleep seconds. This only helps when a page takes")
@@ -1945,7 +2158,7 @@ def main():
         print()
         print("Note: Default mode is ALL clubs; --session, --club, --player override this")
         print("      Sessions are processed sequentially with delays to avoid rate limiting")
-        print("      Default delay between session requests is 2 seconds (configurable with --sleep)")
+        print(f"      Default delay after each page request is {DEFAULT_SLEEP_SECONDS} seconds (configurable with --sleep)")
         print("      On 403 Forbidden, program will wait and retry (see --sleep-403)")
         print()
         return 0
@@ -2008,13 +2221,13 @@ def main():
         elif arg == '--sleep':
             if i + 1 < len(sys.argv):
                 try:
-                    sleep_seconds = int(sys.argv[i + 1])
+                    sleep_seconds = float(sys.argv[i + 1])
                     if sleep_seconds < 0:
-                        print("ERROR: --sleep requires a positive integer")
+                        print("ERROR: --sleep requires a non-negative number")
                         return 1
                     i += 2
                 except ValueError:
-                    print("ERROR: --sleep requires an integer")
+                    print("ERROR: --sleep requires a number")
                     return 1
             else:
                 print("ERROR: --sleep requires a number of seconds")

@@ -324,6 +324,10 @@ Environment:
         if type(exc).__name__ == "Forbidden403Error":
             print(exc)
             return 1
+        if type(exc).__name__ == "SignInRequiredError":
+            print(f"ERROR: {exc}")
+            print("Sign in to ACBL in the downloader's Chrome window, then run this step again.")
+            return 1
         raise
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")

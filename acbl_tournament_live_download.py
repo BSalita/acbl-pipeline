@@ -26,12 +26,40 @@ import pathlib
 from acbl_club_download_to_json import (
     Forbidden403Error,
     fetch_acbl_page,
+    last_fetched_url,
     shutdown_acbl_browser,
 )
 from acbl_tournament_download_sessions_using_sanctioned_events import DownloadStats
 
 LIVE_ORIGIN = "https://live.acbl.org"
 TOURNAMENT_LIST_TYPES = ("nabc", "regionals", "sectionals")
+
+# live.acbl.org hands some events to web3.acbl.org, which wants an ACBL
+# sign-in. A Chrome that is not signed in ends on login.acbl.org/login. On
+# 2026-11-12 that page came back for about 3,950 recap requests in a row and
+# each was reported as "no pair scorecards"; restarting Chrome signed it in
+# again. So: restart Chrome, at most once per this many seconds, then report
+# the session as needing sign-in instead of as having no results.
+SIGN_IN_RESTART_INTERVAL_S = 600
+_last_sign_in_restart = 0.0
+
+# Some recaps link to scorecards that have no board rows: seen on the last
+# session of side-pairs series (2608117-SS01-5, 37 scorecards; sessions 1-4
+# saved normally). Stop after this many empty ones.
+EMPTY_SCORECARD_LIMIT = 3
+
+
+class SignInRequiredError(Exception):
+    """The ACBL sign-in page came back instead of the page asked for."""
+
+
+def is_sign_in_url(url: str) -> bool:
+    """True for login.acbl.org, or the /login page of another acbl.org host."""
+    parts = urllib.parse.urlsplit(url or "")
+    host = (parts.hostname or "").lower()
+    if host == "login.acbl.org":
+        return True
+    return host.endswith(".acbl.org") and parts.path.rstrip("/") == "/login"
 
 _SUIT_LETTER = {
     "clubs": "C",
@@ -677,15 +705,38 @@ def _looks_gateway_error(page_html: str) -> bool:
     return "bad gateway" in lowered or "gokuprops" in lowered or "just a moment" in lowered
 
 
+def _looks_like_recap(page_html: str) -> bool:
+    """True when the page is a live.acbl.org results page, not an error or check page.
+
+    "No pair scorecards" is remembered only for such a page, so a gateway
+    error or a Cloudflare page is never taken for a session with no results.
+    """
+    if _looks_gateway_error(page_html) or _looks_unavailable(page_html):
+        return False
+    return re.search(r"<title>\s*ACBL Live\s*</title>", page_html or "", flags=re.I) is not None
+
+
 def _default_fetch(url: str) -> str:
+    global _last_sign_in_restart
     last = ""
     for attempt in range(1, 4):
         last = fetch_acbl_page(_abs_live(url))
+        landed = last_fetched_url()
+        if is_sign_in_url(landed):
+            now = time.time()
+            if now - _last_sign_in_restart < SIGN_IN_RESTART_INTERVAL_S:
+                raise SignInRequiredError(f"ACBL sign-in page ({landed}) instead of {url}")
+            _last_sign_in_restart = now
+            print(f"  ACBL sign-in page instead of {url}; restarting Chrome to sign in again")
+            shutdown_acbl_browser()
+            continue
         if _looks_gateway_error(last) and attempt < 3:
             print(f"  gateway/challenge page for {url}; retry {attempt}")
             time.sleep(2)
             continue
         return last
+    if is_sign_in_url(last_fetched_url()):
+        raise SignInRequiredError(f"ACBL sign-in page instead of {url}")
     return last
 
 
@@ -792,11 +843,15 @@ def download_sessions_from_web(
     skip_if_json_exists: bool = True,
     skip_if_sql_exists: bool = True,
     fetch: Callable[[str], str] | None = None,
+    stats: DownloadStats | None = None,
 ) -> DownloadStats:
-    """Write API-shaped ``*.session.json`` files from live.acbl.org scorecards."""
+    """Write API-shaped ``*.session.json`` files from live.acbl.org scorecards.
+
+    Pass ``stats`` to read the counts even when the run is interrupted.
+    """
     fetcher = fetch or _default_fetch
     output_dir.mkdir(parents=True, exist_ok=True)
-    stats = DownloadStats()
+    stats = stats if stats is not None else DownloadStats()
     total = len(session_ids)
     consecutive_fetch_failures = 0
 
@@ -804,7 +859,7 @@ def download_sessions_from_web(
         nonlocal consecutive_fetch_failures
         try:
             html = fetcher(url)
-        except Forbidden403Error:
+        except (Forbidden403Error, SignInRequiredError):
             raise
         except KeyboardInterrupt:
             raise
@@ -825,6 +880,13 @@ def download_sessions_from_web(
             stats.aborted = True
             return True
         return False
+
+    def _needs_sign_in(session_id: str) -> None:
+        """Record a session whose page was the ACBL sign-in page. Says nothing about its results."""
+        stats.unavailable += 1
+        stats.sign_in_required += 1
+        stats.unavailable_ids.append(session_id)
+        print(f"UNAVAILABLE (ACBL sign-in page, will retry next run): {session_id}")
 
     try:
         for index, session_id in enumerate(session_ids):
@@ -853,6 +915,9 @@ def download_sessions_from_web(
                 stats.errors += 1
                 stats.aborted = True
                 break
+            except SignInRequiredError:
+                _needs_sign_in(session_id)
+                continue
             if recap_html is None:
                 if _give_up_on_session(session_id):
                     break
@@ -866,6 +931,8 @@ def download_sessions_from_web(
             if not score_urls:
                 stats.unavailable += 1
                 stats.unavailable_ids.append(session_id)
+                if _looks_like_recap(recap_html):
+                    stats.no_scorecard_ids.append(session_id)
                 print(f"UNAVAILABLE (no pair scorecards): {session_id}")
                 continue
             hands_html = ""
@@ -873,11 +940,12 @@ def download_sessions_from_web(
                 try:
                     loaded = _fetch_page(hand_url)
                     hands_html = loaded or ""
-                except Forbidden403Error as exc:
+                except (Forbidden403Error, SignInRequiredError) as exc:
                     print(f"  handrecords skipped: {exc}")
             scorecards: list[tuple[str, str]] = []
             failed = False
             score_failed = False
+            sign_in = False
             for score_url in score_urls:
                 try:
                     loaded = _fetch_page(score_url)
@@ -887,14 +955,30 @@ def download_sessions_from_web(
                     stats.aborted = True
                     failed = True
                     break
+                except SignInRequiredError:
+                    sign_in = True
+                    break
                 if loaded is None:
                     score_failed = True
                     break
                 scorecards.append((score_url, loaded))
+                if (
+                    len(scorecards) == EMPTY_SCORECARD_LIMIT
+                    and len(score_urls) > EMPTY_SCORECARD_LIMIT
+                    and not any(parse_scorecard(page, page_url=url)["rows"] for url, page in scorecards)
+                ):
+                    print(
+                        f"  first {EMPTY_SCORECARD_LIMIT} scorecards have no board rows"
+                        f"; skipping the other {len(score_urls) - EMPTY_SCORECARD_LIMIT}"
+                    )
+                    break
                 if sleep_seconds:
                     time.sleep(sleep_seconds)
             if failed:
                 break
+            if sign_in:
+                _needs_sign_in(session_id)
+                continue
             if score_failed:
                 if _give_up_on_session(session_id):
                     break

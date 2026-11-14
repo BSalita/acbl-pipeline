@@ -16,6 +16,7 @@ adbc-driver-sqlite
 requests
 urllib3
 playwright
+patchright  # Playwright fork Cloudflare detects less; used when installed
 endplay
 duckdb==2.0.0
 fastapi

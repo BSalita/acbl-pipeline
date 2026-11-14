@@ -42,6 +42,7 @@ if str(_SRC_DIR) not in sys.path:
 from mlBridge.mlBridgeAcblLib import (  # noqa: E402
     _goto_with_diagnostics,
     _run_in_thread_with_new_loop,
+    acbl_sync_playwright,
     create_acbl_browser_context,
     wait_through_acbl_challenge,
     create_club_dfs,
@@ -658,7 +659,7 @@ def _playwright_paginated_html(
     """
 
     def _sync() -> Tuple[str, bool]:
-        from playwright.sync_api import sync_playwright
+        sync_playwright = acbl_sync_playwright()
 
         pages_html: List[str] = []
         complete = True

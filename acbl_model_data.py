@@ -148,6 +148,29 @@ def _build_join_plan(brs_lf, *, hrs_df, brs_read_cols, join_keys):
     return lf
 
 
+# Deal identity shared by board results and hand records. session_id is left out on
+# purpose: the build side is reduced to one row per deal before the join.
+HRS_JOIN_KEYS = ['HandRecordBoard', 'Dealer', 'Vul', 'hand_record_id', 'Board']
+
+
+def _drop_repeated_results(df, label):
+    """Keep one row per club board_result_id.
+
+    Step 3c joins board results to hand records on session and board. Where the club hand
+    records list a board more than once, 3c writes that board's results once per copy
+    (57,133 extra rows in the 2026-11-14 file). The copies are identical rows. Tournament
+    frames have no single id column here and their hand records have no repeats.
+    """
+    if 'board_result_id' not in df.columns:
+        return df
+    keep = df['board_result_id'].is_first_distinct()
+    extra = df.height - int(keep.sum())
+    if extra:
+        print(f"[{label}] {extra:,} repeated board results left out")
+        df = df.filter(keep)
+    return df
+
+
 def _validate_plan_schema(lf, *, label):
     """Common pre-flight assertions on a built lazy plan: no Float64
     surprises (would 2x output size), no _x/_y/_right/_left collisions
@@ -749,6 +772,10 @@ def create_model_data(
     # known during play
     opening_lead_features = {
         'Lead':pl.Categorical,
+        # Club only, from add_dd_lead_cost in step 3c: the double-dummy cost of the lead.
+        # Opening-lead state is past the states step 5b reads (0-4), so these are not model inputs.
+        'DD_Lead_Cost':pl.UInt8,
+        'Lead_Is_DD_Best':pl.Boolean,
         #'Opening_Lead_Suit':pl.Categorical, # todo: same as BidSuit category
         #'Opening_Lead_Rank':pl.UInt8,
         #'Opening_Lead_Convention':pl.Categorical, # todo: 4th longest and strongest, high from doubleton, etc.
@@ -966,7 +993,9 @@ def create_model_data(
             'ew_pair_summary_id',
             'NSPair',
             'EWPair',
-            'scores_l',
+            # 'scores_l' is no longer in the club file: step 3b (typed_club_results) takes
+            # Result and Tricks from ACBL, so step 3c does not derive Result from Score_NS
+            # and never builds the scores list. Tournament still derives it.
             'mp_limit',  # event MP ceiling; used by Elo strata, not ML features
         ]
     elif club_or_tournament == 'tournament':
@@ -1061,6 +1090,12 @@ def create_model_data(
     hrs_columns = deal_features_to_join
     hrs_df = pl.read_parquet(acbl_hand_records_augmented_file, columns=hrs_columns)
     print(f"Loaded {acbl_hand_records_augmented_filename}: shape:{hrs_df.shape}, size:{acbl_hand_records_augmented_file.stat().st_size}")
+    # One row per deal. The club hand records list some boards of a session more than once
+    # (24,757 identical extra rows on 2026-11-14) and the same deal can belong to several
+    # sessions; either way every extra row here repeated the board results it matched.
+    hrs_rows = hrs_df.height
+    hrs_df = hrs_df.unique(subset=HRS_JOIN_KEYS, keep='first', maintain_order=True)
+    print(f"hrs_df: {hrs_rows - hrs_df.height:,} rows with a repeated deal key left out, {hrs_df.height:,} kept")
     show_memory_usage('after loading hrs_df (eager small side)')
 
     # Step B: determine brs projection from schema (no data load).
@@ -1081,7 +1116,7 @@ def create_model_data(
           f"(of {len(brs_schema_full)} in source)")
 
     # Sanity: keys we'll join on must be in the projection.
-    join_keys = ['HandRecordBoard', 'Dealer', 'Vul', 'hand_record_id', 'Board']
+    join_keys = HRS_JOIN_KEYS
     missing_keys = [k for k in join_keys if k not in brs_read_cols]
     assert not missing_keys, f"Join keys missing from brs projection: {missing_keys}"
 
@@ -1229,6 +1264,7 @@ def create_model_data(
             # ~38 GB peak RSS without invoking sink_parquet's pathological
             # per-column buffer allocation.
             df = shard_plan.collect(engine='streaming')
+            df = _drop_repeated_results(df, shard_label)
             n_rows_w = df.height
             print(f"[{shard_label}] collected: {n_rows_w:,} rows; writing parquet...")
             df.write_parquet(

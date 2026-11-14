@@ -12,6 +12,22 @@ if not exist "%PY%" (
 )
 set PYTHONUTF8=1
 set PYTHONIOENCODING=utf-8
+:: DD solver for every step: bridge-solver-cpp's DDS-API library (branch
+:: faster-search) instead of ddss. mlBridge\dds_ddss.py loads the library
+:: named by DDSS_DLL_PATH before its built-in ddss path; each step's log
+:: shows the path it loaded. Same results as ddss, so no cache is rebuilt.
+:: MEASURED 2026-11-14, revision b12bb3f, 2000 club deals at 16 threads:
+::   DD tables 17.4s vs 46.5s, tables+par 8.8s vs 27.0s (1000 deals),
+::   opening leads 4.2s vs 12.4s; every result identical to ddss.
+:: To use another library (ddss:
+::   C:\sw\bridge\ML-Contract-Bridge\src\ddss\build-cmake\Release\dds.dll),
+:: set DDSS_DLL_PATH before running this file.
+if not defined DDSS_DLL_PATH for %%I in ("%~dp0..\bridge-solver-cpp\build\dds-single.dll") do set "DDSS_DLL_PATH=%%~fI"
+if not exist "%DDSS_DLL_PATH%" (
+  echo *** FAILED: DD solver library not found: %DDSS_DLL_PATH%
+  echo Build it with build.sh in ..\bridge-solver-cpp, or set DDSS_DLL_PATH.
+  exit /b 1
+)
 :: Success marker for :pyrun. Ctrl+C then "Terminate batch job? N" clears
 :: ERRORLEVEL to 0, so `if errorlevel 1` alone lets the next step run.
 :: Only a successful python exit creates this file (via &&); missing file = abort.
@@ -24,22 +40,25 @@ echo    ..\postmortem-acbl (SavedModels, Elo parquets)
 echo.
 echo  Approximate end-to-end wall time on the dev box
 echo  (512 GB RAM, 64-core CPU, NVMe E:/F:, RTX 5080, 1.8 TB K: pagefile):
-echo    Cold start (no caches, fresh DD/SD work): ~4.5-5 days
-echo      (~38 h Stage 3a + ~18 h Stage 3c + ~45 h Stage 5c + other stages).
-echo    Warm rewrite measured 2026-10-01 -^> 10-03 (log captured mid-5b):
-echo      1a 10h01m + 1b 7h56m + 3a 2h10m (DD/SD cache hit) + 3b 2m
-echo      + 3c 16h27m + 4 40m + 5a 4m (every shard skipped). 5b+ unfinished.
+echo    Cold start (no caches, fresh DD/SD work): ~4 days
+echo      (~38 h Stage 3a + ~1.5 h Stage 3c + ~45 h Stage 5c + other stages).
+echo    Latest run 2026-11-12 -^> 11-14 (six weeks of new data, 251K new deals):
+echo      1a 8h18m + 1b 27m + 1c 20m + 1d 3h + 1e 7m + 2a 3m + 2b 16m
+echo      + 3a 8h41m (6h43m of it new DD/SD) + 3b 2m + 3c 6h03m (est. 2h35m
+echo      alone, both sides in blocks) + 4 5m + 5a 39m (cold rebuild)
+echo      + 5b 56m + 5v 8s.
 echo    Stage 5c current baseline: 45h 31m for all 6 models (2026-10-06 15:50 -^> 10-08 13:21).
 echo      club 39h 19m, tournament 6h 12m. Clean run; no OOM resume.
 echo    Stage 5d shows the prediction charts 5c no longer opens (close windows to finish).
 echo    Empirical bottlenecks per stage are noted as "TIME:" tags below.
 echo    Each step prints its own measured elapsed time as "TIME[step]: ..." lines.
-echo  Latest measured stages: 1a-4 from 2026-10-01 -^> 10-03. Stage 5 from
-echo    the 2026-10-06 -^> 10-08 rebuild (5a shard writes, 5b, 5c).
+echo  Latest measured stages: 1a-5v from 2026-11-12 -^> 11-14. 5c from
+echo    the 2026-10-06 -^> 10-08 rebuild.
 echo  Model training results history: RESULTS.md (append an entry after each 5c run).
 echo ======================================================================
 echo.
 echo Using: %PY%
+echo DD solver: %DDSS_DLL_PATH%
 echo Start: %date% %time%
 :: Each step's output is also saved to logs\acbl_all_<start time>\<step>.log
 :: (via acbl_step_log.py); summary.log collects the TIME[...] lines.
@@ -59,16 +78,33 @@ echo [Stage 1] Data ingestion...
 :: ---- 1a ----
 :: READS:  (web scrape from my.acbl.org)
 :: WRITES: acbl/club-results/{club_id}/details/{session_id}.data.json
-:: TIME:   MEASURED 2026-10-01: 36066s (10h 1m), ended 22:44:56.
-::         1944 clubs, 7689 sessions extracted; last club 208 processed,
-::         2 already on disk, Failed: 0. Incremental, network-bound.
+:: TIME:   MEASURED 2026-11-12 06:14-14:32: 29870s (8h 18m) at the 3.3 s
+::         default, no 403. 1948 clubs, 6856 sessions extracted, Failed: 0;
+::         six weeks since the last sweep. Incremental, network-bound.
+::         2026-10-01 at 5 s: 36066s (10h 1m), 1944 clubs, 7689 sessions.
 ::         Since 2026-10-24: session requests start at most once per --sleep
 ::         (no extra fixed sleep) and listing pages wait for their content
 ::         instead of a fixed 2 s. --concurrency N (default 1) is opt-in; it
 ::         only helps if page loads exceed --sleep.
+::         Since 2026-11-12: --sleep applies to every page request (club list,
+::         club listing pages, sessions). The wait comes right after each
+::         page is fetched: the rest of --sleep since its request started.
+::         Listing pages count toward ACBL's limit: the 06:05 run fetched 121
+::         listing pages about 2 s apart, no sessions, and got the 403. The
+::         05:37 run got it after 58 listing pages and 56 sessions.
+::         A catch-up run now takes at least 1948 clubs x --sleep (1.8 h at
+::         3.3 s) even when nothing is new.
 ::         A small daily catch-up is minutes; this pass was a full sweep.
+:: 403:    MEASURED 2026-11-12 by test_acbl_download_delay.py: "403 Forbidden"
+::         came at 2.7 s (request 113), 2.9 s (122) and 3.0 s (257); 3.1 s
+::         and 3.5 s passed 400 requests; 3.3 s passed 1000 requests. Each
+::         403 cleared in 1-2 min. If a 403 does come, the downloader waits
+::         until it clears and resumes the same session.
+::         --sleep is not passed: the downloader's DEFAULT_SLEEP_SECONDS
+::         (3.3, was 5) applies. Rerun the test with --apply to remeasure
+::         and update that default.
 echo   [1a] Downloading club results to JSON...
-call :pyrun 1a acbl_club_download_to_json.py --sleep 2
+call :pyrun 1a acbl_club_download_to_json.py
 if errorlevel 1 goto :error
 
 :: ---- 1b ----
@@ -80,6 +116,8 @@ if errorlevel 1 goto :error
 ::         are re-parsed (--rebuild-cache forces a full parse). Measured on the
 ::         full corpus: nothing new 45 s; cold (first run) ~38 min; a typical
 ::         run with a few thousand new files ~7-8 min (merge is the floor).
+::         MEASURED 2026-11-12 16:19-16:45: 1599s (27m). 900,751 files parsed
+::         in 5,876 chunks (2,740 chunks reused), err=0, 34 tables merged.
 ::         Before the cache: ~16 min without the SQLite build (2026-10-01).
 ::         MEASURED 2026-10-01 22:45 -^> 10-02 06:40 WITH the SQLite build:
 ::         28533s (7h 56m). 1,335,293 JSON files, err=0. Parquet merge
@@ -97,6 +135,8 @@ if errorlevel 1 goto :error
 :: READS:  (ACBL API via ACBL_API_KEY)
 :: WRITES: acbl/tournaments/events/{sanction_id}.sanction.json
 :: TIME:   incremental; ~minutes daily, ~1-2 h cold start (API-rate-limited).
+::         MEASURED 2026-11-12 16:45-17:05: 1204s (20m) on the live.acbl.org
+::         path, 808 tournaments checked at 1.5 s each, 94 events written.
 ::         A rejected or expired ACBL_API_KEY falls back to live.acbl.org.
 ::         2026-09 cycle skipped (expired JWT). Newest sanction JSON 2026-08-14.
 ::         2026-10-02 console printed this banner, then Stage 3 started 4s
@@ -110,10 +150,22 @@ if errorlevel 1 goto :error
 :: READS:  acbl/tournaments/events/*.sanction.json
 :: WRITES: acbl/tournaments/sessions/{session_id}.session.json
 :: TIME:   incremental; ~minutes daily, several hours cold start (API-bound).
+::         MEASURED 2026-11-12 on the live.acbl.org path, two passes:
+::         17:05-19:02 6993s (stopped by hand) + 19:05-20:08 3811s = 3h.
+::         172,215 sessions already saved, 6,574 asked for, 75 written; the
+::         other 6,499 were team sessions with no pair scorecards, now
+::         listed as unavailable, so the next run does not ask again.
 ::         90s read timeout covers large NABC full_monty payloads.
 ::         HTTP 400/404 (unpublished / no boards) do not fail the step.
 ::         A rejected or expired ACBL_API_KEY falls back to live.acbl.org
 ::         (same Chrome/Cloudflare download path as club results).
+::         --sleep is not passed: DEFAULT_SLEEP_SECONDS (0 = no pause) applies.
+::         On the live.acbl.org path it is a pause after every pair scorecard
+::         page. test_acbl_download_delay.py --target tournament measures it.
+::         The live.acbl.org path cannot save team sessions (no pair
+::         scorecards). Once seen that way, 30+ days after the event, they
+::         are listed in sessions\_web_no_pair_scorecards.json and skipped;
+::         --recheck-web-unavailable asks for them again. The API skips none.
 ::         2026-09 cycle skipped (expired JWT). Newest session JSON 2026-09-02.
 echo   [1d] Downloading tournament sessions...
 call :pyrun 1d acbl_tournament_download_sessions_using_sanctioned_events.py --timeout 90
@@ -127,6 +179,8 @@ if errorlevel 1 goto :error
 ::           2a/2b read the parquets. Check with
 ::           acbl_compare_sqlite_vs_parquet.py --side tournament.
 :: TIME:   parquet build: full rebuild of 172K session files, see TIME[1e].
+::         MEASURED 2026-11-12 20:24-20:31: 411s (7m). 172,288 session files,
+::         15 tables, no SQLite build.
 ::         MEASURED 2026-09-10/11 WITH the SQLite build: finished 00:16,
 ::         sqlite 15.0 GB. If this started after 1b (18:00), it was ~6 h.
 echo   [1e] Converting tournament sessions to Parquet...
@@ -144,8 +198,12 @@ echo [Stage 2] Cleaning...
 ::         acbl/tournament_results_parquet/{handrecord,session}.parquet
 :: WRITES: acbl/acbl_club_hand_records_cleaned.parquet
 ::         acbl/acbl_tournament_hand_records_cleaned.parquet
-:: TIME:   MEASURED 2026-09-11 00:16-03:54 (~3.6 h). Club 0.89 GB @ 03:37,
-::         tournament 0.08 GB @ 03:54. Was ~5-10 min at smaller volume.
+:: TIME:   MEASURED 2026-11-12 20:31-20:33: 155s. Club 135s (21,651,288
+::         rows), tournament 15s (2,081,812 rows). Club alone, now written in
+::         session_id order for 3c: 102s on 2026-11-13; 103s on 2026-11-14,
+::         the first run to drop identical repeated club rows (24,757 of
+::         them; 21,626,531 rows left).
+::         From the SQLite database, 2026-09-11: ~3.6 h.
 echo   [2a] Cleaning hand records...
 call :pyrun 2a acbl_sql_to_hand_records_clean.py
 if errorlevel 1 goto :error
@@ -156,8 +214,9 @@ if errorlevel 1 goto :error
 ::         acbl/acbl_club_board_results_cleaned.parquet  (for tournament enrichment)
 :: WRITES: acbl/acbl_club_board_results_cleaned.parquet
 ::         acbl/acbl_tournament_board_results_cleaned.parquet
-:: TIME:   MEASURED 2026-09-11 03:54-04:27 (~33 min). Club 11.6 GB,
-::         tournament 0.83 GB.
+:: TIME:   MEASURED 2026-11-12 20:33-20:49: 953s (16m). Club 407s
+::         (156.00M rows, 11.6 GB), tournament 546s (32.69M rows, 0.92 GB).
+::         2026-09-11: ~33 min.
 echo   [2b] Cleaning board results...
 call :pyrun 2b acbl_sql_to_board_results_clean.py
 if errorlevel 1 goto :error
@@ -177,10 +236,16 @@ echo [Stage 3] Augmentation...
 ::         acbl/acbl_{club,tournament}_hand_records_augmented_narrow.parquet
 :: TIME:   COLD START ~38 h for 747K novel PBNs (batched SD pipeline; CPU-bound).
 ::         WARM compute is cache hits, but this step still rewrites the full
-::         augmented parquets. MEASURED 2026-10-02 06:40-08:50: 7777s (2h 10m).
-::         Club 7214s (20.93M rows, 71.2 GB), tournament 556s (2.05M rows, 4.1 GB).
-::         DD/Par/SD pbns_to_process=0. Previous warm rewrite 2026-09-11 was ~12 h.
-::         3c is longer on a warm rewrite.
+::         augmented parquets.
+::         MEASURED 2026-11-12 20:50 -^> 11-13 05:30 with 251,482 new deals:
+::         31246s (8h 41m). Club 30634s (21.65M rows): DD 23m, SD 6h 20m,
+::         everything else 1h 48m. Tournament 595s (2.08M rows, 4.5 GB).
+::         MEASURED 2026-11-13 20:41-22:32, warm, club only, rows now in
+::         session_id order (47.1 GB, was 78.5 GB): 6677s (1h 51m), with a
+::         DD verification using most cores from 20:57.
+::         MEASURED 2026-11-14 09:26-10:53, warm, club only (21,626,531
+::         rows, 47.1 GB), nothing else running: 5220s (1h 27m).
+::         2026-10-02 warm rewrite: 7777s (2h 10m), club 7214s.
 ::         Since 2026-10-24 a side is skipped (~1 s check) when its cleaned
 ::         input, cache rows, code and versions match
 ::         acbl_{club,tournament}_hand_records_augmented_manifest.json;
@@ -198,9 +263,11 @@ if errorlevel 1 goto :error
 :: ---- 3b ----
 :: READS:  acbl/acbl_{club,tournament}_board_results_cleaned.parquet
 :: WRITES: acbl/acbl_{club,tournament}_board_results_augmented_step1.parquet
-:: TIME:   MEASURED 2026-10-02 08:50-08:52: 128s. Club 105s
-::         (152.4M cleaned -^> 120.87M step1, 9.7 GB), tournament 17s
-::         (31.77M -^> 27.77M, 0.54 GB).
+:: TIME:   MEASURED 2026-11-13 05:30-05:32: 132s. Club 106s
+::         (156.00M cleaned -^> 123.97M step1, 9.8 GB), tournament 18s
+::         (32.69M -^> 28.35M, 0.59 GB). Club alone 113s on 2026-11-14.
+::         Since 2026-11-14 club Tricks is always total tricks: where ACBL's
+::         tricks_taken is tricks over book, 6 is added (1,724 rows then).
 echo   [3b] Augmenting board results (step 1: contracts + vulnerability)...
 call :pyrun 3b acbl_board_results_augment_step1.py
 if errorlevel 1 goto :error
@@ -209,15 +276,35 @@ if errorlevel 1 goto :error
 :: READS:  acbl/acbl_{club,tournament}_board_results_augmented_step1.parquet
 ::         acbl/acbl_{club,tournament}_hand_records_augmented.parquet
 :: WRITES: acbl/acbl_{club,tournament}_board_results_augmented.parquet
-:: TIME:   MEASURED 2026-10-02 08:52 -^> 10-03 01:19: 59213s (16h 27m).
-::         Club 47221s, 70,827,715 rows, 82.4 GB. Tournament 11970s,
-::         18,667,922 rows, 19.6 GB. Club Date max 2026-09-09.
+:: TIME:   Both sides run in blocks of sessions, kept in
+::         acbl/acbl_{club,tournament}_board_results_augmented_blocks. A
+::         rerun recomputes only blocks whose rows changed; editing this
+::         script, mlBridgeAugmentLib.py or mlBridgeLib.py recomputes all.
+::         All blocks with the machine otherwise idle: ~1h 35m (club 1h 13m
+::         measured, tournament ~20m estimated).
+::         Club, 62 blocks of 25,000 session ids. MEASURED 2026-11-14
+::         10:53-12:06, all blocks, nothing else running: 4393s (1h 13m),
+::         73,347,299 rows, 75.4 GB; about 70 s per block of 1.4M rows, then
+::         24 s for the ratings and 250 s to assemble the file.
+::         2026-11-13 23:15 -^> 11-14 02:51: 12958s (3h 36m), 73,404,432 rows
+::         (57,133 of them repeats), with a DD verification using most cores
+::         for the first 2h 40m.
+::         With no block changed a side is only reassembled: tournament 222s
+::         on 2026-11-14 (147 blocks checked in 10 s, ratings 13 s, file 151 s).
+::         Tournament, 147 blocks (a month of sanctions or a year of NABCs).
+::         MEASURED 2026-11-14 06:39-07:04: 1523s (25m), 18,980,984 rows,
+::         15.4 GB, while 5a and 5b were running. All columns equal the
+::         load-everything run except the three player ratings, which now
+::         average over the rows in the file (1,744 rows are dropped after
+::         the old code had already counted them).
+::         Before blocks: tournament 8799s (2h 27m) on 2026-11-14, paging;
+::         2026-10-02 both sides 59213s (16h 27m), club 47221s.
 ::         Joins ~6k-col hand-record features into board results.
 :: OPTION: set ACBL_SD_LEAD_SAMPLES=20 to add the single-dummy lead score
 ::         (SD_Lead_* columns, club only: tournaments record no lead). The first
 ::         club run solves ~5.7M lead positions, ~33 h at 20 (48 positions/s);
 ::         acbl/acbl_club_sd_lead_cache/ keeps them, so later runs solve only new
-::         ones. Changing the value recomputes every year shard.
+::         ones. Changing the value recomputes every club block.
 if not defined ACBL_SD_LEAD_SAMPLES set "ACBL_SD_LEAD_SAMPLES=0"
 echo   [3c] Augmenting board results (step 2: join hand records + full augmentation; SD lead samples %ACBL_SD_LEAD_SAMPLES%)...
 call :pyrun 3c acbl_board_results_augment_step2.py --sd-lead-samples %ACBL_SD_LEAD_SAMPLES%
@@ -234,9 +321,9 @@ echo [Stage 4] Elo ratings...
 :: WRITES: acbl/acbl_{club,tournament}_elo_ratings.parquet
 ::         acbl/acbl_{club,tournament}_player_elo_ratings.parquet  -> elo, postmortem-acbl
 ::         acbl/acbl_{club,tournament}_pair_elo_ratings.parquet    -> elo, postmortem-acbl
-:: TIME:   MEASURED 2026-10-03 01:19-01:59: 2418s (40m). Club 1937s
-::         (70.83M rows), tournament 475s (18.67M rows). Walks games
-::         chronologically; mostly single-threaded.
+:: TIME:   MEASURED 2026-11-14 05:18-05:24: 321s (5m). Club 256s
+::         (73.40M rows), tournament 58s (18.98M rows).
+::         2026-10-03: 2418s (40m), club 1937s, tournament 475s.
 echo   [4] Computing Elo ratings (player + pair)...
 call :pyrun 4 acbl_elo_ratings_create.py
 if errorlevel 1 goto :error
@@ -255,12 +342,26 @@ echo [Stage 5] ML model pipeline...
 ::         (default --no-merge-shards since 2026-08-16: the single-file merge
 ::         took ~12 h for club and made downstream reads SLOWER; consumers
 ::         now scan the shard glob with file-level Date pruning instead)
-:: TIME:   COLD REBUILD MEASURED 2026-10-06 from shard-dir creation
-::         (after the dirs were deleted) through manifest.json:
-::           club       12:42:51-13:31:45 (49 min). 96 shards,
-::                      71,773,521 rows, 88.43 GB.
-::           tournament 13:31:49-13:48:46 (17 min). 132 shards,
-::                      18,970,284 rows, 15.52 GB.
+:: TIME:   COLD CLUB REBUILD MEASURED 2026-11-14 06:57-07:38: 2464s (41m),
+::         while a 3c tournament test and a file comparison were running.
+::           club       2413s (40 min). 96 shards, 73,347,299 rows,
+::                      88.95 GB. Estimate alone: ~35 min.
+::           tournament 43s, all 132 shards skipped (18,980,984 rows,
+::                      15.53 GB).
+::         Cold rebuild of both, same day 05:32-06:10, nothing else running:
+::         2316s (39m), club 2110s, tournament 199s.
+::         2026-10-06 cold rebuild: club 49 min (71,773,521 rows),
+::         tournament 17 min (18,970,284 rows).
+::         The 05:32 run wrote 73,760,368 club rows, more than 3c had
+::         (73,404,432): the club hand records held 24,757 identical extra
+::         rows (7,906 boards in 376 sessions listed 2-10 times). 3c
+::         repeated those boards' results
+::         (57,133 extra rows) and the 5a join repeated them again (355,936
+::         more). Since 2026-11-14 5a joins to one row per deal and keeps
+::         one row per club board_result_id, and 2a drops the repeated hand
+::         records, so from the next full run 3c has none either.
+::         The column checks at the start fail in under 30 s when 3c adds
+::         or drops a column; add it to the catalog in acbl_model_data.py.
 ::         Skip-all pass remains 231s (2026-10-03 02:01-02:03). Skip
 ::         rebuilds a month when manifest source_rows changed, or, for
 ::         shards written before that field, when the window Date max moved.
@@ -276,14 +377,19 @@ if errorlevel 1 goto :error
 ::         acbl_{club,tournament}_model_data.parquet if no shard dir)
 ::         acbl/acbl_{club,tournament}_player_elo_ratings.parquet
 ::         acbl/acbl_{club,tournament}_pair_elo_ratings.parquet
-:: WRITES: acbl/acbl_{club,tournament}_prediction_data_train.parquet
-::         acbl/acbl_{club,tournament}_prediction_data_test.parquet
-:: TIME:   MEASURED 2026-10-06 13:49-15:50 (2h 2m) from the rebuilt
-::         monthly shards:
-::           club       13:49-15:29 (1h 40m). 61,705,397 train + 10,068,124
-::                      test rows; 203.51 + 26.83 GB. 6,042 columns.
-::           tournament 15:29-15:50 (22 min). 17,698,014 train + 1,272,270
-::                      test rows; 47.01 + 3.32 GB. 6,033 columns.
+:: WRITES: acbl/acbl_{club,tournament}_prediction_data_train_v2.parquet
+::         acbl/acbl_{club,tournament}_prediction_data_test_v2.parquet
+:: TIME:   MEASURED 2026-11-14 07:38-08:34: 3347s (56m), nothing else
+::         running:
+::           club       2329s (39 min). 61,291,826 train + 12,055,473
+::                      test rows; 57.90 + 9.72 GB. 6,042 columns.
+::           tournament 1010s (17 min). 17,697,878 train + 1,283,106
+::                      test rows; 9.90 + 0.79 GB. 6,036 columns.
+::         The files are about a quarter of the 2026-10-06 sizes for the
+::         same columns; null counts of 60 sampled columns equal the 5a
+::         shards on both sides.
+::         2026-10-06: 2h 2m, club 1h 40m (61,705,397 + 10,068,124 rows,
+::         203.51 + 26.83 GB), tournament 22 min (47.01 + 3.32 GB).
 ::         Test cutoff 2026-01-01. Earlier 2026-09-12 run was ~2.5 h
 ::         (club 61.71M+7.74M, tournament 15.70M+1.03M). The 2026-04 run
 ::         against the single merged file was club 7.3 h.
@@ -297,7 +403,17 @@ if errorlevel 1 goto :error
 ::         acbl/acbl_{club,tournament}_{,player_,pair_}elo_ratings.parquet
 ::         acbl/acbl_club_prediction_data_test_v2.parquet
 :: WRITES: (none; exits 1 on any FAIL)
-:: TIME:   minutes (lazy scans).
+:: TIME:   MEASURED 2026-11-14: 8s.
+::         That first full run FAILED 2 of 33 checks, both on the club step1
+::         file: 1,724 rows in 8 sessions of 2026-09 where ACBL's
+::         tricks_taken holds tricks over book (Result is right), and
+::         Result null in 1.63% of played contracts against the 1% limit
+::         (ACBL gave none for 3.2% of 2019 and 11.9% of 2020). The 3c
+::         output passed both: none of the 1,724 rows reach it and 0.25%
+::         of its contracts have a null Result.
+::         Fixed the same day: 3b converts those trick counts, and the
+::         null-Result limit counts contracts from 2021 on (0.06% in step1).
+::         33 of 33 passed at 09:31 after rerunning 3b.
 ::         Verifies the 2026-10 data fixes: doubled contracts kept, typed
 ::         Result/Tricks, player ID 0 nulled, unrated seats, ordered pair keys.
 ::         Runs before 5c so bad data does not cost ~45 h of training.

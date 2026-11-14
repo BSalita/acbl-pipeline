@@ -28,14 +28,22 @@ if not exist "%STAGE%\club_results_parquet\" (
     if errorlevel 1 exit /b 1
 )
 
-xcopy "%SRC%\club_results_parquet\events.parquet" "%STAGE%\club_results_parquet\" /D /Y
-xcopy "%SRC%\club_results_parquet\players.parquet" "%STAGE%\club_results_parquet\" /D /Y
-xcopy "%SRC%\club_results_parquet\pair_summaries.parquet" "%STAGE%\club_results_parquet\" /D /Y
-xcopy "%SRC%\club_results_parquet\sections.parquet" "%STAGE%\club_results_parquet\" /D /Y
-xcopy "%SRC%\club_results_parquet\sessions.parquet" "%STAGE%\club_results_parquet\" /D /Y
-xcopy "%SRC%\acbl_club_board_results_augmented.parquet" "%STAGE%\club_results_parquet\" /D /Y
-xcopy "%SRC%\acbl_tournament_board_results_augmented.parquet" "%STAGE%\club_results_parquet\" /D /Y
-if errorlevel 1 exit /b 1
+rem Each copy is checked: a failed one (file in use, share unreachable, disk
+rem full) stops the script instead of passing unnoticed.
+for %%F in (events players pair_summaries sections sessions) do (
+    xcopy "%SRC%\club_results_parquet\%%F.parquet" "%STAGE%\club_results_parquet\" /D /Y
+    if errorlevel 1 (
+        echo *** FAILED: copy of %%F.parquet
+        exit /b 1
+    )
+)
+for %%F in (acbl_club_board_results_augmented acbl_tournament_board_results_augmented) do (
+    xcopy "%SRC%\%%F.parquet" "%STAGE%\club_results_parquet\" /D /Y
+    if errorlevel 1 (
+        echo *** FAILED: copy of %%F.parquet
+        exit /b 1
+    )
+)
 
 rem Obsolete Stage 1b reconstruction files. Recent sessions missing from the
 rem monolith use the bounded JSON archive/live fallback instead.

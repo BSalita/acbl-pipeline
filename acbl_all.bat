@@ -47,6 +47,9 @@ echo      1a 8h18m + 1b 27m + 1c 20m + 1d 3h + 1e 7m + 2a 3m + 2b 16m
 echo      + 3a 8h41m (6h43m of it new DD/SD) + 3b 2m + 3c 6h03m (est. 2h35m
 echo      alone, both sides in blocks) + 4 5m + 5a 39m (cold rebuild)
 echo      + 5b 56m + 5v 8s.
+echo    Rerun from 2a on 2026-11-14 (no new deals, nothing else running):
+echo      2a 2m + 3a 1h27m + 3c 1h17m + 4 6m + 5a 51m + 5b 60m + 5v 7s
+echo      = 4h43m from the start of 2a to the start of 5c.
 echo    Stage 5c current baseline: 45h 31m for all 6 models (2026-10-06 15:50 -^> 10-08 13:21).
 echo      club 39h 19m, tournament 6h 12m. Clean run; no OOM resume.
 echo    Stage 5d shows the prediction charts 5c no longer opens (close windows to finish).
@@ -321,8 +324,8 @@ echo [Stage 4] Elo ratings...
 :: WRITES: acbl/acbl_{club,tournament}_elo_ratings.parquet
 ::         acbl/acbl_{club,tournament}_player_elo_ratings.parquet  -> elo, postmortem-acbl
 ::         acbl/acbl_{club,tournament}_pair_elo_ratings.parquet    -> elo, postmortem-acbl
-:: TIME:   MEASURED 2026-11-14 05:18-05:24: 321s (5m). Club 256s
-::         (73.40M rows), tournament 58s (18.98M rows).
+:: TIME:   MEASURED 2026-11-14 12:10-12:16: 361s (6m). Club 296s
+::         (73.35M rows), tournament 60s (18.98M rows). 321s earlier that day.
 ::         2026-10-03: 2418s (40m), club 1937s, tournament 475s.
 echo   [4] Computing Elo ratings (player + pair)...
 call :pyrun 4 acbl_elo_ratings_create.py
@@ -342,14 +345,17 @@ echo [Stage 5] ML model pipeline...
 ::         (default --no-merge-shards since 2026-08-16: the single-file merge
 ::         took ~12 h for club and made downstream reads SLOWER; consumers
 ::         now scan the shard glob with file-level Date pruning instead)
-:: TIME:   COLD CLUB REBUILD MEASURED 2026-11-14 06:57-07:38: 2464s (41m),
-::         while a 3c tournament test and a file comparison were running.
-::           club       2413s (40 min). 96 shards, 73,347,299 rows,
-::                      88.95 GB. Estimate alone: ~35 min.
-::           tournament 43s, all 132 shards skipped (18,980,984 rows,
-::                      15.53 GB).
-::         Cold rebuild of both, same day 05:32-06:10, nothing else running:
-::         2316s (39m), club 2110s, tournament 199s.
+:: TIME:   COLD REBUILD OF BOTH MEASURED 2026-11-14 12:16-13:07, nothing
+::         else running: 3087s (51m).
+::           club       2207s (37 min). 96 shards, 73,347,299 rows,
+::                      88.95 GB; the same row count as 3c.
+::           tournament 857s (14 min). 132 shards, 18,980,984 rows,
+::                      15.53 GB.
+::         Delete both shard folders first when rows changed in value but
+::         not in number (player ratings change in every month when rows
+::         are removed anywhere); a month is skipped on its row count.
+::         Earlier that day: club alone 2413s; tournament with every shard
+::         skipped 43s.
 ::         2026-10-06 cold rebuild: club 49 min (71,773,521 rows),
 ::         tournament 17 min (18,970,284 rows).
 ::         The 05:32 run wrote 73,760,368 club rows, more than 3c had
@@ -359,7 +365,7 @@ echo [Stage 5] ML model pipeline...
 ::         (57,133 extra rows) and the 5a join repeated them again (355,936
 ::         more). Since 2026-11-14 5a joins to one row per deal and keeps
 ::         one row per club board_result_id, and 2a drops the repeated hand
-::         records, so from the next full run 3c has none either.
+::         records: the rerun from 2a that day has none in 3c or 5a.
 ::         The column checks at the start fail in under 30 s when 3c adds
 ::         or drops a column; add it to the catalog in acbl_model_data.py.
 ::         Skip-all pass remains 231s (2026-10-03 02:01-02:03). Skip
@@ -385,6 +391,8 @@ if errorlevel 1 goto :error
 ::                      test rows; 57.90 + 9.72 GB. 6,042 columns.
 ::           tournament 1010s (17 min). 17,697,878 train + 1,283,106
 ::                      test rows; 9.90 + 0.79 GB. 6,036 columns.
+::         Rerun 13:07-14:07 the same day: 3572s (60m), same rows and
+::         sizes, with a 91 GB copy to prod reading E: from 13:51.
 ::         The files are about a quarter of the 2026-10-06 sizes for the
 ::         same columns; null counts of 60 sampled columns equal the 5a
 ::         shards on both sides.
@@ -413,7 +421,8 @@ if errorlevel 1 goto :error
 ::         of its contracts have a null Result.
 ::         Fixed the same day: 3b converts those trick counts, and the
 ::         null-Result limit counts contracts from 2021 on (0.06% in step1).
-::         33 of 33 passed at 09:31 after rerunning 3b.
+::         33 of 33 passed at 09:31 after rerunning 3b, and again at 14:07
+::         (7s) on the files rebuilt from 2a.
 ::         Verifies the 2026-10 data fixes: doubled contracts kept, typed
 ::         Result/Tricks, player ID 0 nulled, unrated seats, ordered pair keys.
 ::         Runs before 5c so bad data does not cost ~45 h of training.

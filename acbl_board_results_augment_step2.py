@@ -8,11 +8,26 @@ Takes 6h/70m for 106m->?/22m->15m rows and ?/6752 columns. filesize ?GB/16GB. 2T
 Final augmentation step for board results.
 Joins with hand records and adds complete augmentation data.
 
-Club results are computed per year and cached as one parquet shard per year in
-acbl_club_board_results_augmented_years/. A year is recomputed only when its step1
-rows, its joined hand records, the code or the input schemas change. The final
-parquet is then assembled from the shards by copying their row groups byte for byte.
-Use --rebuild-all to recompute every year.
+Results are computed in blocks of sessions and cached as one parquet shard per block in
+acbl_{club,tournament}_board_results_augmented_blocks/. A block is recomputed only when
+its step1 rows, its hand records, the code or the input schemas change. Use
+--rebuild-all to recompute every block.
+
+Club: a block is SESSION_BLOCK session ids. The hand records file is in session_id
+order (step 2a sorts it, step 3a keeps the order), so each block reads only its own
+hand records and the whole file is never in memory.
+
+Tournament: session ids are strings such as 1502054-2005-1 (sanction, event, session),
+so a block is the sessions sharing a prefix (TOURNAMENT_BLOCK_KEY): one month of
+sanctions, or one year of NABCs. All sessions of a tournament are in one block. The
+hand records (about 2M rows) are not in session order in the file; they are read once
+and sorted in memory.
+
+Every grouped calculation in the board results augmentations stays inside one session,
+except the three player ratings (RATING_COLS), which average over all rows. Those are
+left out of the shards and computed over all blocks when the final file is assembled.
+The final parquet copies the shards' row groups byte for byte and appends the rating
+columns to each row group.
 
 Previous steps:
     acbl_sql_to_hand_records_clean.py
@@ -30,6 +45,8 @@ TODO:
    2026-10-20 caveats).
 """
 
+import base64
+import copy
 import hashlib
 import inspect
 import json
@@ -60,7 +77,21 @@ recentPath = acblPath.joinpath('recent')
 JOIN_KEYS = ['hand_record_id', 'session_id', 'Board']
 ROW_GROUP_SIZE = 512_000
 COMPRESSION = 'zstd'
-CACHE_VERSION = 1
+CACHE_VERSION = 2
+# Session ids per cached block. Fixed-width blocks keep their boundaries when new
+# sessions arrive, so only the newest block changes on a routine run.
+SESSION_BLOCK = 25_000
+# Tournament block key: the leading part of the session id. Sanction ids start with
+# YYMM (1502054-...), NABC ids with letters and a two-digit year (NABC163-...). Ids that
+# match neither fall back to their first four characters. A month's block changes only
+# when that month gets new sessions.
+TOURNAMENT_BLOCK_KEY = r'^(\d{4}|[A-Z]+\d{2})'
+# Row order inside a block, and so in the final file. Columns a side does not have are skipped.
+BLOCK_SORT_KEYS = ['session_id', 'section_id', 'Board', 'Round', 'Table', 'board_result_id']
+# Averages over all of a player's rows (mlBridgeAugmentLib.add_player_ratings), so they
+# cannot be computed block by block. RATING_INPUT_COLS is what the averages are made from.
+RATING_COLS = ['Declarer_Rating', 'Defender_OnLead_Rating', 'Defender_NotOnLead_Rating']
+RATING_INPUT_COLS = ['Declarer_ID', 'OnLead', 'NotOnLead', 'DD_Tricks_Diff', 'Defender_Par_GE']
 
 
 PCT_VALIDATION_COLS = [
@@ -84,13 +115,20 @@ PCT_VALIDATION_COLS = [
 
 def _validate_percentage_columns(df: pl.DataFrame, label: str):
     """Warn about percentage columns with out-of-bounds values [0,1]."""
+    cols = []
     for col in PCT_VALIDATION_COLS:
         if col not in df.columns:
             print(f"  WARNING ({label}): validation column '{col}' not found -- skipping")
-            continue
-        oob = df.filter(~pl.col(col).is_between(0, 1) & pl.col(col).is_not_null())
-        if len(oob) > 0:
-            print(f"  WARNING ({label}): {len(oob)} rows have '{col}' outside [0,1]")
+        else:
+            cols.append(col)
+    if not cols:
+        return
+    # Counted in one pass over these columns. Filtering the whole ~6,800-column frame once
+    # per column took about 2 minutes on a 2.3M-row block.
+    counts = df.select([(~pl.col(c).is_between(0, 1) & pl.col(c).is_not_null()).sum().alias(c) for c in cols]).row(0)
+    for col, n in zip(cols, counts):
+        if n > 0:
+            print(f"  WARNING ({label}): {n} rows have '{col}' outside [0,1]")
 
 
 # ---------------------------------------------------------------------------
@@ -275,20 +313,136 @@ def _read_footer(path: pathlib.Path):
     return size, start, meta
 
 
-def concat_parquet_files(paths: list, out_file: pathlib.Path, chunk_bytes: int = 64 << 20) -> int:
+def _row_groups(meta: list) -> list:
+    rgs = _field(meta, 4)
+    return rgs[2][1] if rgs else []
+
+
+def _first_page_offset(md: list) -> int:
+    """Where a column chunk starts: its dictionary page when it has one, else its first data page."""
+    dictionary = _field(md, 11)
+    if dictionary is not None and dictionary[2] > 0:
+        return dictionary[2]
+    return _field(md, 9)[2]
+
+
+def _row_group_spans(meta: list, footer_start: int, p) -> list:
+    """Byte span (start, end) of every row group: from its first column chunk to the end of
+    its last. Row groups must follow one another without overlapping. Anything stored after
+    the last row group (a page index) lies outside every span and is not copied."""
+    spans = []
+    for rg in _row_groups(meta):
+        chunks = []
+        for cc in _field(rg, 1)[2][1]:
+            md = _field(cc, 3)[2]
+            first = _first_page_offset(md)
+            chunks.append((first, first + _field(md, 7)[2]))
+        start, end = min(c[0] for c in chunks), max(c[1] for c in chunks)
+        if start < (spans[-1][1] if spans else 4) or end > footer_start:
+            raise ValueError(f'{p}: row groups overlap or run into the footer')
+        spans.append((start, end))
+    return spans
+
+
+def _relocate_row_group(rg: list, delta: int, p):
+    """Shift every absolute offset in a row group's metadata by delta bytes.
+
+    The page index (ColumnChunk fields 4-7) is dropped: it holds absolute page offsets in a
+    part of the file that is not copied. Polars writes one; readers work without it.
+    """
+    for cc in _field(rg, 1)[2][1]:
+        cc[:] = [f for f in cc if f[0] not in (4, 5, 6, 7)]
+        for fid in (1, 8, 9):
+            if _field(cc, fid) is not None:
+                raise ValueError(f'{p}: column chunk field {fid} (path/crypto) not supported')
+        # Deprecated ColumnChunk.file_offset; Arrow writes 0, keep 0 as is.
+        if _field(cc, 2) is not None and _field(cc, 2)[2]:
+            _shift(cc, 2, delta)
+        md = _field(cc, 3)[2]
+        if _field(md, 14) is not None:
+            raise ValueError(f'{p}: bloom filters not supported')
+        for fid in (9, 10, 11):
+            f = _field(md, fid)
+            if f is not None and f[2] > 0:  # 0 means "no such page"
+                f[2] += delta
+    _shift(rg, 5, delta)
+
+
+def _arrow_schema_entry(meta: list):
+    """The key/value struct holding pyarrow's own copy of the schema, or None."""
+    kv = _field(meta, 5)
+    for entry in (kv[2][1] if kv else []):
+        if bytes(_field(entry, 1)[2]) == b'ARROW:schema':
+            return entry
+    return None
+
+
+def _decode_arrow_schema(entry: list) -> pyarrow.Schema:
+    return pyarrow.ipc.read_schema(pyarrow.BufferReader(base64.b64decode(bytes(_field(entry, 2)[2]))))
+
+
+def _append_side_schema(meta: list, side_meta: list, side_path):
+    """Add the side file's columns to the end of meta's schema. Side columns must be flat."""
+    schema, side = _field(meta, 2)[2][1], _field(side_meta, 2)[2][1]
+    side_children = _field(side[0], 5)[2]
+    if len(side) - 1 != side_children:
+        raise ValueError(f'{side_path}: nested columns not supported in a side file')
+    names = {bytes(_field(e, 4)[2]) for e in schema[1:]}
+    for e in side[1:]:
+        if bytes(_field(e, 4)[2]) in names:
+            raise ValueError(f'{side_path}: column {bytes(_field(e, 4)[2]).decode()} is already in the main file')
+    _field(schema[0], 5)[2] += side_children
+    schema.extend(side[1:])
+    # One ColumnOrder per leaf column.
+    orders, side_orders = _field(meta, 7), _field(side_meta, 7)
+    if (orders is None) != (side_orders is None):
+        raise ValueError(f'{side_path}: column_orders present in only one of the files')
+    if orders is not None:
+        orders[2][1].extend(side_orders[2][1])
+    # pyarrow stores its schema a second time; readers that use it must see the new columns.
+    entry, side_entry = _arrow_schema_entry(meta), _arrow_schema_entry(side_meta)
+    if entry is not None:
+        if side_entry is None:
+            raise ValueError(f'{side_path}: no ARROW:schema entry')
+        main_schema, side_schema = _decode_arrow_schema(entry), _decode_arrow_schema(side_entry)
+        merged = pyarrow.schema(list(main_schema) + list(side_schema), metadata=main_schema.metadata)
+        _field(entry, 2)[2] = base64.b64encode(merged.serialize().to_pybytes())
+
+
+def concat_parquet_files(paths: list, out_file: pathlib.Path, side_paths: list = None, chunk_bytes: int = 64 << 20) -> int:
     """Concatenate parquet files with identical schemas into one file without re-encoding.
 
-    Row groups are copied byte for byte; only footer offsets are shifted. Files with page
-    indexes, bloom filters or encryption are refused since those hold absolute offsets.
+    Row groups are copied byte for byte; only footer offsets are shifted. Files with bloom
+    filters or encryption are refused since those hold absolute offsets. A page index is
+    left out of the result.
+
+    side_paths gives one more parquet file per input file, holding extra columns for the
+    same rows in the same row groups. Each side row group is copied right after its main
+    row group and its columns are appended to that row group, so the output has the main
+    columns followed by the side columns.
     Returns the total row count.
     """
-    first_schema = first_kv = None
+    if side_paths is not None and len(side_paths) != len(paths):
+        raise ValueError(f'{len(side_paths)} side files for {len(paths)} files')
+    first_meta = first_schema = first_kv = None
+    first_side_meta = first_side_schema = first_side_kv = None
     row_groups = []
+    segments = []  # [path, offset, length], merged when contiguous
     total_rows = 0
     pos = 4
-    plan = []
-    for p in paths:
-        size, start, meta = _read_footer(p)
+
+    def take(p, rg, span):
+        nonlocal pos
+        start, end = span
+        _relocate_row_group(rg, pos - start, p)
+        if segments and segments[-1][0] == p and segments[-1][1] + segments[-1][2] == start:
+            segments[-1][2] += end - start
+        else:
+            segments.append([p, start, end - start])
+        pos += end - start
+
+    for i, p in enumerate(paths):
+        _, start, meta = _read_footer(p)
         schema, kv = _field(meta, 2), _field(meta, 5)
         if first_schema is None:
             first_meta, first_schema, first_kv = meta, schema, kv
@@ -296,46 +450,57 @@ def concat_parquet_files(paths: list, out_file: pathlib.Path, chunk_bytes: int =
             raise ValueError(f'{p}: schema differs from {paths[0]}')
         if _field(meta, 8) is not None:
             raise ValueError(f'{p}: encrypted parquet not supported')
-        delta = pos - 4
-        rgs = _field(meta, 4)
-        for rg in (rgs[2][1] if rgs else []):
-            for cc in _field(rg, 1)[2][1]:
-                for fid in (1, 4, 6, 8, 9):
-                    if _field(cc, fid) is not None:
-                        raise ValueError(f'{p}: column chunk field {fid} (path/page index/crypto) not supported')
-                # Deprecated ColumnChunk.file_offset; Arrow writes 0, keep 0 as is.
-                if _field(cc, 2) is not None and _field(cc, 2)[2]:
-                    _shift(cc, 2, delta)
-                md = _field(cc, 3)[2]
-                if _field(md, 14) is not None:
-                    raise ValueError(f'{p}: bloom filters not supported')
-                for fid in (9, 10, 11):
-                    _shift(md, fid, delta)
-            _shift(rg, 5, delta)
+        groups, spans = _row_groups(meta), _row_group_spans(meta, start, p)
+        side_groups = side_spans = sp = None
+        if side_paths is not None:
+            sp = side_paths[i]
+            _, side_start, side_meta = _read_footer(sp)
+            side_schema, side_kv = _field(side_meta, 2), _field(side_meta, 5)
+            if first_side_schema is None:
+                first_side_meta, first_side_schema, first_side_kv = side_meta, side_schema, side_kv
+            elif side_schema != first_side_schema or side_kv != first_side_kv:
+                raise ValueError(f'{sp}: schema differs from {side_paths[0]}')
+            if _field(side_meta, 8) is not None:
+                raise ValueError(f'{sp}: encrypted parquet not supported')
+            side_groups, side_spans = _row_groups(side_meta), _row_group_spans(side_meta, side_start, sp)
+            if [_field(rg, 3)[2] for rg in side_groups] != [_field(rg, 3)[2] for rg in groups]:
+                raise ValueError(f'{sp}: row groups do not match {p}')
+        for k, rg in enumerate(groups):
+            take(p, rg, spans[k])
+            if side_groups is not None:
+                side_rg = side_groups[k]
+                take(sp, side_rg, side_spans[k])
+                _field(rg, 1)[2][1].extend(_field(side_rg, 1)[2][1])
+                _field(rg, 2)[2] += _field(side_rg, 2)[2]
+                compressed, side_compressed = _field(rg, 6), _field(side_rg, 6)
+                if (compressed is None) != (side_compressed is None):
+                    raise ValueError(f'{sp}: total_compressed_size present in only one of the files')
+                if compressed is not None:
+                    compressed[2] += side_compressed[2]
             ordinal = _field(rg, 7)
             if ordinal is not None:
                 ordinal[2] = len(row_groups)
             row_groups.append(rg)
         total_rows += _field(meta, 3)[2]
-        plan.append((p, start))
-        pos += start - 4
 
-    meta = [list(f) for f in first_meta]
-    _field(meta, 3)[2] = total_rows
-    rg_field = _field(meta, 4)
-    if rg_field is None:
+    # Deep copy: the schema and key/value fields are edited below when side columns are added.
+    meta = copy.deepcopy([f for f in first_meta if f[0] != 4])
+    rg_at = next((i for i, f in enumerate(first_meta) if f[0] == 4), None)
+    if rg_at is None:
         raise ValueError(f'{paths[0]}: no row_groups field')
-    rg_field[2] = (_T_STRUCT, row_groups)
+    meta.insert(rg_at, [4, _T_LIST, (_T_STRUCT, row_groups)])
+    _field(meta, 3)[2] = total_rows
+    if side_paths is not None:
+        _append_side_schema(meta, first_side_meta, side_paths[0])
     w = _ThriftWriter()
     w.struct(meta)
     footer = bytes(w.out)
 
     with open(out_file, 'wb') as out:
         out.write(b'PAR1')
-        for p, start in plan:
+        for p, offset, left in segments:
             with open(p, 'rb') as f:
-                f.seek(4)
-                left = start - 4
+                f.seek(offset)
                 while left:
                     buf = f.read(min(chunk_bytes, left))
                     if not buf:
@@ -349,7 +514,7 @@ def concat_parquet_files(paths: list, out_file: pathlib.Path, chunk_bytes: int =
 
 
 # ---------------------------------------------------------------------------
-# Club per-year cache
+# Block cache: one shard per block of sessions
 # ---------------------------------------------------------------------------
 
 def _sha(*parts) -> str:
@@ -362,7 +527,7 @@ def _sha(*parts) -> str:
 
 
 def _code_fingerprint() -> str:
-    """Hash of the code that shapes a year's output, plus library versions."""
+    """Hash of the code that shapes a block's output, plus library versions."""
     import mlBridge.mlBridgeLib as mlBridgeLib
     import numpy
     parts = []
@@ -372,6 +537,7 @@ def _code_fingerprint() -> str:
     parts.append(inspect.getsource(drop_out_of_range_pct))
     parts += [pl.__version__, pyarrow.__version__, numpy.__version__]
     parts += [JOIN_KEYS, ROW_GROUP_SIZE, COMPRESSION, CACHE_VERSION]
+    parts += [SESSION_BLOCK, TOURNAMENT_BLOCK_KEY, BLOCK_SORT_KEYS, RATING_COLS, RATING_INPUT_COLS]
     return _sha(*parts)
 
 
@@ -401,16 +567,60 @@ def _hrs_row_hashes(hrs_file: pathlib.Path, chunk_rows: int = 500_000) -> pl.Dat
     return pl.concat(parts).with_row_index('_rn')
 
 
-def _year_fingerprint(common: str, part_brs_df: pl.DataFrame, hrs_hashes: pl.DataFrame) -> str:
-    keys = part_brs_df.select(JOIN_KEYS).unique()
-    hrs_part = hrs_hashes.join(keys, on=JOIN_KEYS, how='semi').sort('_rn')
+def _block_starts(session_ids: pl.Series) -> list:
+    """First session id of every block that holds at least one of these sessions, ascending."""
+    return (session_ids // SESSION_BLOCK * SESSION_BLOCK).unique().sort().to_list()
+
+
+def _slice_bounds(sorted_ids: pl.Series, lo: int, hi: int) -> tuple:
+    """(offset, length) of the rows with lo <= id < hi in an ascending series."""
+    a = int(sorted_ids.search_sorted(lo, side='left'))
+    b = int(sorted_ids.search_sorted(hi, side='left'))
+    return a, b - a
+
+
+def _club_blocks(brs_ids: pl.Series, hrs_ids: pl.Series) -> list:
+    """[(block key, step1 slice, hand records slice)] for ascending integer session ids."""
+    return [(lo, _slice_bounds(brs_ids, lo, lo + SESSION_BLOCK), _slice_bounds(hrs_ids, lo, lo + SESSION_BLOCK))
+            for lo in _block_starts(brs_ids)]
+
+
+def _tournament_block_keys(session_ids: pl.Series) -> pl.Series:
+    return session_ids.str.extract(TOURNAMENT_BLOCK_KEY, 1).fill_null(session_ids.str.slice(0, 4))
+
+
+def _key_runs(keys: pl.Series) -> list:
+    """[(key, (offset, length))] in order of appearance; every key's rows must be adjacent."""
+    runs = (pl.DataFrame({'_k': keys}).with_row_index('_at')
+            .group_by('_k', maintain_order=True)
+            .agg(pl.col('_at').first().alias('_first'), pl.col('_at').last().alias('_last'), pl.len().alias('_n')))
+    split = runs.filter(pl.col('_last') - pl.col('_first') + 1 != pl.col('_n'))
+    if split.height:
+        raise RuntimeError(f"rows of block {split['_k'][0]!r} are not adjacent: the session ids are not sorted")
+    return [(k, (int(first), int(n))) for k, first, _, n in runs.iter_rows()]
+
+
+def _tournament_blocks(brs_ids: pl.Series, hrs_ids: pl.Series) -> list:
+    """[(block key, step1 slice, hand records slice)] for string session ids, both sorted.
+
+    A block with no hand records gets an empty slice.
+    """
+    hrs_runs = dict(_key_runs(_tournament_block_keys(hrs_ids)))
+    return [(key, brs_at, hrs_runs.get(key, (0, 0))) for key, brs_at in _key_runs(_tournament_block_keys(brs_ids))]
+
+
+def _block_fingerprint(common: str, part_brs_df: pl.DataFrame, hrs_row_hashes: pl.Series) -> str:
+    """Covers the block's step1 rows and its hand records, both in file order.
+
+    Row positions in the hand records file are left out, so sessions added to an
+    earlier block do not change this one.
+    """
     return _sha(
         common,
         part_brs_df.height,
         _hash_series_bytes(part_brs_df.hash_rows(seed=0)),
-        hrs_part.height,
-        _hash_series_bytes(hrs_part['_rn']),
-        _hash_series_bytes(hrs_part['_h']),
+        hrs_row_hashes.len(),
+        _hash_series_bytes(hrs_row_hashes),
     )
 
 
@@ -424,11 +634,11 @@ def _load_manifest(path: pathlib.Path) -> dict:
     try:
         m = json.loads(path.read_text(encoding='utf-8'))
         if m.get('version') == CACHE_VERSION:
-            m.setdefault('years', {})
+            m.setdefault('blocks', {})
             return m
     except (OSError, ValueError):
         pass
-    return {'version': CACHE_VERSION, 'years': {}}
+    return {'version': CACHE_VERSION, 'blocks': {}}
 
 
 def _num_rows(path: pathlib.Path) -> int:
@@ -444,38 +654,43 @@ def _shard_ok(entry: dict, cache_dir: pathlib.Path, fingerprint: str) -> bool:
         return True
     try:
         p = cache_dir / entry['file']
-        return _num_rows(p) == entry['rows'] and p.stat().st_size == entry['size']
+        return (_num_rows(p) == entry['rows'] and p.stat().st_size == entry['size']
+                and _num_rows(cache_dir / entry['inputs']) == entry['rows'])
     except (OSError, KeyError, TypeError, ValueError, pyarrow.ArrowException):
         return False
 
 
-def _augment_club_year(part_brs_df: pl.DataFrame, hrs_df: pl.DataFrame, y, sd_lead=None) -> pl.DataFrame:
-    """Same steps as before the cache was added; returns None if the join is empty."""
-    part_brs_df = part_brs_df.join(hrs_df, left_on=JOIN_KEYS, right_on=JOIN_KEYS, how='inner')
-    print(part_brs_df)
-    #assert part_brs_df.select('^.*_right$').is_empty(), part_brs_df.select('^.*_right$')
+def _augment_block(side: str, part_brs_df: pl.DataFrame, hrs_df: pl.DataFrame, label: str, sd_lead=None) -> pl.DataFrame:
+    """Join one block of step1 rows to its hand records and augment; returns None if the join is empty.
+
+    Rows keep the order of part_brs_df. The result still holds RATING_COLS as averages
+    over this block only; the caller leaves them out of the shard.
+    """
+    part_brs_df = part_brs_df.join(hrs_df, left_on=JOIN_KEYS, right_on=JOIN_KEYS, how='inner', maintain_order='left')
+    if side == 'tournament':
+        # todo: club has 'section_name_right'; see TODO 1 at the top.
+        assert part_brs_df.select('^.*_right$').is_empty(), part_brs_df.select('^.*_right$')
     if part_brs_df.is_empty():
         return None
     part_brs_df = mlBridgeAugmentLib.AllBoardResultsAugmentations(part_brs_df, sd_lead=sd_lead).perform_all_board_results_augmentations()
     if sd_lead is not None:
-        sd_lead.flush()  # keep solved positions even if a later year fails
+        sd_lead.flush()  # keep solved positions even if a later block fails
     non_object_columns = [col for col, dtype in zip(part_brs_df.columns, part_brs_df.dtypes) if dtype != pl.Object]
     part_brs_df = part_brs_df.select(non_object_columns)
-    part_brs_df = drop_out_of_range_pct(part_brs_df, f"club year {y}")
-    _validate_percentage_columns(part_brs_df, f"club year {y}")
-    print(part_brs_df)
+    if side == 'club':
+        part_brs_df = drop_out_of_range_pct(part_brs_df, label)
+    _validate_percentage_columns(part_brs_df, label)
     return part_brs_df
 
 
 def _write_shard(df: pl.DataFrame, path: pathlib.Path):
-    """Write with the final file's settings; temp file + rename so a crash leaves no half shard."""
+    """Write with the final file's settings; temp file + rename so a crash leaves no half shard.
+
+    Polars encodes the columns in parallel. PyArrow encodes them one after another: on
+    2026-11-13 one 512,000-row group of 6,804 columns took 261 s with PyArrow and 5 s with Polars.
+    """
     tmp = path.with_name(path.name + '.tmp')
-    arrow_table = df.to_arrow()
-    writer = pq.ParquetWriter(tmp, arrow_table.schema, compression=COMPRESSION)
-    try:
-        writer.write_table(arrow_table, row_group_size=ROW_GROUP_SIZE)
-    finally:
-        writer.close()
+    df.write_parquet(tmp, compression=COMPRESSION, row_group_size=ROW_GROUP_SIZE)
     os.replace(tmp, path)
 
 
@@ -483,85 +698,143 @@ def _sd_lead_fingerprint(sd_lead) -> str:
     return 'sd_lead=off' if sd_lead is None else f'sd_lead={sd_lead.samples}:{sd_lead.mode}'
 
 
-def _augment_club_by_year(brs_df: pl.DataFrame, hrs_file: pathlib.Path, out_file: pathlib.Path, rebuild_all: bool, sd_lead=None):
-    cache_dir = out_file.with_name(out_file.stem + '_years')
+def _block_name(key) -> str:
+    """File name stem of a block: club keys are first session ids, tournament keys are id prefixes."""
+    return f'block_{key:08d}' if isinstance(key, int) else f'block_{key}'
+
+
+def _block_label(side: str, key) -> str:
+    if side == 'club':
+        return f"club sessions {key}-{key + SESSION_BLOCK - 1}"
+    return f"tournament sessions {key}"
+
+
+def _write_rating_files(cache_dir: pathlib.Path, entries: list) -> list:
+    """Compute RATING_COLS over all blocks and write them as one side file per shard.
+
+    entries are the manifest entries of the shards, in final file order. Each side file
+    holds its shard's rows in its shard's row groups, as concat_parquet_files needs.
+    The averages are over the rows kept in the shards, so rows removed by
+    drop_out_of_range_pct do not count.
+    """
+    inputs = pl.concat([pl.read_parquet(cache_dir / e['inputs']) for e in entries])
+    ratings = mlBridgeAugmentLib.add_player_ratings(inputs).select(RATING_COLS)
+    del inputs
+    side_files = []
+    offset = 0
+    for e in entries:
+        with open(cache_dir / e['file'], 'rb') as f:
+            md = pq.ParquetFile(f).metadata
+            group_rows = [md.row_group(i).num_rows for i in range(md.num_row_groups)]
+        table = ratings.slice(offset, e['rows']).to_arrow()
+        assert sum(group_rows) == table.num_rows == e['rows'], f"{e['file']}: {sum(group_rows)} rows in file, {table.num_rows} ratings, {e['rows']} in manifest"
+        path = cache_dir / e['file'].replace('.parquet', '.ratings.parquet')
+        tmp = path.with_name(path.name + '.tmp')
+        writer = pq.ParquetWriter(tmp, table.schema, compression=COMPRESSION)
+        try:
+            at = 0
+            for n in group_rows:
+                writer.write_table(table.slice(at, n), row_group_size=n)
+                at += n
+        finally:
+            writer.close()
+        os.replace(tmp, path)
+        side_files.append(path)
+        offset += e['rows']
+    return side_files
+
+
+def _augment_by_block(side: str, brs_df: pl.DataFrame, hrs_file: pathlib.Path, out_file: pathlib.Path, rebuild_all: bool, sd_lead=None):
+    cache_dir = out_file.with_name(out_file.stem + '_blocks')
     cache_dir.mkdir(parents=True, exist_ok=True)
     manifest_file = cache_dir / 'manifest.json'
     manifest = _load_manifest(manifest_file)
 
-    years = (
-        brs_df
-        .select(pl.col('Date').dt.year().alias('year'))
-        .drop_nulls()
-        .unique()
-        .sort('year')
-        .to_series()
-        .to_list()
-    )
-    print(f"processing years: {years}")
+    # Session order makes every block one slice of step1, and gives the final file its row order.
+    t = time.time()
+    brs_df = brs_df.sort([c for c in BLOCK_SORT_KEYS if c in brs_df.columns], maintain_order=True)
+    brs_ids = brs_df['session_id']
+    print(f"sorted {len(brs_df)} step1 rows in {time.time()-t:.1f}s")
 
     t = time.time()
     hrs_schema = pl.read_parquet_schema(hrs_file)
-    # Turning the SD lead score on or off (or changing its samples) recomputes every year.
+    # Turning the SD lead score on or off (or changing its samples) recomputes every block.
     common = _sha(_code_fingerprint(), _schema_str(brs_df.schema), _schema_str(hrs_schema), _sd_lead_fingerprint(sd_lead))
-    hrs_hashes = _hrs_row_hashes(hrs_file)
-    print(f"hashed {len(hrs_hashes)} hand records in {time.time()-t:.1f}s")
+    if side == 'club':
+        # Too big to hold: hashed in slices here, read one block at a time below.
+        all_hrs_df = None
+        hrs_hashes = _hrs_row_hashes(hrs_file)
+        if not hrs_hashes['session_id'].is_sorted():
+            raise RuntimeError(
+                f"{hrs_file.name} is not in session_id order, so a block's hand records cannot be read on their own. "
+                "Rerun acbl_sql_to_hand_records_clean.py (step 2a), then acbl_hand_records_augment.py (step 3a).")
+        blocks = _club_blocks(brs_ids, hrs_hashes['session_id'])
+    else:
+        # About 2M rows, not in session order in the file: held in memory, sorted here.
+        # The join keys are unique, so the order (and each block's fingerprint) does not
+        # depend on the file's row order.
+        all_hrs_df = pl.read_parquet(hrs_file).sort(JOIN_KEYS)
+        hrs_hashes = all_hrs_df.select(JOIN_KEYS).with_columns(all_hrs_df.hash_rows(seed=0).alias('_h'))
+        blocks = _tournament_blocks(brs_ids, hrs_hashes['session_id'])
+    print(f"hashed {len(hrs_hashes)} hand records in {time.time()-t:.1f}s; {len(blocks)} blocks")
 
-    # Fingerprint every year and decide which ones to recompute.
+    # Fingerprint every block and decide which ones to recompute.
+    t = time.time()
     plan = []
-    for y in years:
-        t = time.time()
-        part_brs_df = brs_df.filter(pl.col('Date').dt.year() == y)
-        fp = _year_fingerprint(common, part_brs_df, hrs_hashes)
-        skip = not rebuild_all and _shard_ok(manifest['years'].get(str(y)), cache_dir, fp)
-        plan.append((y, fp, skip))
-        print(f"year {y}: {'unchanged, reuse shard' if skip else 'changed, recompute'} (fingerprint {time.time()-t:.1f}s)")
-    del hrs_hashes
+    for lo, brs_at, hrs_at in blocks:
+        fp = _block_fingerprint(common, brs_df.slice(*brs_at), hrs_hashes['_h'].slice(*hrs_at))
+        skip = not rebuild_all and _shard_ok(manifest['blocks'].get(str(lo)), cache_dir, fp)
+        plan.append((lo, fp, skip, brs_at, hrs_at))
+    del hrs_hashes, blocks
+    todo = sum(not skip for _, _, skip, _, _ in plan)
+    print(f"{len(plan) - todo} blocks unchanged, {todo} to recompute (fingerprints {time.time()-t:.1f}s)")
 
-    hrs_df = None
-    if not all(skip for _, _, skip in plan):
-        hrs_df = pl.read_parquet(hrs_file)
-        print(f"Loaded {hrs_file.name}: shape:{hrs_df.shape}, size:{hrs_file.stat().st_size}")
-        print(hrs_df)
-        print(set(brs_df.columns).intersection(set(hrs_df.columns)))
-
-    for y, fp, skip in plan:
+    hrs_lf = pl.scan_parquet(hrs_file)
+    for n, (lo, fp, skip, brs_at, hrs_at) in enumerate(plan, 1):
         if skip:
-            print(f"year {y}: skipped, {manifest['years'][str(y)]['rows']} rows from cache")
             continue
         t = time.time()
-        part_brs_df = brs_df.filter(pl.col('Date').dt.year() == y) # or group_by()?
-        print(f"\nProcessing year {y}: part_brs_df shape:{part_brs_df.shape}")
-        part_brs_df = _augment_club_year(part_brs_df, hrs_df, y, sd_lead)
-        shard_name = f'year_{y}.parquet'
+        label = _block_label(side, lo)
+        part_brs_df = brs_df.slice(*brs_at)
+        hrs_df = hrs_lf.slice(*hrs_at).collect() if all_hrs_df is None else all_hrs_df.slice(*hrs_at)
+        print(f"\nBlock {n} of {len(plan)}, {label}: {part_brs_df.height} step1 rows, {hrs_df.height} hand records")
+        part_brs_df = _augment_block(side, part_brs_df, hrs_df, label, sd_lead)
+        del hrs_df
+        shard_name = f'{_block_name(lo)}.parquet'
+        inputs_name = f'{_block_name(lo)}.ratings_in.parquet'
         if part_brs_df is None:
-            print(f"No data for year {y}")
+            print(f"No data for {label}")
             (cache_dir / shard_name).unlink(missing_ok=True)
+            (cache_dir / inputs_name).unlink(missing_ok=True)
             entry = {'fingerprint': fp, 'rows': 0, 'file': None}
         else:
+            _write_shard(part_brs_df.select(RATING_INPUT_COLS), cache_dir / inputs_name)
+            part_brs_df = part_brs_df.drop(RATING_COLS)
             _write_shard(part_brs_df, cache_dir / shard_name)
-            entry = {'fingerprint': fp, 'rows': len(part_brs_df), 'file': shard_name,
+            entry = {'fingerprint': fp, 'rows': len(part_brs_df), 'file': shard_name, 'inputs': inputs_name,
                      'size': (cache_dir / shard_name).stat().st_size, 'columns': len(part_brs_df.columns)}
         entry['seconds'] = round(time.time() - t, 1)
-        manifest['years'][str(y)] = entry
+        manifest['blocks'][str(lo)] = entry
         _write_json_atomic(manifest, manifest_file)
-        print(f"year {y}: recomputed, {entry['rows']} rows, elapsed time in seconds: {time.time()-t}")
+        print(f"block {lo}: recomputed, {entry['rows']} rows, elapsed time in seconds: {time.time()-t:.1f}")
         part_brs_df = None
-    del hrs_df
+    del brs_df, all_hrs_df
 
-    # Forget years that no longer exist in step1.
-    for key in [k for k in manifest['years'] if int(k) not in years]:
-        stale = manifest['years'].pop(key)
-        if stale.get('file'):
-            (cache_dir / stale['file']).unlink(missing_ok=True)
-        print(f"year {key}: no longer in step1, dropped from cache")
+    # Forget blocks that no longer exist in step1.
+    current = {str(lo) for lo, _, _, _, _ in plan}
+    for key in [k for k in manifest['blocks'] if k not in current]:
+        stale = manifest['blocks'].pop(key)
+        for suffix in ('.parquet', '.ratings_in.parquet', '.ratings.parquet'):
+            (cache_dir / f"{_block_name(int(key) if side == 'club' else key)}{suffix}").unlink(missing_ok=True)
+        print(f"block {key}: no longer in step1, dropped from cache ({stale.get('rows')} rows)")
     _write_json_atomic(manifest, manifest_file)
 
-    shards = [cache_dir / manifest['years'][str(y)]['file'] for y, _, _ in plan if manifest['years'][str(y)]['file']]
-    if not shards:
+    entries = [manifest['blocks'][str(lo)] for lo, _, _, _, _ in plan if manifest['blocks'][str(lo)]['file']]
+    if not entries:
         return
+    shards = [cache_dir / e['file'] for e in entries]
 
-    # Columns must not change across years.
+    # Columns must not change across blocks.
     prev_columns = None
     for p in shards:
         with open(p, 'rb') as f:
@@ -571,7 +844,7 @@ def _augment_club_by_year(brs_df: pl.DataFrame, hrs_file: pathlib.Path, out_file
         assert columns == prev_columns, f"columns changed from {prev_columns} to {columns} in {p.name}"
 
     # Assemble the final file, unless it already matches these shards.
-    assembled_fp = _sha(*[f'{y}:{fp}' for y, fp, _ in plan])
+    assembled_fp = _sha(*[f'{lo}:{fp}' for lo, fp, _, _, _ in plan])
     prev = manifest.get('assembled') or {}
     try:
         st = out_file.stat()
@@ -580,16 +853,21 @@ def _augment_club_by_year(brs_df: pl.DataFrame, hrs_file: pathlib.Path, out_file
     except OSError:
         up_to_date = False
     if up_to_date and not rebuild_all:
-        print(f"{out_file.name} already matches the year shards, not rewritten")
+        print(f"{out_file.name} already matches the block shards, not rewritten")
         return
+
+    # The ratings average over every block, so they are rewritten whenever any block changed.
+    t = time.time()
+    side_files = _write_rating_files(cache_dir, entries)
+    print(f"player ratings over {sum(e['rows'] for e in entries)} rows written in {time.time()-t:.1f}s")
 
     t = time.time()
     tmp = out_file.with_name(out_file.name + '.tmp')
     try:
-        total_rows = concat_parquet_files(shards, tmp)
-        # Cheap read check: decode one column across all row groups.
+        total_rows = concat_parquet_files(shards, tmp, side_paths=side_files)
+        # Cheap read check: decode one shard column and the rating columns across all row groups.
         with open(tmp, 'rb') as f:
-            assert pq.ParquetFile(f).read(columns=[prev_columns[0]]).num_rows == total_rows
+            assert pq.ParquetFile(f).read(columns=[prev_columns[0]] + RATING_COLS).num_rows == total_rows
         os.replace(tmp, out_file)
     finally:
         tmp.unlink(missing_ok=True)
@@ -648,32 +926,11 @@ def augment_board_results_step2(club_or_tournament, data_path=None, recent_path=
     acbl_board_results_augmented_filename = f'acbl_{club_or_tournament}_board_results_augmented.parquet'
     acbl_board_results_augmented_file = data_path.joinpath(acbl_board_results_augmented_filename)
 
-    if club_or_tournament == 'club':
-        #hrs_df = hrs_df.with_columns(pl.col('hand_record_id').cast(pl.Int64)) # todo: temp until previous step is corrected. issue is 'SHUFFLE' in hand_record_id for session.
-        # Hand records are loaded inside, and only when some year must be recomputed.
-        _augment_club_by_year(brs_df, acbl_hand_records_augmented_file, acbl_board_results_augmented_file, rebuild_all, sd_lead)
-    elif club_or_tournament == 'tournament':
-        hrs_df = pl.read_parquet(acbl_hand_records_augmented_file)
-        print(f"Loaded {acbl_hand_records_augmented_filename}: shape:{hrs_df.shape}, size:{acbl_hand_records_augmented_file.stat().st_size}")
-        print(hrs_df)
-
-        print(set(brs_df.columns).intersection(set(hrs_df.columns)))
-
-        brs_df = brs_df.join(hrs_df, on=['hand_record_id','session_id','Board'], how='inner')
-        assert brs_df.select('^.*_right$').is_empty(), brs_df.select('^.*_right$')
-        if brs_df.is_empty():
-            print("No data to process.")
-        else:
-            brs_df = mlBridgeAugmentLib.AllBoardResultsAugmentations(brs_df, sd_lead=sd_lead).perform_all_board_results_augmentations()
-            if sd_lead is not None:
-                sd_lead.flush()
-            non_object_columns = [col for col, dtype in zip(brs_df.columns, brs_df.dtypes) if dtype != pl.Object]
-            brs_df = brs_df.select(non_object_columns)
-            _validate_percentage_columns(brs_df, "tournament")
-            brs_df.write_parquet(acbl_board_results_augmented_file)
-            print(f"Saved {acbl_board_results_augmented_filename}: shape:{brs_df.shape}, size:{acbl_board_results_augmented_file.stat().st_size}")
-    else:
+    if club_or_tournament not in ('club', 'tournament'):
         raise ValueError(f"Invalid club_or_tournament: {club_or_tournament}")
+    #hrs_df = hrs_df.with_columns(pl.col('hand_record_id').cast(pl.Int64)) # todo: temp until previous step is corrected. issue is 'SHUFFLE' in hand_record_id for session.
+    # Hand records are read inside: club one block of sessions at a time, tournament once.
+    _augment_by_block(club_or_tournament, brs_df, acbl_hand_records_augmented_file, acbl_board_results_augmented_file, rebuild_all, sd_lead)
 
     if club_or_tournament == "club":
         from acbl_recent_update import augmented_max_date, prune_recent
@@ -692,7 +949,7 @@ def _parse_club_tournament_args():
     parser = argparse.ArgumentParser(description="Augment ACBL board results (step 2).")
     parser.add_argument("--club", action="store_true", help="Process club data only")
     parser.add_argument("--tournament", action="store_true", help="Process tournament data only")
-    parser.add_argument("--rebuild-all", action="store_true", help="Club: recompute every year, ignoring the year cache")
+    parser.add_argument("--rebuild-all", action="store_true", help="Recompute every block of sessions, ignoring the cache")
     parser.add_argument("--sd-lead-samples", type=int, default=0,
                         help="Add the single-dummy lead score with this many layouts per lead (0 = off; 20 recommended). "
                              "First club run: about 33 h at 20.")

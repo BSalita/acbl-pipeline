@@ -335,6 +335,31 @@ def get_club_hand_records_schemas():
     return sql_selects_d, schema_d
 
 
+def drop_repeated_hand_records(hrs_df: pl.DataFrame) -> pl.DataFrame:
+    """Keep one copy of rows that are identical in every column.
+
+    On 2026-11-14 the club file held 24,757 such extra rows: 7,906 boards in 376 sessions
+    listed 2 to 10 times. Step 3c joins board results to hand records on session and
+    board, so each copy repeated every result on that board (57,133 extra rows in the
+    step 3c output, and their matchpoints were computed over the repeated field).
+    """
+    out = hrs_df.unique(maintain_order=True)
+    print(f"Dropped {hrs_df.height - out.height} repeated hand record rows")
+    return out
+
+
+def sort_by_session(hrs_df: pl.DataFrame) -> pl.DataFrame:
+    """Order hand records by session_id, then Board, then every other column.
+
+    Step 3a keeps this row order in the augmented file, so step 3c can read one range of
+    session ids without loading the rest. The remaining columns break ties: some rows share
+    a session and board, and the tables are read without an ORDER BY, so only a sort on
+    every column gives the same file on every run.
+    """
+    first = ['session_id', 'Board']
+    return hrs_df.sort(first + [c for c in hrs_df.columns if c not in first])
+
+
 def club_hand_records_clean():
 
     sql_selects_d, schema_d = get_club_hand_records_schemas()
@@ -364,7 +389,8 @@ def club_hand_records_clean():
     acbl_hand_records_cleaned_filename = f'acbl_club_hand_records_cleaned.parquet'
     acbl_hand_records_cleaned_file = acblPath.joinpath(acbl_hand_records_cleaned_filename)
     non_object_columns = [col for col, dtype in zip(hrs_df.columns, hrs_df.dtypes) if dtype != pl.Object] # drop object columns e.g. Hands, Par, DDmakes
-    filtered_hrs_df = hrs_df.select(non_object_columns)
+    filtered_hrs_df = drop_repeated_hand_records(hrs_df.select(non_object_columns))
+    filtered_hrs_df = sort_by_session(filtered_hrs_df)
     filtered_hrs_df.write_parquet(acbl_hand_records_cleaned_file)
     print(f"Saved {acbl_hand_records_cleaned_filename}: shape:{filtered_hrs_df.shape}, size:{acbl_hand_records_cleaned_file.stat().st_size}")
 

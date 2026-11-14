@@ -27,3 +27,6 @@ club-results-recent/
 
 # Retired scripts (pre-version-control archive)
 old/
+
+# Scratch runner, edited per run; kept local
+t.bat

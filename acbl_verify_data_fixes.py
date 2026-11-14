@@ -25,6 +25,11 @@ import polars as pl
 from tqdm import tqdm
 
 DOUBLED_SHARE_RANGE = (0.025, 0.08)  # ACBL tournament data runs about 4.2%.
+# The club "Result present" limit counts contracts from this date on. ACBL gives no result
+# for 3.2% of 2019 and 11.9% of 2020 club contracts (measured 2026-11-14), which put the
+# step1 file at 1.63% over all years; from 2021 on it is 0.06%. A conversion that loses
+# results would still show up in the later years.
+RESULT_REQUIRED_FROM = datetime.date(2021, 1, 1)
 SEATS = "NESW"
 
 
@@ -74,11 +79,14 @@ def check_board_results(path: pathlib.Path, *, club: bool) -> list[Check]:
         return checks
     zero_declarer = _zero_id("Declarer_ID").sum() if "Declarer_ID" in schema else pl.lit(0)
     played = pl.col("BidLvl").is_not_null() & (pl.col("BidLvl") > 0)
+    recent = played & (pl.col("Date") >= RESULT_REQUIRED_FROM) if "Date" in schema else played
     stats = _collect(
         _scan(path).select(
             contracts=played.sum(),
             doubled=(played & (pl.col("Dbl").fill_null("") != "")).sum(),
             result_null=(played & pl.col("Result").is_null()).sum(),
+            recent_contracts=recent.sum(),
+            recent_result_null=(recent & pl.col("Result").is_null()).sum(),
             result_mismatch=(
                 played
                 & pl.col("Result").is_not_null()
@@ -107,11 +115,12 @@ def check_board_results(path: pathlib.Path, *, club: bool) -> list[Check]:
         f"{stats['result_mismatch']:,} mismatches",
     ))
     if club:
-        null_share = stats["result_null"] / max(stats["contracts"], 1)
+        null_share = stats["recent_result_null"] / max(stats["recent_contracts"], 1)
+        all_share = stats["result_null"] / max(stats["contracts"], 1)
         checks.append(Check(
-            f"{path.name}: Result present for played contracts (< 1% null)",
+            f"{path.name}: Result present for played contracts from {RESULT_REQUIRED_FROM.year} on (< 1% null)",
             null_share < 0.01,
-            f"{stats['result_null']:,} null ({null_share:.2%})",
+            f"{stats['recent_result_null']:,} null ({null_share:.2%}); all years {stats['result_null']:,} ({all_share:.2%})",
         ))
     zeros = sum(stats[f"zero_{s}"] for s in SEATS) + stats["zero_declarer"]
     nulls = sum(stats[f"null_{s}"] for s in SEATS)

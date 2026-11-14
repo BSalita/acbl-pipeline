@@ -2,7 +2,7 @@ import unittest
 
 import polars as pl
 
-from acbl_board_results_augment_step1 import normalize_contracts, typed_club_results
+from acbl_board_results_augment_step1 import normalize_contracts, tricks_as_total, typed_club_results
 
 
 class NormalizeContractsTests(unittest.TestCase):
@@ -35,6 +35,38 @@ class TypedClubResultsTests(unittest.TestCase):
         self.assertEqual(out["Tricks"].to_list(), [10, 9, 8, None, None])
         self.assertEqual(out.schema["Result"], pl.Int8)
         self.assertEqual(out.schema["Tricks"], pl.UInt8)
+
+    def test_impossible_values_null_both_columns(self) -> None:
+        # Rows seen in the 2026-11 club data, then the valid extremes.
+        frame = pl.DataFrame(
+            {
+                "result": ["127", "107", "+6", None, "300", "-13", "+6", "="],
+                "tricks_taken": ["136", "116", "17", "206", "9", "0", "13", "7"],
+            }
+        )
+        out = typed_club_results(frame)
+        self.assertEqual(out["Result"].to_list(), [None, None, None, None, None, -13, 6, 0])
+        self.assertEqual(out["Tricks"].to_list(), [None, None, None, None, 9, 0, 13, 7])
+        self.assertEqual(out.schema["Result"], pl.Int8)
+        self.assertEqual(out.schema["Tricks"], pl.UInt8)
+
+
+class TricksAsTotalTests(unittest.TestCase):
+    def test_over_book_tricks_get_six_added_and_unexplained_pairs_are_nulled(self) -> None:
+        frame = pl.DataFrame(
+            {
+                # total tricks; over book (3N=, 1N+1, 3N-1); fits neither; pass; missing values
+                "BidLvl": pl.Series([3, 3, 1, 3, 4, 0, 2, 2], dtype=pl.UInt8),
+                "Result": pl.Series([0, 0, 1, -1, 1, None, None, 1], dtype=pl.Int8),
+                "Tricks": pl.Series([9, 3, 2, 2, 8, None, 8, None], dtype=pl.UInt8),
+            }
+        )
+        out = tricks_as_total(frame)
+        self.assertEqual(out["Tricks"].to_list(), [9, 9, 8, 8, None, None, 8, None])
+        self.assertEqual(out["Result"].to_list(), [0, 0, 1, -1, None, None, None, 1])
+        self.assertEqual(out.schema["Result"], pl.Int8)
+        self.assertEqual(out.schema["Tricks"], pl.UInt8)
+        self.assertEqual(out.columns, frame.columns)
 
 
 class PostmortemFrameTests(unittest.TestCase):

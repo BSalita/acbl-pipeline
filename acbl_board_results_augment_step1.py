@@ -80,12 +80,41 @@ def typed_club_results(brs_df: pl.DataFrame) -> pl.DataFrame:
 
     ACBL's values are authoritative, so augmentation must not re-derive them from Score_NS.
     The raw 'result' must not survive: DuckDB is case-insensitive and would resolve 'Result' to it.
+
+    A few ACBL rows hold impossible values (3D with result 127, tricks_taken 136). Step 2 failed
+    on one on 2026-11-13 (Tricks 136 does not fit Int8). When either value is impossible, both
+    become null: the pair is corrupt, and null is what a missing value already is.
     """
+    result = (pl.when(pl.col('result') == '=').then(pl.lit('0')).otherwise(pl.col('result'))
+              .cast(pl.Int8, strict=False))
+    tricks = pl.col('tricks_taken').cast(pl.UInt8, strict=False)
+    # 13 tricks at most; a result runs from 7 bid and none made (-13) to 1 bid and all made (+6).
+    possible = (tricks.is_null() | (tricks <= 13)) & (result.is_null() | result.is_between(-13, 6))
     return brs_df.with_columns(
-        pl.when(pl.col('result') == '=').then(pl.lit('0')).otherwise(pl.col('result'))
-        .cast(pl.Int8, strict=False).alias('Result'),
-        pl.col('tricks_taken').cast(pl.UInt8, strict=False).alias('Tricks'),
+        pl.when(possible).then(result).alias('Result'),
+        pl.when(possible).then(tricks).alias('Tricks'),
     ).drop('result', 'tricks_taken')
+
+
+def tricks_as_total(brs_df: pl.DataFrame) -> pl.DataFrame:
+    """Make Tricks the total tricks declarer took, so Result == Tricks - BidLvl - 6.
+
+    In some sessions ACBL's tricks_taken holds tricks over book (3N made exactly: 3, not 9).
+    On 2026-11-14 that was 1,724 rows in 8 sessions of 2026-09; Result agreed with the score
+    in every one. Those rows get 6 added. A pair that fits neither reading is corrupt and
+    both values become null, as typed_club_results does for impossible values.
+    Passed-out boards (BidLvl 0) and rows missing either value are left alone.
+    """
+    result, tricks, level = pl.col('Result').cast(pl.Int16), pl.col('Tricks').cast(pl.Int16), pl.col('BidLvl').cast(pl.Int16)
+    both = (pl.col('BidLvl') > 0) & pl.col('Result').is_not_null() & pl.col('Tricks').is_not_null()
+    over_book = both & (tricks - level - 6 != result) & (tricks == result + level)
+    corrupt = both & (tricks - level - 6 != result) & (tricks != result + level)
+    counts = brs_df.select(over_book.sum().alias('over_book'), corrupt.sum().alias('corrupt')).row(0)
+    print(f"Tricks given over book, 6 added: {counts[0]} rows; Result and Tricks disagree, both nulled: {counts[1]} rows")
+    return brs_df.with_columns(
+        pl.when(corrupt).then(None).otherwise(pl.col('Result')).alias('Result'),
+        pl.when(corrupt).then(None).when(over_book).then(pl.col('Tricks') + 6).otherwise(pl.col('Tricks')).cast(pl.UInt8).alias('Tricks'),
+    )
 
 
 def augment_board_results_step1(club_or_tournament):
@@ -197,7 +226,7 @@ def augment_board_results_step1(club_or_tournament):
 
     # todo: looks like all of this can be moved/handled in mlBridgeAugmentLib.py
     if club_or_tournament == 'club':
-        brs_df = typed_club_results(brs_df)
+        brs_df = tricks_as_total(typed_club_results(brs_df))
         #mae = pl.Series('Event',['?' if not isinstance(p, str) else p.split(' ')[1][0] for p in brs_df['club_session']])
         brs_df = brs_df.with_columns(
             pl.col('Date').str.strptime(pl.Date, '%Y-%m-%d %H:%M:%S'), # should Date be pl.Date, pl.Datetime or pl.String?

@@ -328,6 +328,17 @@ echo [Stage 4] Elo ratings...
 :: TIME:   MEASURED 2026-11-14 12:10-12:16: 361s (6m). Club 296s
 ::         (73.35M rows), tournament 60s (18.98M rows). 321s earlier that day.
 ::         2026-10-03: 2418s (40m), club 1937s, tournament 475s.
+:: NOTE:   Until 2026-11-15 the session-start and session-end pair ratings
+::         (Elo_R_NS/EW_EventStart/EventEnd, and so the pair lookup file and
+::         two model inputs) were taken per pair number. Pair numbers repeat
+::         in every section, so a pair got the rating of another pair with
+::         its number: 31%% of tournament rows and 4%% of club rows, NaN
+::         where that other pair had an unknown player. They are now taken
+::         per pair of player ids
+::         (mlBridgeAugmentLib.compute_event_start_end_elo_columns). The
+::         files built 2026-11-14 and the models trained 2026-11-15 still
+::         carry the old values. That edit also makes 3a and 3c recompute
+::         on the next run. 5v checks both properties.
 echo   [4] Computing Elo ratings (player + pair)...
 call :pyrun 4 acbl_elo_ratings_create.py
 if errorlevel 1 goto :error
@@ -530,7 +541,8 @@ if errorlevel 1 goto :error
 ::              Elo_R_EW_EventStart (mean 0, std 1 in the schema).
 ::              mlBridgeAiLib.compute_scaling_parameters now treats NaN as
 ::              missing and prints the columns. The NaN ratings themselves
-::              are still produced upstream (3c pair Elo; not fixed).
+::              came from step 4 (see its NOTE); fixed in code 2026-11-15,
+::              in effect from the next step 4 run.
 ::           2. 5b writes the train file in date order (since 2026-10-24) and
 ::              the shard trainer reads shards in file order. 5c now mixes
 ::              the training rows with a seeded shuffle when it writes the

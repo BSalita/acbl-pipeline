@@ -124,9 +124,19 @@ about 32 s per 1M-row shard. The club classifiers' 62 shards take about
 
 ### Not done
 
-- The NaN pair ratings themselves are still produced upstream (the pair Elo
-  taken per pair number in step 3c). 2,055 club and 186 tournament pairs have
-  a NaN latest rating in `acbl_{club,tournament}_pair_elo_ratings.parquet`.
+- The NaN pair ratings themselves were still produced upstream when these
+  models were trained: 2,055 club and 186 tournament pairs have a NaN latest
+  rating in `acbl_{club,tournament}_pair_elo_ratings.parquet`. Cause, found
+  later the same day: step 4 took the session-start and session-end pair
+  ratings per pair number, and pair numbers repeat in every section of a
+  session. So 31% of tournament rows and 4% of club rows carry the rating of
+  another pair with the same number (median error 22 points in the tournament
+  pair file, 90th percentile 62), and NaN where that pair had an unknown
+  player. Both model inputs `Elo_R_NS_EventStart` and `Elo_R_EW_EventStart`
+  are affected in every model to date. Fixed in
+  `mlBridgeAugmentLib.compute_event_start_end_elo_columns` (per pair of player
+  ids); it takes effect at the next step 4 run, and the models need a retrain
+  after that to use the corrected inputs.
 - A missing rating still enters the models as 0 before scaling, which is about
   41 (club) and 51 (tournament) standard deviations below the mean for these
   two columns. Unchanged from earlier runs and not tested.

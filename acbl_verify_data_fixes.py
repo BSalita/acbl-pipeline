@@ -6,6 +6,8 @@ Checks:
     - The raw ACBL 'result' / 'tricks_taken' strings are gone; Result and Tricks agree.
     - Player id 0 (missing ACBL number) is stored as null, and Elo does not rate null seats.
     - Pair keys are null with an unknown member and ordered as strings.
+    - A pair's session-start and session-end ratings are its own, and never missing
+      (2026-11-15 fix in mlBridgeAugmentLib.compute_event_start_end_elo_columns).
 
 Usage:
     python acbl_verify_data_fixes.py [--data-dir e:/bridge/data/acbl] [--since 2026-10-21]
@@ -50,6 +52,15 @@ def _collect(lf: pl.LazyFrame) -> pl.DataFrame:
 
 def _zero_id(col: str) -> pl.Expr:
     return pl.col(col).cast(pl.Utf8).str.contains(r"^0+$").fill_null(False)
+
+
+PAIR_SEATS = {"NS": ("Player_ID_N", "Player_ID_S"), "EW": ("Player_ID_E", "Player_ID_W")}
+
+
+def _known_pair(a: str, b: str) -> pl.Expr:
+    """Both players have an id and they differ (when mlBridgeAugmentLib.pair_key_expr is not null)."""
+    x, y = pl.col(a).cast(pl.Utf8), pl.col(b).cast(pl.Utf8)
+    return (x.is_not_null() & y.is_not_null() & (x != y)).fill_null(False)
 
 
 def _fresh(path: pathlib.Path, since: datetime.date) -> Check:
@@ -146,9 +157,29 @@ def check_board_elo(path: pathlib.Path) -> list[Check]:
     ).row(0, named=True)
     rated = sum(stats[f"rated_null_{s}"] for s in SEATS)
     zeros = sum(stats[f"zero_{s}"] for s in SEATS)
+    # A pair's session-start and session-end ratings are its own. They were taken per pair
+    # number until 2026-11-15, and pair numbers repeat in every section of a session.
+    pair_stats = _collect(
+        _scan(path).select(
+            **{
+                f"{when}_{pair}": (
+                    _known_pair(*PAIR_SEATS[pair])
+                    & (pl.col(f"Elo_R_{pair}_Event{when}").is_nan() | (pl.col(f"Elo_R_{pair}_Event{when}") != pl.col(own)))
+                ).sum()
+                for pair in PAIR_SEATS
+                for when, own in (("Start", f"Elo_R_{pair}_Before"), ("End", f"Elo_R_{pair}"))
+            }
+        )
+    ).row(0, named=True)
+    wrong = sum(pair_stats.values())
     return [
         Check(f"{path.name}: no rating for seats without an id", rated == 0, f"{rated:,} rated null seats"),
         Check(f"{path.name}: no player id 0", zeros == 0, f"{zeros:,} zero ids"),
+        Check(
+            f"{path.name}: pair start/end rating is the pair's own",
+            wrong == 0,
+            ", ".join(f"{k} {v:,}" for k, v in pair_stats.items()) + " rows differ",
+        ),
     ]
 
 
@@ -172,10 +203,22 @@ def check_pair_elo(path: pathlib.Path) -> list[Check]:
             zero=(left.str.contains(r"^0+$") | right.str.contains(r"^0+$")).sum(),
             unordered=(left > right).sum(),
             null=pl.col("Pair_IDs").is_null().sum(),
+            unrated_start=(pl.col("Elo_R_EventStart").is_nan() | pl.col("Elo_R_EventStart").is_null()).sum(),
+            unrated_end=(pl.col("Elo_R_EventEnd").is_nan() | pl.col("Elo_R_EventEnd").is_null()).sum(),
         )
     ).row(0, named=True)
+    unrated = {k: stats.pop(k) for k in ("unrated_start", "unrated_end")}
     bad = {k: v for k, v in stats.items() if v}
-    return [Check(f"{path.name}: pair keys valid", not bad, str(bad or "self/zero/unordered/null all 0"))]
+    return [
+        Check(f"{path.name}: pair keys valid", not bad, str(bad or "self/zero/unordered/null all 0")),
+        # Every pair in this file has played the session, so it has a rating (found 2026-11-15:
+        # NaN where the first pair with the same pair number had an unknown player).
+        Check(
+            f"{path.name}: every pair has a start and end rating",
+            not any(unrated.values()),
+            f"{unrated['unrated_start']:,} without start, {unrated['unrated_end']:,} without end",
+        ),
+    ]
 
 
 def check_contracts(path: pathlib.Path) -> list[Check]:

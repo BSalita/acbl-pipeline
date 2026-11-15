@@ -40,8 +40,8 @@ echo    ..\postmortem-acbl (SavedModels, Elo parquets)
 echo.
 echo  Approximate end-to-end wall time on the dev box
 echo  (512 GB RAM, 64-core CPU, NVMe E:/F:, RTX 5080, 1.8 TB K: pagefile):
-echo    Cold start (no caches, fresh DD/SD work): ~4 days
-echo      (~38 h Stage 3a + ~1.5 h Stage 3c + ~45 h Stage 5c + other stages).
+echo    Cold start (no caches, fresh DD/SD work): ~3 days
+echo      (~38 h Stage 3a + ~1.5 h Stage 3c + ~11 h Stage 5c + other stages).
 echo    Latest run 2026-11-12 -^> 11-14 (six weeks of new data, 251K new deals):
 echo      1a 8h18m + 1b 27m + 1c 20m + 1d 3h + 1e 7m + 2a 3m + 2b 16m
 echo      + 3a 8h41m (6h43m of it new DD/SD) + 3b 2m + 3c 6h03m (est. 2h35m
@@ -50,13 +50,14 @@ echo      + 5b 56m + 5v 8s.
 echo    Rerun from 2a on 2026-11-14 (no new deals, nothing else running):
 echo      2a 2m + 3a 1h27m + 3c 1h17m + 4 6m + 5a 51m + 5b 60m + 5v 7s
 echo      = 4h43m from the start of 2a to the start of 5c.
-echo    Stage 5c current baseline: 45h 31m for all 6 models (2026-10-06 15:50 -^> 10-08 13:21).
-echo      club 39h 19m, tournament 6h 12m. Clean run; no OOM resume.
+echo    Stage 5c current baseline: 10h 59m for all 6 models (2026-11-15 02:32 -^> 13:31).
+echo      club 9h 46m, tournament 1h 12m. Was 45h 31m on 2026-10-06 with
+echo      about 6,000 model inputs (about 2,100 since 2026-10-24).
 echo    Stage 5d shows the prediction charts 5c no longer opens (close windows to finish).
 echo    Empirical bottlenecks per stage are noted as "TIME:" tags below.
 echo    Each step prints its own measured elapsed time as "TIME[step]: ..." lines.
 echo  Latest measured stages: 1a-5v from 2026-11-12 -^> 11-14. 5c from
-echo    the 2026-10-06 -^> 10-08 rebuild.
+echo    the 2026-11-15 retrain.
 echo  Model training results history: RESULTS.md (append an entry after each 5c run).
 echo ======================================================================
 echo.
@@ -425,7 +426,7 @@ if errorlevel 1 goto :error
 ::         (7s) on the files rebuilt from 2a.
 ::         Verifies the 2026-10 data fixes: doubled contracts kept, typed
 ::         Result/Tricks, player ID 0 nulled, unrated seats, ordered pair keys.
-::         Runs before 5c so bad data does not cost ~45 h of training.
+::         Runs before 5c so bad data does not cost ~11 h of training.
 ::         After the first passing run, merge acbl-pipeline branch
 ::         after-nov-2026-acbl-rebuild (drops the club API raw-result override).
 echo   [5v] Verifying data fixes...
@@ -451,53 +452,103 @@ if errorlevel 1 goto :error
 ::         Charts are not shown here (MPLBACKEND=Agg). Use 5d.
 ::         Joint contract/declarer pick (what postmortem-acbl serves):
 ::           acbl_prediction_rank_eval.py --side club|tournament (~3 min).
-:: TIME:   CURRENT BASELINE 45h 31m for all 6 models.
-::         MEASURED 2026-10-06 15:50 -^> 10-08 13:21 from artifact mtimes
-::         (club 39h 19m, tournament 6h 12m). Clean run.
+:: TIME:   CURRENT BASELINE 10h 59m for all 6 models.
+::         MEASURED 2026-11-15 02:32 -^> 13:31 (TIME[5c] 39,535 s; club
+::         9h 46m, tournament 1h 12m). Clean run, nothing else running.
+::         The first run on these files (2026-11-14 14:07 -^> 11-15 00:49,
+::         10h 42m) had the two defects listed under TRAINING DEFECTS.
+::         Was 45h 31m on 2026-10-06 -^> 10-08 (club 39h 19m, tournament
+::         6h 12m) when the classifiers still read about 6,000 inputs.
 ::         schema mtime = load+prepare done; .pth = shards+epochs done;
 ::         importance.csv = eval done.
 ::         Input sizes (test cutoff 2026-01-01):
-::           club:      61.71M train + 10.07M test rows, 203.51 + 26.83 GB
-::           tournament:17.70M train + 1.27M test rows, 47.01 + 3.32 GB
-::         club (39h 19m):
-::           Declarer_Direction: load 3h 10m + shards 4h 18m + epochs 9h 35m
-::                               + eval 56m. .pth 10-07 08:53, importance 09:50.
-::           Contract:           load 3h 03m + shards+epochs 14h 22m + eval 59m.
-::                               .pth 10-08 03:14, importance 04:13.
-::           Pct_NS (pruned):    load 1h 25m + shards+epochs 1h 22m + eval 10m.
-::                               .pth 10-08 07:00, importance 07:09.
-::         tournament (6h 12m):
-::           Declarer_Direction: load 16m + shards+epochs 2h 18m + eval 5m.
-::                               .pth 10-08 09:43, importance 09:49.
-::           Contract:           load 13m + shards+epochs 2h 30m + eval 6m.
-::                               .pth 10-08 12:32, importance 12:38.
-::           Pct_NS (pruned):    load 13m + shards+epochs 29m + eval 1m.
-::                               .pth 10-08 13:20, importance 13:21.
-::         ACCURACY on the held-out test parquets (debug_predictions_*):
-::           club Declarer_Direction: accuracy 0.6644, macro F1 0.664,
-::                               majority baseline 0.2623 (N). 60,268 test
+::           club:      61.29M train + 12.06M test rows, 62.17 + 10.43 GB
+::           tournament:17.70M train + 1.28M test rows, 10.63 + 0.85 GB
+::         5c reads 2,122 (club) / 2,116 (tournament) of 6,042 columns;
+::         Pct_NS is pruned to 1,341 / 1,335 inputs. Shards hold 1M rows
+::         (~8.4 GB for the classifiers). The last shard is validation
+::         (club 291,826 rows, tournament 697,878): the newest sessions.
+::         club (9h 46m):
+::           Declarer_Direction: load 9m + shards 38m + 20 epochs 3h 31m
+::                               (first 291s, then ~645s each) + eval 7m.
+::                               .pth 06:50, importance 06:57.
+::           Contract:           reuses the Declarer_Direction shards; target
+::                               rewrite + 20 epochs (~648s each) 3h 58m
+::                               + eval 7m. .pth 10:55, importance 11:01.
+::           Pct_NS (pruned):    load 8m + shards + 20 epochs (~2m each)
+::                               1h 06m + eval 3m. .pth 12:15, importance 12:18.
+::         tournament (1h 12m):
+::           Declarer_Direction: load 2m + shards + 17 epochs (~55s each,
+::                               early stop) 27m + eval 1m. .pth 12:47.
+::           Contract:           target rewrite + 20 epochs 26m + eval under
+::                               1m. .pth 13:14.
+::           Pct_NS (pruned):    load 2m + shards + 15 epochs (early stop)
+::                               15m + eval under 1m. .pth 13:31.
+::         ACCURACY on the held-out test parquets (debug_predictions_*),
+::         2026-11-15 retrain. Contract accuracy is an exact match (level,
+::         strain, declarer, doubling). The 5c log's Contract "Accuracy"
+::         compares level and strain only.
+::           club Declarer_Direction: accuracy 0.6648, macro F1 0.669,
+::                               majority baseline 0.2635 (N). 72,724 test
 ::                               rows have a null direction and count as misses.
-::           club Contract:      accuracy 0.3795, macro F1 0.182,
-::                               majority baseline 0.0408 (3NN). 141 test classes.
-::           club Pct_NS:        MAE 0.2595, variance ratio 0.167
-::                               (pred_std/actual_std). y max 1.25.
-::           club rank (2026-10-18): Spearman 0.456 vs seat-Elo line 0.433
-::                               (92,573 section/directions). Section
-::                               centering keeps ranks, pair MAE 0.0556 ->
-::                               0.0544; board centering adds nothing.
-::           club joint pick (declarer weight 0.3, 305k boards): contract
-::                               0.3787 -^> 0.3787, declarer 0.6630 -^> 0.6644,
-::                               contract/declarer agree 85.4%% -^> 100%%.
-::           tournament joint pick (318k boards): contract 0.3826 -^> 0.3830,
+::                               Best epoch 18 of 20 (val_acc 0.6747).
+::           club Contract:      accuracy 0.3793, macro F1 0.067,
+::                               majority baseline 0.0408 (3NN). 412 test classes.
+::                               Level and strain only: 0.4320 (majority 0.1509).
+::                               Best epoch 19 of 20 (val_acc 0.3872).
+::           club Pct_NS:        MAE 0.2589, variance ratio 0.194
+::                               (pred_std/actual_std). Best epoch 16 of 20.
+::           club rank:          Spearman 0.462 vs seat-Elo line 0.436
+::                               (110,870 section/directions, 1,013,170 pairs).
+::                               Section centering keeps ranks, pair MAE 0.0553
+::                               -^> 0.0538; board centering adds nothing.
+::           tournament Declarer_Direction: accuracy 0.6568, macro F1 0.656,
+::                               majority baseline 0.2623 (N). Early stop at
+::                               epoch 17, best 12 (val_acc 0.6604).
+::           tournament Contract: accuracy 0.3829, macro F1 0.073,
+::                               majority baseline 0.0433 (3NN). 378 test classes.
+::                               Level and strain only: 0.4472.
+::                               Best epoch 18 of 20 (val_acc 0.3866).
+::           tournament Pct_NS:  MAE 0.2514, variance ratio 0.163. Early stop
+::                               at epoch 15, best 10.
+::           tournament rank:    Spearman 0.372 vs seat-Elo line 0.339
+::                               (12,063 section/directions, 123,351 pairs).
+::           Joint pick (declarer weight 0.3), measured on the 2026-10 models
+::           and not repeated for this retrain:
+::             club (305k boards): contract 0.3787 -^> 0.3787, declarer
+::                               0.6630 -^> 0.6644, contract/declarer agree
+::                               85.4%% -^> 100%%.
+::             tournament (318k boards): contract 0.3826 -^> 0.3830,
 ::                               declarer 0.6529 -^> 0.6598.
-::           tournament Declarer_Direction: accuracy 0.6522, macro F1 0.652,
-::                               majority baseline 0.2623 (N).
-::           tournament Contract: accuracy 0.3824, macro F1 0.073,
-::                               majority baseline 0.0434 (3NN). 378 test classes.
-::           tournament Pct_NS:  MAE 0.2514, variance ratio 0.164.
-::                               y max 9.99 (sentinel; still in the test file).
-::         Earlier 2026-09-13 -^> 09-15 run was ~45 h and resumed after an
-::         OOM reboot (club DD) and an AppHang (tournament Pct_NS).
+::           2026-10 models for comparison (not the same test rows): club
+::           Declarer_Direction 0.6644, Contract 0.3795; tournament 0.6574,
+::           0.3843 (2026-10-24 A/B).
+::         TRAINING DEFECTS found in the 2026-11-14 run and fixed 2026-11-15
+::         (details in RESULTS.md):
+::           1. NaN pair ratings (0.25%% of club rows, 0.07%% of tournament
+::              rows) made the scaler skip Elo_R_NS_EventStart and
+::              Elo_R_EW_EventStart (mean 0, std 1 in the schema).
+::              mlBridgeAiLib.compute_scaling_parameters now treats NaN as
+::              missing and prints the columns. The NaN ratings themselves
+::              are still produced upstream (3c pair Elo; not fixed).
+::           2. 5b writes the train file in date order (since 2026-10-24) and
+::              the shard trainer reads shards in file order. 5c now mixes
+::              the training rows with a seeded shuffle when it writes the
+::              shards and leaves the last (validation) shard in file order.
+::              --keep-row-order turns the shuffle off.
+::           With both defects: club Declarer_Direction 0.6622, Contract
+::           0.3771; tournament 0.6393, 0.3715. Those models are kept in
+::           F:\bridge\data\acbl\SavedModels_20261114_unscaled_pair_elo.
+::           In a model schema, scaling_params of mean 0.0 and std 1.0 for a
+::           column that is not constant means the scaler skipped it.
+::           Before a full retrain after a change to 4, 5a, 5b or 5c, train
+::           the two tournament classifiers into a test folder (~56 min) and
+::           compare with RESULTS.md:
+::             acbl_prediction_train.py --tournament --target Declarer_Direction
+::               --target Contract --out-dir F:\bridge\data\acbl\NAME
+::         Earlier runs: 2026-10-06 -^> 10-08 took 45h 31m (clean). 2026-09-13
+::         -^> 09-15 took ~45 h and resumed after an OOM reboot (club DD) and
+::         an AppHang (tournament Pct_NS).
 ::         HOST MEMORY: this is the bottleneck, not VRAM. Loading train+test
 ::         together drove Python to ~488 GB and OOM-rebooted club DD
 ::         (2026-09-13). After loading them one at a time, resume RSS was
@@ -509,11 +560,15 @@ if errorlevel 1 goto :error
 ::         45-373 GB transient allocations and commit-limit failures.
 ::         GPU MEMORY: observed peak was only ~0.38 GB Declarer_Direction,
 ::         ~0.58 GB Contract, and ~0.43 GB Pct_NS on the RTX 5080.
-::         DISK: full-width club models create 62 transient shards (61 x
-::         ~22.48 GiB + one ~15.86 GiB = ~1.36 TiB) under SavedModels.
-::         E:\...\SavedModels is a junction to F:\...\SavedModels; ensure at
-::         least 1.5 TiB free on F: before 5c. Shards are deleted before the
-::         next target, so only one target's shard set should exist at a time.
+::         DISK: the club classifiers create 62 transient shards of ~8.4 GB
+::         (about 0.5 TiB) under SavedModels. This was ~1.36 TiB with
+::         full-width inputs. E:\...\SavedModels must be a junction to
+::         F:\...\SavedModels: check before 5c, because 5b recreates it as a
+::         plain folder on E: when the junction is missing (found
+::         2026-11-14). The rerun runners require 1.5 TiB free on F:.
+::         Shards are deleted before the next target, so only one target's
+::         shard set should exist at a time. The last target's shards
+::         (tournament Pct_NS, 18 files, 88 GiB) stay until the next run.
 ::         Run this step alone (not via acbl_all.bat) when iterating on models.
 echo   [5c] Training prediction models...
 set MPLBACKEND=Agg

@@ -21,6 +21,120 @@ Reading the metrics:
 
 ---
 
+## 2026-11-15 (full retrain on the 2026-11-14 data; two training defects fixed)
+
+Data: rebuilt from step 2a on 2026-11-14 with the repeated club hand records
+removed. Club 61,291,826 train + 12,055,473 test rows, tournament 17,697,878 +
+1,283,106, test cutoff 2026-01-01. 5c reads 2,122 (club) / 2,116 (tournament)
+of 6,042 columns; Pct_NS is pruned to 1,341 / 1,335 inputs. The test rows are
+not the ones the October models were scored on (six more weeks of data, no
+repeated club results), so the October column is a guide, not an exact
+comparison.
+
+Two full runs of all six models:
+
+1. 2026-11-14 14:07 to 2026-11-15 00:49 (10 h 42 m). These models had the two
+   defects below. Kept with their test predictions in
+   `F:\bridge\data\acbl\SavedModels_20261114_unscaled_pair_elo`.
+2. 2026-11-15 02:32 to 13:31 (10 h 59 m), with both fixes. These are the models
+   now in `SavedModels`. Log: `logs/acbl_all_20261115_retrain_5c/5c.log`.
+
+Contract accuracy below is an exact match (level, strain, declarer, doubling),
+computed from `debug_predictions_*_contract.parquet`. The 5c log's Contract
+"Accuracy" compares level and strain only and is listed separately.
+
+| Test set | 2026-10 models | 2026-11-14 (both defects) | 2026-11-15 retrain |
+|---|---|---|---|
+| Club Declarer_Direction accuracy | 0.6644 | 0.6622 | 0.6648 |
+| Club Declarer_Direction macro F1 | 0.664 | 0.664 | 0.669 |
+| Club Declarer_Direction best val_acc (epoch) | | 0.6730 (20) | 0.6747 (18) |
+| Club Contract accuracy | 0.3795 | 0.3771 | 0.3793 |
+| Club Contract, level and strain only | | 0.4296 | 0.4320 |
+| Club Contract best val_acc (epoch) | | 0.3848 (19) | 0.3872 (19) |
+| Club Pct_NS MAE | 0.2595 | 0.2588 | 0.2589 |
+| Club Pct_NS variance ratio | 0.167 | 0.211 | 0.194 |
+| Club section rank Spearman, model / seat-Elo line | 0.456 / 0.433 | 0.458 / 0.436 | 0.462 / 0.436 |
+| Tournament Declarer_Direction accuracy | 0.6574 | 0.6393 | 0.6568 |
+| Tournament Declarer_Direction macro F1 | 0.657 | 0.638 | 0.656 |
+| Tournament Contract accuracy | 0.3843 | 0.3715 | 0.3829 |
+| Tournament Contract, level and strain only | | 0.4411 | 0.4472 |
+| Tournament Pct_NS MAE | 0.2514 | 0.2514 | 0.2514 |
+| Tournament Pct_NS variance ratio | 0.164 | 0.163 | 0.163 |
+| Tournament section rank Spearman, model / seat-Elo line | | 0.368 / 0.339 | 0.372 / 0.339 |
+
+The 2026-10 column is the 2026-10-08 run, except the tournament classifiers,
+which are the 2026-10-24 A/B models. Majority baselines for the retrain: club
+Declarer_Direction 0.2635 (N), club Contract 0.0408 (3NN, 412 test classes),
+tournament Declarer_Direction 0.2623 (N), tournament Contract 0.0433 (3NN,
+378 test classes). 72,724 club test rows have a null direction and count as
+misses. Rank metrics: club 110,870 section/directions and 1,013,170 pairs,
+tournament 12,063 and 123,351.
+
+Epochs in the retrain: the club models ran all 20 (best epoch 18, 19 and 16 for
+Declarer_Direction, Contract and Pct_NS). Tournament Declarer_Direction stopped
+at 17 (best 12), Contract ran 20 (best 18), Pct_NS stopped at 15 (best 10).
+
+### The two defects
+
+**1. Pair ratings were not scaled.** `Elo_R_NS_EventStart` and
+`Elo_R_EW_EventStart` hold a few NaN values (club train 150,249 and 176,065 of
+61.3M rows; tournament train 12,907 and 13,865 of 17.7M). Polars `mean()` and
+`std()` return NaN when any value is NaN, and `compute_scaling_parameters`
+(`mlBridge/mlBridgeAiLib.py`) then fell back to mean 0 and std 1, so both
+columns went into all six models at about 1500 while every other input was
+near 0. The scaler now treats NaN as missing and prints the affected columns.
+In the retrained schemas the two columns have mean about 1510 and std about 36
+(club), 1506 and 29 (tournament).
+
+**2. The training rows were in date order.** Step 5b has written the train file
+in date order with a session's rows together since 2026-10-24, so that the
+last shard (validation) is the newest data. The shard trainer reads shards in
+file order and does not shuffle, so each epoch ended on the newest year. 5c now
+mixes the training rows with a seeded shuffle when it writes the shards and
+leaves the validation shard in file order (`--keep-row-order` turns it off).
+The 2026-11-14 run was the first full 5c run on date-ordered files.
+
+Each fix was checked on the tournament classifiers before the full retrain:
+
+| Tournament test accuracy | Declarer_Direction | Contract |
+|---|---|---|
+| 2026-10-24 A/B models | 0.6574 | 0.3843 |
+| 2026-11-14, both defects | 0.6393 | 0.3715 |
+| Scaler fix only | 0.6489 | not run |
+| Scaler fix and shuffle | 0.6568 | 0.3829 |
+
+The two-model test takes about 56 minutes:
+`acbl_prediction_train.py --tournament --target Declarer_Direction --target Contract --out-dir F:\bridge\data\acbl\<name>`.
+The full retrain reproduced the test accuracy of both models (same seed).
+
+### Time (retrain)
+
+| Model | Load | Shards and epochs | Eval |
+|---|---|---|---|
+| Club Declarer_Direction | 9 m | 38 m + 3 h 31 m (20 epochs, about 645 s each) | 7 m |
+| Club Contract | reuses the shards | 3 h 58 m (target rewrite + 20 epochs) | 7 m |
+| Club Pct_NS | 8 m | 1 h 06 m (20 epochs, about 2 m each) | 3 m |
+| Tournament Declarer_Direction | 2 m | 27 m (17 epochs, about 55 s each) | 1 m |
+| Tournament Contract | reuses the shards | 26 m (20 epochs) | under 1 m |
+| Tournament Pct_NS | 2 m | 15 m (15 epochs) | under 1 m |
+
+Club 9 h 46 m, tournament 1 h 12 m. Writing shards in shuffled order costs
+about 32 s per 1M-row shard. The club classifiers' 62 shards take about
+0.5 TiB.
+
+### Not done
+
+- The NaN pair ratings themselves are still produced upstream (the pair Elo
+  taken per pair number in step 3c). 2,055 club and 186 tournament pairs have
+  a NaN latest rating in `acbl_{club,tournament}_pair_elo_ratings.parquet`.
+- A missing rating still enters the models as 0 before scaling, which is about
+  41 (club) and 51 (tournament) standard deviations below the mean for these
+  two columns. Unchanged from earlier runs and not tested.
+- The joint contract/declarer pick (`acbl_prediction_rank_eval.py`) was not
+  measured again for these models.
+
+---
+
 ## 2026-10-24 (tournament A/B: drop the 3,920 duplicate EV inputs)
 
 Each `EV_<pair>_<dir>_<strain>_<level>_<vul>_<tricks>_<score>` input is

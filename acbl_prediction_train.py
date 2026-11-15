@@ -58,6 +58,7 @@ from mlBridge.mlBridgeAiLib import (
     train_model_from_df,
     train_model_from_tensors,
     create_torch_shards,
+    shuffled_train_row_order,
     train_model_from_shards,
     predict_model,
     analyze_prediction_results,
@@ -367,6 +368,13 @@ def _parse_cli_args():
               "and debug_*/rank-metric files to OUT_DIR, instead of e:/bridge/data/acbl. "
               "Use for experiments so the served models are not overwritten."),
     )
+    parser.add_argument(
+        "--keep-row-order", action="store_true",
+        help=("Write the training shards in train-file order (date order, one "
+              "session's rows together), as before 2026-11-15. Default: mix the "
+              "training rows with a seeded shuffle; the validation shard (the "
+              "newest rows) is the same either way."),
+    )
     args = parser.parse_args()
     if not args.club and not args.tournament:
         modes = ["club", "tournament"]
@@ -378,7 +386,7 @@ def _parse_cli_args():
             modes.append("tournament")
     targets = args.target if args.target else list(y_names)
     return (modes, targets, args.input_suffix, args.reuse_shards, args.save_debug_input,
-            args.keep_ev_duplicates, args.out_dir)
+            args.keep_ev_duplicates, args.out_dir, not args.keep_row_order)
 
 
 def _reusable_shards(saved_models_path: pathlib.Path, model_name: str):
@@ -530,8 +538,15 @@ def _prepare_target_frame(df: pl.DataFrame, y_name: str, *, for_training: bool) 
 
 def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
                       input_suffix: str = "_v2", reuse_shards: bool = False,
-                      save_debug_input: bool = False, keep_ev_duplicates: bool = False):
+                      save_debug_input: bool = False, keep_ev_duplicates: bool = False,
+                      shuffle_rows: bool = True):
     """Train ACBL prediction models for the requested targets (default: all three).
+
+    `shuffle_rows` mixes the training rows when the shards are written. The
+    train file is in date order with one session's rows together (step 5b), and
+    the shard trainer reads shards in file order, so without it a batch is a
+    handful of sessions and every epoch walks 2017..2025 in order. Measured
+    2026-11-15 on tournament Declarer_Direction: see RESULTS.md.
 
     `targets` controls which y-variables are trained this run. Targets are still
     iterated in the canonical `y_names` order so any cross-target dependencies
@@ -544,7 +559,7 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
     selected_targets = [y for y in y_names if y in (targets or y_names)]
     print(f"\nProcessing {club_or_tournament} prediction training... "
           f"targets={selected_targets}  input_suffix='{input_suffix}'"
-          f"  reuse_shards={reuse_shards}")
+          f"  reuse_shards={reuse_shards}  shuffle_rows={shuffle_rows}")
 
     # Load train and test one at a time. Holding both club frames plus a
     # working copy (~488 GB) plus a 24 GB shard is what froze the 512 GB box
@@ -707,6 +722,7 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         leftover_shards, leftover_schema = _reusable_shards(savedModelsPath, model_name)
         reusing_shards = bool(reuse_shards and leftover_shards)
         swap_y_df = None
+        row_order = None  # set when this target's shards are written with mixed rows
         if (not reusing_shards and shared_shards is not None
                 and SHARD_REUSE_TARGETS.get(y_name) == shared_shards['y_name']):
             print(f"Trying to reuse {shared_shards['y_name']} shards for {y_name}...")
@@ -773,6 +789,9 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
                 if p.is_file() and p not in keep:
                     p.unlink()
             swap_started = time.time()
+            if shared_shards.get('row_order') is not None:
+                # The shared shards hold the rows in this order, not file order.
+                swap_y_df = swap_y_df[pl.Series(shared_shards['row_order'], dtype=pl.UInt32)]
             _swap_shard_targets(shared_shards['shards'], schema_d, swap_y_df)
             print(f"Rewrote {len(shared_shards['shards'])} {shared_shards['y_name']} shards with "
                   f"{y_name} targets in {time.time() - swap_started:.1f}s")
@@ -793,11 +812,18 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
             if est_shards < 2 and num_rows > 0:
                 effective_shard_rows_count = max(1, num_rows // 2)
                 print(f"[shards] Adjusted shard_rows_count from {optimal_shard_rows_count:,} to {effective_shard_rows_count:,} to ensure a validation shard (rows={num_rows:,})")
+            if shuffle_rows:
+                # The trainer validates on the last shard; keep those rows (the
+                # newest) in place and mix all the others.
+                row_order = shuffled_train_row_order(num_rows, effective_shard_rows_count, n_valid_shards=1)
+                print(f"[shards] Training rows mixed with a seeded shuffle; "
+                      f"last shard (validation) left in file order")
             create_torch_shards(
                 working_df_for_training,  # WITHOUT split indicators
                 schema_d,
                 shard_rows_count=effective_shard_rows_count,
                 apply_scaling=True,  # Enable scaling of features
+                row_order=row_order,
             )
             print("Feature scaling enabled for inputs; targets remain unscaled")
             print("Split indicators excluded from training shards")
@@ -808,7 +834,8 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
             built, _ = _reusable_shards(savedModelsPath, model_name)
             if built:
                 shared_shards = {'y_name': y_name, 'schema': schema_d,
-                                 'shards': built, 'rows': len(working_df_for_training)}
+                                 'shards': built, 'rows': len(working_df_for_training),
+                                 'row_order': row_order}
 
         # takes 10m/12m
         # Remove old shards if they exist. Determine scale parameters, scale, create shard files.
@@ -1043,7 +1070,7 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
 if __name__ == "__main__":
     mlBridge.pd_options_display()
     (cli_modes, cli_targets, cli_suffix, cli_reuse_shards, cli_save_debug_input,
-     cli_keep_ev_duplicates, cli_out_dir) = _parse_cli_args()
+     cli_keep_ev_duplicates, cli_out_dir, cli_shuffle_rows) = _parse_cli_args()
     if cli_out_dir is not None:
         outputPath = cli_out_dir
         savedModelsPath = cli_out_dir.joinpath('SavedModels')
@@ -1059,7 +1086,8 @@ if __name__ == "__main__":
             train_predictions(club_or_tournament, targets=cli_targets,
                               input_suffix=cli_suffix, reuse_shards=cli_reuse_shards,
                               save_debug_input=cli_save_debug_input,
-                              keep_ev_duplicates=cli_keep_ev_duplicates)
+                              keep_ev_duplicates=cli_keep_ev_duplicates,
+                              shuffle_rows=cli_shuffle_rows)
     except KeyboardInterrupt:
         print("Interrupted during training", file=sys.stderr, flush=True)
         sys.exit(130)

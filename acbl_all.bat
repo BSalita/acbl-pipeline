@@ -40,8 +40,9 @@ echo    ..\postmortem-acbl (SavedModels, Elo parquets)
 echo.
 echo  Approximate end-to-end wall time on the dev box
 echo  (512 GB RAM, 64-core CPU, NVMe E:/F:, RTX 5080, 1.8 TB K: pagefile):
-echo    Cold start (no caches, fresh DD/SD work): ~3 days
-echo      (~38 h Stage 3a + ~1.5 h Stage 3c + ~11 h Stage 5c + other stages).
+echo    Cold start (no caches, fresh DD/SD work): ~3.5 days
+echo      (~38 h Stage 3a + ~14.5 h Stage 3c, 12h 44m of it first-time lead
+echo      solving + ~11 h Stage 5c + other stages).
 echo    Latest run 2026-11-12 -^> 11-14 (six weeks of new data, 251K new deals):
 echo      1a 8h18m + 1b 27m + 1c 20m + 1d 3h + 1e 7m + 2a 3m + 2b 16m
 echo      + 3a 8h41m (6h43m of it new DD/SD) + 3b 2m + 3c 6h03m (est. 2h35m
@@ -50,6 +51,9 @@ echo      + 5b 56m + 5v 8s.
 echo    Rerun from 2a on 2026-11-14 (no new deals, nothing else running):
 echo      2a 2m + 3a 1h27m + 3c 1h17m + 4 6m + 5a 51m + 5b 60m + 5v 7s
 echo      = 4h43m from the start of 2a to the start of 5c.
+echo    Upgrade run 2026-11-15 -^> 11-16 (SuitC and SD lead columns added, every
+echo      block recomputed, lead cache empty): 3a 1h47m + 3c 14h22m + 4 7m.
+echo      With the lead cache filled, 3c for all blocks is about 2h 10m (estimate).
 echo    Stage 5c current baseline: 10h 59m for all 6 models (2026-11-15 02:32 -^> 13:31).
 echo      club 9h 46m, tournament 1h 12m. Was 45h 31m on 2026-10-06 with
 echo      about 6,000 model inputs (about 2,100 since 2026-10-24).
@@ -57,7 +61,8 @@ echo    Stage 5d shows the prediction charts 5c no longer opens (close windows t
 echo    Empirical bottlenecks per stage are noted as "TIME:" tags below.
 echo    Each step prints its own measured elapsed time as "TIME[step]: ..." lines.
 echo  Latest measured stages: 1a-5v from 2026-11-12 -^> 11-14. 5c from
-echo    the 2026-11-15 retrain.
+echo    the 2026-11-15 retrain. 3a, 3c and 4 with the SuitC and SD lead
+echo    columns from the 2026-11-15 -^> 11-16 upgrade run.
 echo  Model training results history: RESULTS.md (append an entry after each 5c run).
 echo ======================================================================
 echo.
@@ -249,6 +254,11 @@ echo [Stage 3] Augmentation...
 ::         DD verification using most cores from 20:57.
 ::         MEASURED 2026-11-14 09:26-10:53, warm, club only (21,626,531
 ::         rows, 47.1 GB), nothing else running: 5220s (1h 27m).
+::         MEASURED 2026-11-15 17:02-18:49, warm, both sides, with the SuitC
+::         columns (first run with them): 6426s (1h 47m). Club 6026s
+::         (1h 40m; 21,626,531 rows, 6,111 columns, 48.5 GB), tournament 401s
+::         (2,081,812 rows, 4.6 GB). Adding the SuitC columns themselves
+::         took 50 s (club) and 6 s (tournament) from the filled cache.
 ::         2026-10-02 warm rewrite: 7777s (2h 10m), club 7214s.
 ::         Since 2026-10-24 a side is skipped (~1 s check) when its cleaned
 ::         input, cache rows, code and versions match
@@ -257,8 +267,11 @@ echo [Stage 3] Augmentation...
 :: OPTION: ACBL_SUITC=1 (default since 2026-11-15; set ACBL_SUITC=0 to turn
 ::         off) adds the SC_* SuitC single-suit columns (needs
 ::         ..\SuitC\build\Release\SuitC.exe). Holdings are cached in
-::         E:\bridge\data\suitc\combos\ (shared with FFBridge); the first run
-::         solves ~800k holdings (~1-2 h). Changing it recomputes 3a and 3c.
+::         E:\bridge\data\suitc\combos\ (shared with FFBridge). The cache is
+::         filled: 783,075 holdings for 11,521,432 distinct deals, checked in
+::         12 s on 2026-11-15 (suitc_backfill.py). From an empty cache the
+::         holdings take ~1-2 h (estimate, not measured here). Changing the
+::         option recomputes 3a and 3c.
 ::         Guess_Foresight_Z (elo\foresight.py) needs these columns.
 if not defined ACBL_SUITC set "ACBL_SUITC=1"
 set "SUITC_ARGS="
@@ -287,8 +300,22 @@ if errorlevel 1 goto :error
 ::         acbl/acbl_{club,tournament}_board_results_augmented_blocks. A
 ::         rerun recomputes only blocks whose rows changed; editing this
 ::         script, mlBridgeAugmentLib.py or mlBridgeLib.py recomputes all.
-::         All blocks with the machine otherwise idle: ~1h 35m (club 1h 13m
-::         measured, tournament ~20m estimated).
+::         All blocks with the SD lead score (the default since 2026-11-15)
+::         and the lead cache filled: about 2h 10m (estimate: club 1h 13m as
+::         below + 38m DD lead cost, tournament 20m measured).
+::         MEASURED 2026-11-15 18:50 -^> 11-16 09:12, all blocks, lead cache
+::         empty, SuitC columns in: 51742s (14h 22m).
+::           Club 50549s (14h 2m), 73,347,299 rows, 77.3 GB: SD lead score
+::           45849s (12h 44m) for 5,507,880 positions at 120 positions/s;
+::           DD lead cost 2294s (38m) for 5,908,701 positions, solved again
+::           whenever a block is recomputed (no cache); everything else 40m,
+::           of it 34 s for the ratings and 286 s to assemble the file.
+::           Blocks 33 to 62 (1.2M to 1.8M rows) took 14 to 22 min each,
+::           17 min on average.
+::           Tournament 1193s (20m), all 147 blocks, 18,980,984 rows, 15.8 GB
+::           (154 s to assemble); no lead columns.
+::         Without the lead and SuitC columns (before 2026-11-15), machine
+::         otherwise idle: ~1h 35m (club 1h 13m measured, tournament ~20m).
 ::         Club, 62 blocks of 25,000 session ids. MEASURED 2026-11-14
 ::         10:53-12:06, all blocks, nothing else running: 4393s (1h 13m),
 ::         73,347,299 rows, 75.4 GB; about 70 s per block of 1.4M rows, then
@@ -310,9 +337,10 @@ if errorlevel 1 goto :error
 :: OPTION: ACBL_SD_LEAD_SAMPLES=20 (default since 2026-11-15; set
 ::         ACBL_SD_LEAD_SAMPLES=0 to turn off) adds the single-dummy lead score
 ::         (SD_Lead_* columns, club only: tournaments record no lead). The first
-::         club run solves ~5.7M lead positions, ~33 h at 20 (48 positions/s);
-::         acbl/acbl_club_sd_lead_cache/ keeps them, so later runs solve only new
-::         ones. Changing the value recomputes every club block.
+::         club run solved 5.51M lead positions in 12h 44m at 20 samples
+::         (120 positions/s, 2026-11-16; see TIME above).
+::         acbl/acbl_club_sd_lead_cache/ keeps them (466 MB), so later runs
+::         solve only new ones. Changing the value recomputes every club block.
 ::         Lead_Foresight_Z (elo\foresight.py) needs these columns.
 if not defined ACBL_SD_LEAD_SAMPLES set "ACBL_SD_LEAD_SAMPLES=20"
 echo   [3c] Augmenting board results (step 2: join hand records + full augmentation; SD lead samples %ACBL_SD_LEAD_SAMPLES%)...
@@ -330,7 +358,10 @@ echo [Stage 4] Elo ratings...
 :: WRITES: acbl/acbl_{club,tournament}_elo_ratings.parquet
 ::         acbl/acbl_{club,tournament}_player_elo_ratings.parquet  -> elo, postmortem-acbl
 ::         acbl/acbl_{club,tournament}_pair_elo_ratings.parquet    -> elo, postmortem-acbl
-:: TIME:   MEASURED 2026-11-14 12:10-12:16: 361s (6m). Club 296s
+:: TIME:   MEASURED 2026-11-16 09:12-09:19, with the lead, SuitC and club
+::         columns kept: 410s (7m). Club 342s (73.35M rows, 102 columns,
+::         4.2 GB), tournament 68s (18.98M rows, 89 columns, 1.4 GB).
+::         MEASURED 2026-11-14 12:10-12:16: 361s (6m). Club 296s
 ::         (73.35M rows), tournament 60s (18.98M rows). 321s earlier that day.
 ::         2026-10-03: 2418s (40m), club 1937s, tournament 475s.
 :: NOTE:   Until 2026-11-15 the session-start and session-end pair ratings
@@ -341,9 +372,10 @@ echo [Stage 4] Elo ratings...
 ::         where that other pair had an unknown player. They are now taken
 ::         per pair of player ids
 ::         (mlBridgeAugmentLib.compute_event_start_end_elo_columns). The
-::         files built 2026-11-14 and the models trained 2026-11-15 still
-::         carry the old values. That edit also makes 3a and 3c recompute
-::         on the next run. 5v checks both properties.
+::         Elo files have the corrected values since the 2026-11-16 run
+::         (5v checks both properties: 37 of 37 passed). The models trained
+::         2026-11-15 were trained on the old values; the corrected ones
+::         reach them after 5a, 5b and a 5c retrain.
 echo   [4] Computing Elo ratings (player + pair)...
 call :pyrun 4 acbl_elo_ratings_create.py
 if errorlevel 1 goto :error
@@ -547,7 +579,7 @@ if errorlevel 1 goto :error
 ::              mlBridgeAiLib.compute_scaling_parameters now treats NaN as
 ::              missing and prints the columns. The NaN ratings themselves
 ::              came from step 4 (see its NOTE); fixed in code 2026-11-15,
-::              in effect from the next step 4 run.
+::              and in the Elo files since the 2026-11-16 step 4 run.
 ::           2. 5b writes the train file in date order (since 2026-10-24) and
 ::              the shard trainer reads shards in file order. 5c now mixes
 ::              the training rows with a seeded shuffle when it writes the

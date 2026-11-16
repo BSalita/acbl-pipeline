@@ -2,24 +2,28 @@
 setlocal EnableExtensions
 :: One-time ACBL upgrade: add the opening-lead and SuitC columns to the
 :: existing ACBL data (no new downloads, no model retraining).
-::   1. fill the shared SuitC cache (E:\bridge\data\suitc\combos)   minutes if
-::      the FFBridge upgrade already filled it, else ~1-2 h
-::   2. 3a hand records with SuitC (SC_* columns)                    ~2-3 h
+:: Times are from the run of 2026-11-15 17:02 to 2026-11-16 09:48 (16h 46m).
+::   1. fill the shared SuitC cache (E:\bridge\data\suitc\combos)    12 s
+::      (already filled: 783,075 holdings; from empty ~1-2 h, estimate)
+::   2. 3a hand records with SuitC (SC_* columns)                    1h 47m
 ::   3. 3c board results with the SD lead score (20 samples). Adds
 ::      DD_Lead_Cost, Lead_Is_DD_Best, SD_Lead_*, DD_Tricks_Diff_SC.
 ::      Club only for the lead columns: tournaments record no lead.
-::      The first run solves ~5.7M lead positions (~33 h) on top of
-::      the ~16.5 h rewrite                                          ~50 h
-::   4. Elo ratings (keeps the lead and SuitC columns)                ~40 min
+::      Club 14h 2m, of it 12h 44m solving 5.51M lead positions at
+::      120 positions/s; tournament 20m                              14h 22m
+::   4. Elo ratings (keeps the lead and SuitC columns)                7 min
 ::   5. publish: acbl-pipeline\u.bat (board results to X1 acbl-stage),
 ::      elo\u.bat (Elo parquets), bridgestats-acbl\u.bat (narrow hand records)
 ::   6. redeploy Elo, postmortem and BridgeStats-ACBL on X1
+::      Steps 5 and 6 took 29 min together with only the board results
+::      (93 GB) published; the Elo and BridgeStats files, published by
+::      hand afterwards, took 3 min, and the three redeploys 3 min.
 :: Run it after ffbridge_upgrade_lead_suitc.bat has finished: both are CPU
 :: bound, and elo\u.bat also publishes the FFBridge archive.
 :: Each step stops the run on failure; rerun the script as is: step 1 solves
-:: only uncached holdings, 3a skips a side that is already done, 3c resumes
-:: club years already written (tournament is redone, ~3.3 h) and keeps
-:: solved lead positions in acbl\acbl_club_sd_lead_cache\.
+:: only uncached holdings, 3a skips a side that is already done, 3c
+:: recomputes only the blocks not yet written and keeps solved lead
+:: positions in acbl\acbl_club_sd_lead_cache\.
 :: Stage 5 (model data, training) is not run: the models do not use these
 :: columns.
 :: NOTE 2026-11-15: step 4 now also applies the pair-rating fix

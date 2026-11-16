@@ -206,6 +206,7 @@ def create_elo_ratings(club_or_tournament, out_dir=None):
     # Select only necessary columns
     regex_cols = [
             'Date', 'is_virtual_game', 'session_id', 'event_id', 'event_name',
+            'Club$',  # club number (club only): home-versus-away split for Home_Edge_Z (elo/foresight.py)
             'Round', 'Board', 'Pair_Number_(NS|EW)',
             'Player_ID_[NESW]', 'Player_Name_[NESW]', 'MP_(NS|EW)', 'MP_Top',
             'MasterPoints_[NESW]', 'MasterPoints_(NS|EW)', 'Pct_NS',

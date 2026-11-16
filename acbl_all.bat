@@ -254,10 +254,13 @@ echo [Stage 3] Augmentation...
 ::         input, cache rows, code and versions match
 ::         acbl_{club,tournament}_hand_records_augmented_manifest.json;
 ::         --force recomputes. The first run after this change recomputes.
-:: OPTION: set ACBL_SUITC=1 to add the SC_* SuitC single-suit columns (needs
+:: OPTION: ACBL_SUITC=1 (default since 2026-11-15; set ACBL_SUITC=0 to turn
+::         off) adds the SC_* SuitC single-suit columns (needs
 ::         ..\SuitC\build\Release\SuitC.exe). Holdings are cached in
 ::         E:\bridge\data\suitc\combos\ (shared with FFBridge); the first run
 ::         solves ~800k holdings (~1-2 h). Changing it recomputes 3a and 3c.
+::         Guess_Foresight_Z (elo\foresight.py) needs these columns.
+if not defined ACBL_SUITC set "ACBL_SUITC=1"
 set "SUITC_ARGS="
 if "%ACBL_SUITC%"=="1" set "SUITC_ARGS=--suitc"
 echo   [3a] Augmenting hand records (DD + SD + Par; SuitC %ACBL_SUITC%)...
@@ -304,12 +307,14 @@ if errorlevel 1 goto :error
 ::         Before blocks: tournament 8799s (2h 27m) on 2026-11-14, paging;
 ::         2026-10-02 both sides 59213s (16h 27m), club 47221s.
 ::         Joins ~6k-col hand-record features into board results.
-:: OPTION: set ACBL_SD_LEAD_SAMPLES=20 to add the single-dummy lead score
+:: OPTION: ACBL_SD_LEAD_SAMPLES=20 (default since 2026-11-15; set
+::         ACBL_SD_LEAD_SAMPLES=0 to turn off) adds the single-dummy lead score
 ::         (SD_Lead_* columns, club only: tournaments record no lead). The first
 ::         club run solves ~5.7M lead positions, ~33 h at 20 (48 positions/s);
 ::         acbl/acbl_club_sd_lead_cache/ keeps them, so later runs solve only new
 ::         ones. Changing the value recomputes every club block.
-if not defined ACBL_SD_LEAD_SAMPLES set "ACBL_SD_LEAD_SAMPLES=0"
+::         Lead_Foresight_Z (elo\foresight.py) needs these columns.
+if not defined ACBL_SD_LEAD_SAMPLES set "ACBL_SD_LEAD_SAMPLES=20"
 echo   [3c] Augmenting board results (step 2: join hand records + full augmentation; SD lead samples %ACBL_SD_LEAD_SAMPLES%)...
 call :pyrun 3c acbl_board_results_augment_step2.py --sd-lead-samples %ACBL_SD_LEAD_SAMPLES%
 if errorlevel 1 goto :error

@@ -707,6 +707,26 @@ def _looks_like_recap(page_html: str) -> bool:
     return re.search(r"<title>\s*ACBL Live\s*</title>", page_html or "", flags=re.I) is not None
 
 
+def _looks_like_empty_scorecard(page_html: str) -> bool:
+    """True for a real ACBL Live scorecard page whose board table has no rows.
+
+    Seen on 2026-11-23 for 20 sessions (2015-2026): the recap lists the pairs and
+    their scores, but every scorecard table and the Detailed Board page are
+    empty, so the session has no board results to save.
+    """
+    if not _looks_like_recap(page_html):
+        return False
+    match = re.search(
+        r"<table\b[^>]*class=\"[^\"]*\bscorecard\b[^\"]*\"[^>]*>(.*?)</table>",
+        page_html,
+        flags=re.S | re.I,
+    )
+    if not match:
+        return False
+    body = re.search(r"<tbody\b[^>]*>(.*?)</tbody>", match.group(1), flags=re.S | re.I)
+    return body is not None and re.search(r"<tr\b", body.group(1), flags=re.I) is None
+
+
 def _default_fetch(url: str) -> str:
     last = ""
     for attempt in range(1, 4):
@@ -972,6 +992,9 @@ def download_sessions_from_web(
             if not payload or not any(section["board_results"] for section in payload["sections"]):
                 stats.unavailable += 1
                 stats.unavailable_ids.append(session_id)
+                if scorecards and all(_looks_like_empty_scorecard(page) for _url, page in scorecards):
+                    # ACBL published the standings without the boards: remembered, not retried.
+                    stats.no_board_rows_ids.append(session_id)
                 print(f"UNAVAILABLE (no board rows): {session_id}")
                 continue
             text = json.dumps(payload, indent=4, ensure_ascii=False)

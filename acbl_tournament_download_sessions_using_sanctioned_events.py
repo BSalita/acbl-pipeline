@@ -277,6 +277,16 @@ WEB_TEAM_GAME_TYPES = frozenset({"Swiss", "Teams", "KO", "Compact KO", "Swiss Q 
 WEB_NO_SCORECARDS_FILE = "_web_no_pair_scorecards.json"
 WEB_SETTLE_DAYS = 30
 
+# --- Sessions whose scorecards have no board rows -------------------------------
+# Some sessions, of any game type, have a recap with results and links to pair
+# scorecards, but every scorecard table is empty, and so is the Detailed Board
+# page: ACBL published the standings without the boards. Checked 2026-11-23 on
+# 20 such sessions (2015-2026, live.acbl.org and web3.acbl.org). The webpage path
+# can never save them. They are remembered in WEB_NO_BOARD_ROWS_FILE and skipped
+# on the same terms as the team sessions above (checked at least WEB_SETTLE_DAYS
+# after the event started), whatever the game type.
+WEB_NO_BOARD_ROWS_FILE = "_web_no_board_rows.json"
+
 
 def session_event_id(session_id: str) -> str:
     return session_id.rpartition("-")[0]
@@ -287,10 +297,11 @@ def is_team_session(session_id: str, event_info: Mapping[str, tuple[str, str]]) 
     return game_type in WEB_TEAM_GAME_TYPES
 
 
-def load_web_no_scorecards(sessions_dir: pathlib.Path) -> dict[str, str]:
-    """``session id -> date checked`` for recaps seen with no pair scorecards."""
+def load_web_no_scorecards(sessions_dir: pathlib.Path, filename: str = WEB_NO_SCORECARDS_FILE) -> dict[str, str]:
+    """``session id -> date checked`` for recaps seen with no pair scorecards
+    (or, with ``filename=WEB_NO_BOARD_ROWS_FILE``, with only empty scorecards)."""
     try:
-        data = json.loads((sessions_dir / WEB_NO_SCORECARDS_FILE).read_text(encoding="utf-8"))
+        data = json.loads((sessions_dir / filename).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
     sessions = data.get("sessions") if isinstance(data, Mapping) else None
@@ -299,16 +310,29 @@ def load_web_no_scorecards(sessions_dir: pathlib.Path) -> dict[str, str]:
     return {str(key): str(value) for key, value in sessions.items()}
 
 
-def save_web_no_scorecards(sessions_dir: pathlib.Path, checked: Mapping[str, str]) -> None:
+_WEB_SKIP_NOTES = {
+    WEB_NO_SCORECARDS_FILE: "Team sessions whose live.acbl.org recap page had no pair scorecards on the date shown.",
+    WEB_NO_BOARD_ROWS_FILE: (
+        "Sessions whose live.acbl.org pair scorecards all had empty board tables on the date shown "
+        "(ACBL published the standings without the boards)."
+    ),
+}
+
+
+def save_web_no_scorecards(
+    sessions_dir: pathlib.Path,
+    checked: Mapping[str, str],
+    filename: str = WEB_NO_SCORECARDS_FILE,
+) -> None:
     payload = {
         "note": (
-            "Team sessions whose live.acbl.org recap page had no pair scorecards on the date shown. "
+            f"{_WEB_SKIP_NOTES[filename]} "
             "The webpage download path skips them; the API path does not. Delete this file, or pass "
             "--recheck-web-unavailable, to have them requested again."
         ),
         "sessions": dict(sorted(checked.items())),
     }
-    path = sessions_dir / WEB_NO_SCORECARDS_FILE
+    path = sessions_dir / filename
     temp = path.with_suffix(".tmp")
     temp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
     temp.replace(path)
@@ -320,13 +344,26 @@ def web_team_sessions_to_skip(
     checked: Mapping[str, str],
 ) -> set[str]:
     """Team sessions already seen, after the event had settled, with no pair scorecards."""
+    return web_settled_sessions_to_skip(session_ids, event_info, checked, game_types=WEB_TEAM_GAME_TYPES)
+
+
+def web_settled_sessions_to_skip(
+    session_ids: Iterable[str],
+    event_info: Mapping[str, tuple[str, str]],
+    checked: Mapping[str, str],
+    game_types: frozenset[str] | None = None,
+) -> set[str]:
+    """Sessions in ``checked`` whose check was made after the event had settled.
+
+    ``game_types`` limits the skip to those event types; ``None`` allows any.
+    """
     skip: set[str] = set()
     for session_id in session_ids:
         when = checked.get(session_id)
         if not when:
             continue
         game_type, start = event_info.get(session_event_id(session_id), ("", ""))
-        if game_type not in WEB_TEAM_GAME_TYPES:
+        if game_types is not None and game_type not in game_types:
             continue
         try:
             checked_on = datetime.strptime(when[:10], "%Y-%m-%d")
@@ -356,6 +393,8 @@ class DownloadStats:
     unavailable_ids: list[str] = field(default_factory=list)
     # Webpage path: sessions whose recap page loaded and linked no pair scorecards.
     no_scorecard_ids: list[str] = field(default_factory=list)
+    # Webpage path: sessions whose pair scorecards all loaded with empty board tables.
+    no_board_rows_ids: list[str] = field(default_factory=list)
 
     def failed(self) -> bool:
         return self.aborted or self.errors > 0
@@ -646,7 +685,8 @@ def main() -> int:
         action="store_true",
         help=(
             "Webpage path: also request team sessions already seen with no pair scorecards "
-            f"(listed in {WEB_NO_SCORECARDS_FILE}); they are skipped by default"
+            f"(listed in {WEB_NO_SCORECARDS_FILE}) and sessions already seen with only empty "
+            f"scorecards ({WEB_NO_BOARD_ROWS_FILE}); they are skipped by default"
         ),
     )
 
@@ -680,6 +720,7 @@ def main() -> int:
 
     event_info: dict[str, tuple[str, str]] = {}
     web_skipped: list[str] = []
+    web_skipped_no_rows: list[str] = []
     session_ids = (
         sorted(set(args.session_id), reverse=True)
         if args.session_id
@@ -712,6 +753,7 @@ def main() -> int:
         from acbl_tournament_live_download import download_sessions_from_web
 
         checked = load_web_no_scorecards(sessions_dir)
+        checked_rows = load_web_no_scorecards(sessions_dir, WEB_NO_BOARD_ROWS_FILE)
         if not args.recheck_web_unavailable:
             skip = web_team_sessions_to_skip(ids, event_info, checked)
             if skip:
@@ -721,6 +763,14 @@ def main() -> int:
                     f"Skipping {len(skip):,} team sessions: their recap pages have no pair scorecards, "
                     f"so only the API can deliver them ({WEB_NO_SCORECARDS_FILE}). "
                     f"Fetching {len(ids):,}."
+                )
+            skip_rows = web_settled_sessions_to_skip(ids, event_info, checked_rows)
+            if skip_rows:
+                web_skipped_no_rows.extend(sorted(skip_rows))
+                ids = [session_id for session_id in ids if session_id not in skip_rows]
+                print(
+                    f"Skipping {len(skip_rows):,} sessions: their scorecards on live.acbl.org have no "
+                    f"board rows ({WEB_NO_BOARD_ROWS_FILE}). Fetching {len(ids):,}."
                 )
         web = DownloadStats()
         try:
@@ -734,11 +784,14 @@ def main() -> int:
             )
         finally:
             # Also after Ctrl+C: keep what this run learned.
+            today = datetime.now().strftime("%Y-%m-%d")
             found = [sid for sid in web.no_scorecard_ids if is_team_session(sid, event_info)]
             if found:
-                today = datetime.now().strftime("%Y-%m-%d")
                 checked.update({sid: today for sid in found})
                 save_web_no_scorecards(sessions_dir, checked)
+            if web.no_board_rows_ids:
+                checked_rows.update({sid: today for sid in web.no_board_rows_ids})
+                save_web_no_scorecards(sessions_dir, checked_rows, WEB_NO_BOARD_ROWS_FILE)
         return web
 
     if use_web:
@@ -778,7 +831,7 @@ def main() -> int:
     missing = audit_session_artifacts(
         audit_ids,
         sessions_dir,
-        unavailable_ids=stats.unavailable_ids + web_skipped,
+        unavailable_ids=stats.unavailable_ids + web_skipped + web_skipped_no_rows,
     )
 
     print()
@@ -804,6 +857,11 @@ def main() -> int:
         print(
             f"{len(web_skipped):,} team session(s) were not requested: live.acbl.org has no pair "
             "scorecards for them. A valid ACBL_API_KEY fetches them through the API."
+        )
+    if web_skipped_no_rows:
+        print(
+            f"{len(web_skipped_no_rows):,} session(s) were not requested: their live.acbl.org scorecards "
+            f"have no board rows ({WEB_NO_BOARD_ROWS_FILE})."
         )
     if stats.sign_in_required:
         print(

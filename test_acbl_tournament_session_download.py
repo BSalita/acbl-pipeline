@@ -306,6 +306,74 @@ class WebTeamSessionSkipTests(unittest.TestCase):
         self.assertEqual(stats.unavailable, 3)
         self.assertEqual(stats.no_scorecard_ids, ["2605102-201B-1"])
 
+    # Trimmed from https://web3.acbl.org/event/1803023/1/1/scores/A/N/14 (2026-11-23):
+    # a real results page whose scorecard table has no board rows.
+    EMPTY_SCORECARD = (
+        "<html><head><title>ACBL Live</title></head><body>"
+        '<table class="tablesorter scorecard table"><thead><tr><th></th><th>Board</th>'
+        "<th>Contract</th><th>By</th><th>Plus</th><th>Minus</th><th>Matchpoints</th><th>%</th>"
+        "</tr></thead><tbody>\n\t\t\t\t\t\t\t\t\t</tbody></table></body></html>"
+    )
+
+    def test_empty_scorecard_page_is_recognized(self) -> None:
+        from acbl_tournament_live_download import _looks_like_empty_scorecard
+
+        self.assertTrue(_looks_like_empty_scorecard(self.EMPTY_SCORECARD))
+        with_row = self.EMPTY_SCORECARD.replace("<tbody>", '<tbody><tr><td><a href="?board_num=1">1</a></td></tr>')
+        self.assertFalse(_looks_like_empty_scorecard(with_row))
+        self.assertFalse(_looks_like_empty_scorecard(self.EMPTY_SCORECARD.replace("ACBL Live", "Login")))
+        self.assertFalse(_looks_like_empty_scorecard("<html><title>ACBL Live</title><body>no table</body></html>"))
+
+    def test_no_board_rows_is_remembered_only_when_every_scorecard_table_is_empty(self) -> None:
+        from acbl_tournament_live_download import download_sessions_from_web
+
+        def recap(session: str) -> str:
+            return (
+                "<html><head><title>ACBL Live</title></head><body><h2>Morning 299er Pairs</h2>"
+                f'<a href="/event/1803023/{session}/1/scores/A/N/14">Scores</a></body></html>'
+            )
+
+        pages = {
+            "/event/1803023/1/1/recap": recap("1"),
+            "/event/1803023/1/1/scores/A/N/14": self.EMPTY_SCORECARD,
+            "/event/1803023/2/1/recap": recap("2"),
+            # Not a results page (for example a check page): may be temporary, so asked again.
+            "/event/1803023/2/1/scores/A/N/14": "<html><title>Just a moment...</title></html>",
+        }
+        ids = ["1803023-1-1", "1803023-2-1"]
+        stats = DownloadStats()
+        with tempfile.TemporaryDirectory() as tmp:
+            download_sessions_from_web(ids, Path(tmp), fetch=pages.__getitem__, stats=stats)
+        self.assertEqual(stats.unavailable, 2)
+        self.assertEqual(stats.no_board_rows_ids, ["1803023-1-1"])
+        self.assertEqual(stats.no_scorecard_ids, [])
+
+    def test_no_board_rows_sessions_are_skipped_for_any_game_type_once_settled(self) -> None:
+        from acbl_tournament_download_sessions_using_sanctioned_events import (
+            WEB_NO_BOARD_ROWS_FILE,
+            load_web_no_scorecards,
+            save_web_no_scorecards,
+            web_settled_sessions_to_skip,
+        )
+
+        checked = {
+            "2605102-191A-1": "2026-11-23",  # pairs, checked months later: skip
+            "2605102-201B-1": "2026-11-23",  # team, checked months later: skip
+            "2610350-0101-1": "2026-11-12",  # checked 12 days after the event: ask again
+            "9999999-XXXX-1": "2026-11-23",  # unknown event: ask again
+        }
+        self.assertEqual(
+            web_settled_sessions_to_skip(list(checked) + ["2605102-191A-2"], self.EVENTS, checked),
+            {"2605102-191A-1", "2605102-201B-1"},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            save_web_no_scorecards(folder, checked, WEB_NO_BOARD_ROWS_FILE)
+            self.assertEqual(load_web_no_scorecards(folder, WEB_NO_BOARD_ROWS_FILE), checked)
+            self.assertEqual(load_web_no_scorecards(folder), {})  # the team list is a separate file
+            note = json.loads((folder / WEB_NO_BOARD_ROWS_FILE).read_text(encoding="utf-8"))["note"]
+            self.assertIn("empty board tables", note)
+
 
 if __name__ == "__main__":
     unittest.main()

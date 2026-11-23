@@ -2,7 +2,34 @@ import unittest
 
 import polars as pl
 
-from acbl_sql_to_hand_records_clean import _parse_acbl_par, sort_by_session
+from acbl_sql_to_hand_records_clean import _parse_acbl_par, clean_hand_records, sort_by_session
+
+
+class NewFormHandRecordTests(unittest.TestCase):
+    """Club hand records from about March 2026 on: spaced cards, ten as T, no ACBL DD/Par."""
+
+    # Raw row of hand-record set 1107741, board 19.
+    SPACED = ("S 7 6 5H K 9 5 3D K 6 5C A Q 4S A K Q 8 2H 6D Q J 8C J 8 7 6"
+              "S T 9 4 3H Q 8D 9 7 4C T 9 5 3S JH A J T 7 4 2D A T 3 2C K 2")
+    OLDER = SPACED.replace(" ", "").replace("T", "10")
+
+    def _clean(self, rows):
+        frame = pl.DataFrame(rows, schema={
+            "board": pl.Int16, "board_record_string": pl.String, "hand_record_id": pl.String,
+            "dealer": pl.String, "vulnerability": pl.String, "double_dummy_ew": pl.String,
+            "double_dummy_ns": pl.String, "par": pl.String,
+        }, orient="row")
+        return clean_hand_records(frame)
+
+    def test_spaced_row_without_dd_is_kept_with_its_pbn(self) -> None:
+        out = self._clean([(19, self.SPACED, "1107741", "S", "E-W", "", "", "")])
+        self.assertEqual(out["PBN"].to_list(),
+                         ["N:765.K953.K65.AQ4 T943.Q8.974.T953 J.AJT742.AT32.K2 AKQ82.6.QJ8.J876"])
+        self.assertNotIn("_no_acbl_dd", out.columns)
+
+    def test_older_form_row_without_dd_is_still_dropped(self) -> None:
+        out = self._clean([(19, self.OLDER, "1107741", "S", "E-W", "", "", "")])
+        self.assertEqual(out.height, 0)
 
 
 class ParParseTests(unittest.TestCase):

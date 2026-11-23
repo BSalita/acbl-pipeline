@@ -211,6 +211,19 @@ def clean_hand_records(hrs_df):
     t0 = _timed('vul filter', t0)
 
     hrs_df = hrs_df.with_columns(pl.col('board_record_string').str.replace_all('-', ''))
+    # Club hand records from about May 2026 on put a space between cards and write
+    # the ten as T ("S Q 6 3H Q J 4 2D K 5C ..."). validate_brs rejects T, so these
+    # were dropped (26,489 distinct deals in the 2026-11-14 run). Same form as
+    # mlBridgeAcblLib.normalize_brs_expr, which the live postmortems use.
+    # That form also never has ACBL's double dummy or par (checked 2026-11-24:
+    # 33,523 rows, 1,527 hand-record sets, 2026-03-09 to 2026-11-22, all empty), so
+    # _no_acbl_dd keeps those rows past the empty DD/Par filter below.
+    hrs_df = hrs_df.with_columns(pl.col('board_record_string').str.contains(' ', literal=True).fill_null(False).alias('_no_acbl_dd'))
+    n_spaced = hrs_df['_no_acbl_dd'].sum()
+    print(f"Normalizing {n_spaced} spaced board_record_strings (ten as T)")
+    hrs_df = hrs_df.with_columns(pl.col('board_record_string')
+                                 .str.replace_all(r'\s+', '')
+                                 .str.replace_all('T', '10', literal=True))
 
     # drop results whose board_record_string contains invalid characters (5492639, 13290144) or wrong number of cards (4754685, 6213531)
     print("Validating board_record_strings...")
@@ -224,7 +237,11 @@ def clean_hand_records(hrs_df):
     b2 = hrs_df['ACBL_double_dummy_ew'] != ''
     b3 = hrs_df['ACBL_Par'] != ''
     assert (b1 == b2).fill_null(False).all() and (b1 == b3).fill_null(False).all()
-    print(f"Dropping {(~b1).sum()} rows with empty DD/Par columns")
+    # New-form hand records carry no ACBL DD/Par: set them aside, skip the DD and
+    # par checks, and add them back once those columns are dropped.
+    no_acbl_dd = hrs_df.filter(~b1.fill_null(False) & pl.col('_no_acbl_dd'))
+    print(f"Dropping {(~b1).sum() - no_acbl_dd.height} rows with empty DD/Par columns; "
+          f"keeping {no_acbl_dd.height} new-form rows, which never have them")
     hrs_df = hrs_df.filter(b1) # drop rows which have empty double dummy or par columns
 
     # clean double dummy columns. rewrite into standarized form.
@@ -267,6 +284,8 @@ def clean_hand_records(hrs_df):
         hrs_df = hrs_df.filter(pl.col('ACBL_Par').is_in(good_pars))
     print(f"Pass outs count: {sum(n for n, p in zip(par_counts['count'], parsed) if p is not None and p[0] == 0)}")
     hrs_df = hrs_df.drop('ACBL_Par')
+    no_acbl_dd = no_acbl_dd.drop(['ACBL_double_dummy_ns', 'ACBL_double_dummy_ew', 'ACBL_Par'])
+    hrs_df = pl.concat([hrs_df, no_acbl_dd.select(hrs_df.columns)]).drop('_no_acbl_dd')
     t0 = _timed('par', t0)
 
     # create HandRecordBoard column

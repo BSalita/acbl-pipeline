@@ -151,6 +151,11 @@ if errorlevel 1 goto :error
 ::         2026-10-02 console printed this banner, then Stage 3 started 4s
 ::         after 1b (06:40:29 -^> 06:40:33). 1c-2b were not remeasured;
 ::         cleaned parquets were not rebuilt from the new sqlite.
+:: SIGN-IN: some events (web3.acbl.org) need an ACBL sign-in. On the sign-in
+::         page 1a, 1c and 1d now wait (up to 6 h, phone alert after 90 s when
+::         ACBL_CHALLENGE_NTFY_URL is set) for you to sign in IN THE
+::         DOWNLOADER'S CHROME WINDOW, then carry on. Do not close that window.
+::         2026-11-23: 1c failed four times on event 2608114 before this.
 echo   [1c] Downloading tournament sanctioned events...
 call :pyrun 1c acbl_tournament_download_sanctioned_events.py
 if errorlevel 1 goto :error

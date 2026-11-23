@@ -274,36 +274,133 @@ class LiveTournamentParseTests(unittest.TestCase):
         self.assertFalse(is_sign_in_url("https://live.acbl.org/event/1606017/SS03/4/scores/ZZ/A/1"))
         self.assertFalse(is_sign_in_url(""))
 
-    def test_default_fetch_restarts_chrome_once_then_reports_sign_in(self) -> None:
+    def test_default_fetch_reports_a_sign_in_page_that_got_past_the_wait(self) -> None:
         import acbl_tournament_live_download as live
 
-        landed = ["https://login.acbl.org/login", "https://web3.acbl.org/event/1606017/SS03/4/recap"]
-        calls = {"fetch": 0, "restart": 0}
+        calls = {"fetch": 0}
 
         def fake_fetch(url: str) -> str:
             calls["fetch"] += 1
             return "<html>page</html>"
 
-        def fake_restart() -> None:
-            calls["restart"] += 1
-
-        saved = (live.fetch_acbl_page, live.last_fetched_url, live.shutdown_acbl_browser, live._last_sign_in_restart)
+        saved = (live.fetch_acbl_page, live.last_fetched_url)
         live.fetch_acbl_page = fake_fetch
-        live.last_fetched_url = lambda: landed[min(calls["fetch"], len(landed)) - 1]
-        live.shutdown_acbl_browser = fake_restart
-        live._last_sign_in_restart = 0.0
         try:
-            # Sign-in page, Chrome restarted, then the real page.
+            live.last_fetched_url = lambda: "https://web3.acbl.org/event/1606017/SS03/4/recap"
             self.assertEqual(live._default_fetch("/event/1606017/SS03/4/recap"), "<html>page</html>")
-            self.assertEqual(calls, {"fetch": 2, "restart": 1})
-            # Still the sign-in page soon after a restart: no second restart.
-            landed[:] = ["https://login.acbl.org/login"]
-            calls.update(fetch=0, restart=0)
+            live.last_fetched_url = lambda: "https://login.acbl.org/login"
             with self.assertRaises(live.SignInRequiredError):
                 live._default_fetch("/event/1606017/SS03/4/recap")
-            self.assertEqual(calls, {"fetch": 1, "restart": 0})
+            self.assertEqual(calls["fetch"], 2)  # no Chrome restart, no second try
         finally:
-            live.fetch_acbl_page, live.last_fetched_url, live.shutdown_acbl_browser, live._last_sign_in_restart = saved
+            live.fetch_acbl_page, live.last_fetched_url = saved
+
+
+class _SignInPage:
+    """Fake page: on the ACBL sign-in page until ``signed_in_after`` one-second waits."""
+
+    LOGIN = "https://login.acbl.org/login"
+
+    def __init__(self, signed_in_after: int | None, landed: str = "https://my.acbl.org/") -> None:
+        self.signed_in_after = signed_in_after
+        self.waits = 0
+        self.reloads = 0
+        self.gotos: list[str] = []
+        self.closed = False
+        self.url = self.LOGIN
+        self._landed = landed
+
+    def content(self) -> str:
+        if self.url == self.LOGIN:
+            return "<html><head><title>Login</title></head><body><form></form></body></html>"
+        return '<html><table id="events"></table><h1>ACBL Live</h1></html>'
+
+    def title(self) -> str:
+        return "Login" if self.url == self.LOGIN else "ACBL Live"
+
+    def is_closed(self) -> bool:
+        return self.closed
+
+    def wait_for_timeout(self, _ms: int) -> None:
+        self.waits += 1
+        if self.signed_in_after is not None and self.waits >= self.signed_in_after:
+            self.url = self._landed
+
+    def wait_for_load_state(self, *_args, **_kwargs) -> None:
+        return None
+
+    def reload(self, **_kwargs) -> None:
+        self.reloads += 1
+
+    def goto(self, url: str, **_kwargs) -> None:
+        self.gotos.append(url)
+        self.url = url
+
+
+class SignInWaitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import acbl_club_download_to_json as club
+
+        self.club = club
+        self.saved_given_up = club._sign_in_given_up
+        club._sign_in_given_up = False
+
+    def tearDown(self) -> None:
+        self.club._sign_in_given_up = self.saved_given_up
+
+    def test_sign_in_error_is_a_block_that_is_not_retried(self) -> None:
+        error = self.club.SignInRequiredError("x")
+        self.assertIsInstance(error, self.club.Forbidden403Error)
+        self.assertFalse(error.rate_limited)
+
+    def test_waits_without_reloading_then_loads_the_page_asked_for(self) -> None:
+        page = _SignInPage(signed_in_after=5)
+        wanted = "https://live.acbl.org/events/2608114"
+        self.assertTrue(_wait_through_cloudflare(page, timeout_ms=60_000, reload_after_s=0, requested_url=wanted))
+        self.assertEqual(page.reloads, 0)  # never reloaded under someone typing a password
+        self.assertEqual(page.gotos, [wanted])
+        self.assertEqual(page.url, wanted)
+
+    def test_warm_up_does_not_wait_for_sign_in(self) -> None:
+        page = _SignInPage(signed_in_after=None)
+        self.assertTrue(_wait_through_cloudflare(page, timeout_ms=60_000, reload_after_s=0, sign_in=False))
+        self.assertEqual(page.waits, 0)
+
+    def test_announced_wait_returns_once_signed_in(self) -> None:
+        page = _SignInPage(signed_in_after=3)
+        self.club._wait_for_sign_in(page, "https://live.acbl.org/events/2608114", timeout_s=60, quiet_s=0)
+        self.assertEqual(page.waits, 3)
+        self.assertFalse(self.club._sign_in_given_up)
+
+    def test_wait_runs_out_then_later_sign_in_pages_fail_at_once(self) -> None:
+        page = _SignInPage(signed_in_after=None)
+        with self.assertRaises(self.club.SignInRequiredError):
+            self.club._wait_for_sign_in(page, timeout_s=0, quiet_s=0)
+        self.assertTrue(self.club._sign_in_given_up)
+        later = _SignInPage(signed_in_after=None)
+        with self.assertRaises(self.club.SignInRequiredError):
+            self.club._wait_for_sign_in(later, timeout_s=3600, quiet_s=0)
+        self.assertEqual(later.waits, 0)
+
+    def test_closing_the_window_during_the_wait_reopens_chrome(self) -> None:
+        page = _SignInPage(signed_in_after=None)
+        page.closed = True
+        with self.assertRaises(RuntimeError) as caught:
+            self.club._wait_for_sign_in(page, timeout_s=60, quiet_s=0)
+        # fetch_acbl_page retries this error on a fresh Chrome.
+        self.assertTrue(self.club._closed_target_error(caught.exception))
+        self.assertFalse(self.club._sign_in_given_up)
+
+    def test_club_details_page_on_sign_in_is_waited_on(self) -> None:
+        wanted = "https://my.acbl.org/club-results/details/100"
+        page = _SignInPage(signed_in_after=2)
+        page.content = lambda: (  # type: ignore[method-assign]
+            "<html><title>Login</title></html>" if page.url == page.LOGIN
+            else '<html><script>var data = {"x": 1};</script></html>'
+        )
+        page.wait_for_selector = lambda *_a, **_k: None  # type: ignore[attr-defined]
+        self.assertEqual(self.club._session_json_from_page(page, wanted), {"x": 1})
+        self.assertEqual(page.gotos, [wanted])
 
     def test_team_scorecards_without_boards_stop_after_three(self) -> None:
         links = "".join(f'<a href="/event/1606017/SS03/4/scores/ZZ/A/{n}">{n}</a>' for n in range(1, 61))

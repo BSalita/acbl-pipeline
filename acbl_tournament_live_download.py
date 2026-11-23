@@ -23,9 +23,11 @@ from typing import Any, Callable
 
 import pathlib
 
-from acbl_club_download_to_json import (
+from acbl_club_download_to_json import (  # noqa: F401  (SignInRequiredError, is_sign_in_url re-exported)
     Forbidden403Error,
+    SignInRequiredError,
     fetch_acbl_page,
+    is_sign_in_url,
     last_fetched_url,
     shutdown_acbl_browser,
 )
@@ -37,11 +39,11 @@ TOURNAMENT_LIST_TYPES = ("nabc", "regionals", "sectionals")
 # live.acbl.org hands some events to web3.acbl.org, which wants an ACBL
 # sign-in. A Chrome that is not signed in ends on login.acbl.org/login. On
 # 2026-11-12 that page came back for about 3,950 recap requests in a row and
-# each was reported as "no pair scorecards"; restarting Chrome signed it in
-# again. So: restart Chrome, at most once per this many seconds, then report
-# the session as needing sign-in instead of as having no results.
-SIGN_IN_RESTART_INTERVAL_S = 600
-_last_sign_in_restart = 0.0
+# each was reported as "no pair scorecards". fetch_acbl_page now holds on the
+# sign-in page until someone signs in in the downloader's Chrome window (up to
+# 6 h, acbl_club_download_to_json.SIGN_IN_TIMEOUT_S). If no one does, it raises
+# SignInRequiredError and later sign-in pages fail at once: sessions are then
+# reported as needing sign-in, not as having no results.
 
 # Some recaps link to scorecards that have no board rows: seen on the last
 # session of side-pairs series (2608117-SS01-5, 37 scorecards; sessions 1-4
@@ -49,17 +51,6 @@ _last_sign_in_restart = 0.0
 EMPTY_SCORECARD_LIMIT = 3
 
 
-class SignInRequiredError(Exception):
-    """The ACBL sign-in page came back instead of the page asked for."""
-
-
-def is_sign_in_url(url: str) -> bool:
-    """True for login.acbl.org, or the /login page of another acbl.org host."""
-    parts = urllib.parse.urlsplit(url or "")
-    host = (parts.hostname or "").lower()
-    if host == "login.acbl.org":
-        return True
-    return host.endswith(".acbl.org") and parts.path.rstrip("/") == "/login"
 
 _SUIT_LETTER = {
     "clubs": "C",
@@ -717,19 +708,13 @@ def _looks_like_recap(page_html: str) -> bool:
 
 
 def _default_fetch(url: str) -> str:
-    global _last_sign_in_restart
     last = ""
     for attempt in range(1, 4):
+        # Waits at an ACBL sign-in page until someone signs in.
         last = fetch_acbl_page(_abs_live(url))
-        landed = last_fetched_url()
-        if is_sign_in_url(landed):
-            now = time.time()
-            if now - _last_sign_in_restart < SIGN_IN_RESTART_INTERVAL_S:
-                raise SignInRequiredError(f"ACBL sign-in page ({landed}) instead of {url}")
-            _last_sign_in_restart = now
-            print(f"  ACBL sign-in page instead of {url}; restarting Chrome to sign in again")
-            shutdown_acbl_browser()
-            continue
+        if is_sign_in_url(last_fetched_url()):
+            # Only if a sign-in page got past that wait.
+            raise SignInRequiredError(f"ACBL sign-in page ({last_fetched_url()}) instead of {url}")
         if _looks_gateway_error(last) and attempt < 3:
             print(f"  gateway/challenge page for {url}; retry {attempt}")
             time.sleep(2)
@@ -910,14 +895,14 @@ def download_sessions_from_web(
             print(f"{index}/{total} [web] {LIVE_ORIGIN}{recap_url}")
             try:
                 recap_html = _fetch_page(recap_url)
+            except SignInRequiredError:  # a Forbidden403Error: catch it first
+                _needs_sign_in(session_id)
+                continue
             except Forbidden403Error as exc:
                 print(f"ERROR: {exc}")
                 stats.errors += 1
                 stats.aborted = True
                 break
-            except SignInRequiredError:
-                _needs_sign_in(session_id)
-                continue
             if recap_html is None:
                 if _give_up_on_session(session_id):
                     break
@@ -949,14 +934,14 @@ def download_sessions_from_web(
             for score_url in score_urls:
                 try:
                     loaded = _fetch_page(score_url)
+                except SignInRequiredError:  # a Forbidden403Error: catch it first
+                    sign_in = True
+                    break
                 except Forbidden403Error as exc:
                     print(f"ERROR: {exc}")
                     stats.errors += 1
                     stats.aborted = True
                     failed = True
-                    break
-                except SignInRequiredError:
-                    sign_in = True
                     break
                 if loaded is None:
                     score_failed = True

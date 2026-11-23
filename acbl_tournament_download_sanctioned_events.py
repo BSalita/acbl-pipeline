@@ -321,12 +321,14 @@ Environment:
                 print("API PAT rejected; switching to live.acbl.org webpage fallback.")
                 write_count = _from_web()
     except Exception as exc:
-        if type(exc).__name__ == "Forbidden403Error":
-            print(exc)
-            return 1
+        # SignInRequiredError comes only after the run waited (up to 6 h) on the
+        # sign-in page and no one signed in.
         if type(exc).__name__ == "SignInRequiredError":
             print(f"ERROR: {exc}")
             print("Sign in to ACBL in the downloader's Chrome window, then run this step again.")
+            return 1
+        if type(exc).__name__ == "Forbidden403Error":
+            print(exc)
             return 1
         raise
     except KeyboardInterrupt:

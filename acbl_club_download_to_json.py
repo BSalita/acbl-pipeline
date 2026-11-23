@@ -9,6 +9,7 @@ import json
 import sys
 import os
 import time
+import urllib.parse
 from datetime import datetime, date
 from typing import Optional, List
 
@@ -300,6 +301,8 @@ def _wait_through_cloudflare(
     page,
     timeout_ms: int = CHALLENGE_TIMEOUT_MS,
     reload_after_s: float = CHALLENGE_RELOAD_S,
+    requested_url: str = "",
+    sign_in: bool = True,
 ) -> bool:
     """
     After navigating, wait out a Cloudflare managed/JS challenge interstitial.
@@ -311,11 +314,18 @@ def _wait_through_cloudflare(
     challenge without a click. The wait defaults to six hours so an unattended
     run is still sitting on the check when someone returns.
 
+    With ``sign_in`` (the default), an ACBL sign-in page is waited on too
+    (see :func:`_wait_for_sign_in`); after the sign-in, ``requested_url`` is
+    loaded again. The my.acbl.org warm-up passes ``sign_in=False``: that page
+    always sends a browser that is not signed in to the sign-in page, and club
+    results do not need a sign-in.
+
     Returns:
         True once real page content is loaded.
 
     Raises:
         Forbidden403Error if the challenge never clears within timeout_ms.
+        SignInRequiredError if no one signs in within SIGN_IN_TIMEOUT_S.
     """
     deadline = time.time() + timeout_ms / 1000.0
     started = time.time()
@@ -344,6 +354,13 @@ def _wait_through_cloudflare(
                 page.wait_for_load_state('domcontentloaded', timeout=10000)
             except Exception:
                 pass
+            if sign_in and is_sign_in_url(_page_url(page)):
+                # Holds until someone signs in (or raises), then loads the
+                # page asked for and judges it again.
+                _wait_for_sign_in(page, requested_url)
+                if requested_url:
+                    page.goto(requested_url, wait_until="domcontentloaded", timeout=90000)
+                continue
             if announced:
                 print("  Cloudflare/WAF challenge cleared.")
             elif seen_challenge:
@@ -423,6 +440,105 @@ def _wait_through_cloudflare(
     )
 
 
+# --- ACBL sign-in ---------------------------------------------------------------
+# live.acbl.org hands some events to web3.acbl.org, which wants an ACBL
+# sign-in. A Chrome that is not signed in ends on login.acbl.org/login. On
+# 2026-11-12 that page came back for about 3,950 recap requests in a row; on
+# 2026-11-23 step 1c stopped on it four times (event 2608114) because the run
+# restarted Chrome and gave up within seconds, so no one could sign in in the
+# downloader's window. Now the run holds on the sign-in page, as it does on a
+# Cloudflare check, until someone signs in in that window.
+SIGN_IN_TIMEOUT_S = 6 * 60 * 60
+# A profile that is still signed in passes through login.acbl.org on its own
+# (OAuth redirects). Say nothing until the sign-in page has stayed this long.
+SIGN_IN_QUIET_S = 3
+SIGN_IN_STATUS_S = 60
+# Set when a sign-in wait ran out: later sign-in pages in this run fail at
+# once, so an unattended run reports them instead of waiting 6 h on each.
+_sign_in_given_up = False
+
+
+class SignInRequiredError(Forbidden403Error):
+    """The ACBL sign-in page came back, and no one signed in.
+
+    A Forbidden403Error (not rate_limited) so callers that stop on a block
+    stop on this too. The tournament session downloader catches it first and
+    records the session as needing sign-in.
+    """
+
+
+def is_sign_in_url(url: str) -> bool:
+    """True for login.acbl.org, or the /login page of another acbl.org host."""
+    parts = urllib.parse.urlsplit(url or "")
+    host = (parts.hostname or "").lower()
+    if host == "login.acbl.org":
+        return True
+    return host.endswith(".acbl.org") and parts.path.rstrip("/") == "/login"
+
+
+def _wait_for_sign_in(
+    page,
+    requested_url: str = "",
+    timeout_s: float = SIGN_IN_TIMEOUT_S,
+    quiet_s: float = SIGN_IN_QUIET_S,
+) -> None:
+    """Hold on the ACBL sign-in page until the browser leaves it.
+
+    The page is never reloaded or navigated here: a person may be typing in
+    it. Returns once the address is no longer a sign-in page (someone signed
+    in, or the OAuth redirect went through on its own).
+
+    Raises:
+        SignInRequiredError when no one signs in within ``timeout_s``, or at
+        once after an earlier wait in this run ran out.
+        An error saying the target "has been closed" when the window is
+        closed; fetch_acbl_page then reopens Chrome and tries again.
+    """
+    global _sign_in_given_up, _last_challenge_alert
+    wanted = requested_url or _page_url(page)
+    started = time.time()
+    announced = False
+    alerted = False
+    last_status = started
+    while is_sign_in_url(_page_url(page)):
+        if _page_is_closed(page):
+            raise RuntimeError("Target page, context or browser has been closed during the ACBL sign-in wait")
+        now = time.time()
+        if not announced and now - started >= quiet_s:
+            if _sign_in_given_up:
+                raise SignInRequiredError(f"ACBL sign-in page ({_page_url(page)}) instead of {wanted}")
+            print(f"  ACBL sign-in page ({_page_url(page)}) instead of {wanted}")
+            print("  -> Sign in to ACBL in this Chrome window. The run waits here until you do.")
+            print("  -> Do not close the window: the run carries on by itself once you are signed in.")
+            print(f"  -> This wait lasts up to {int(timeout_s / 3600)}h. Profile: {PROFILE_DIR}")
+            _bring_page_window_forward(page)
+            announced = True
+            last_status = now
+        if announced and not alerted and now - started >= CHALLENGE_ALERT_AFTER_S:
+            _send_challenge_alert(
+                "ACBL sign-in needed",
+                "The ACBL downloader is on the ACBL sign-in page. Sign in in its Chrome window. "
+                f"It waits up to {int(timeout_s / 3600)}h. Page: {wanted}",
+                "high",
+            )
+            alerted = True
+            _last_challenge_alert = now
+        if announced and now - last_status >= SIGN_IN_STATUS_S:
+            print(f"  ... still waiting for an ACBL sign-in ({int((now - started) / 60)}m elapsed)")
+            last_status = now
+        if now - started >= timeout_s:
+            _sign_in_given_up = True
+            raise SignInRequiredError(
+                f"no one signed in to ACBL within {int(timeout_s / 60)} minutes "
+                f"(sign-in page instead of {wanted})"
+            )
+        page.wait_for_timeout(1000)
+    if announced:
+        print(f"  Signed in to ACBL after {int(time.time() - started)}s; carrying on.")
+        if alerted:
+            _send_challenge_alert("ACBL signed in", "The ACBL downloader is signed in and running again.", "low")
+
+
 # --- Shared browser singleton -------------------------------------------------
 # Launching (and closing) a full Chrome per HTTP GET is extremely slow. Instead
 # we keep ONE persistent context + page alive for the whole run and reuse it for
@@ -468,7 +584,9 @@ def _get_browser_page():
             print("  Warming Chrome session at https://my.acbl.org/ ...")
             _mark_request_start()
             _PAGE.goto("https://my.acbl.org/", wait_until="domcontentloaded", timeout=60000)
-            _wait_through_cloudflare(_PAGE)
+            # my.acbl.org sends a browser that is not signed in to the sign-in
+            # page; club results do not need one, so do not wait for it here.
+            _wait_through_cloudflare(_PAGE, sign_in=False)
             # The warm-up is a request too: hold the first real one back.
             _pause_after_request()
     except Forbidden403Error:
@@ -556,7 +674,8 @@ def fetch_acbl_page(url: str, timeout_ms: int = 180000) -> str:
         page = _get_browser_page()
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=90000)
-            _wait_through_cloudflare(page)
+            # Also holds on an ACBL sign-in page until someone signs in.
+            _wait_through_cloudflare(page, requested_url=url)
             for _ in range(8):
                 try:
                     content = page.content()
@@ -576,7 +695,8 @@ def fetch_acbl_page(url: str, timeout_ms: int = 180000) -> str:
             raise
         except Exception as exc:
             last_error = exc
-            if attempt >= 3 or not _transient_navigation_error(exc):
+            # A closed window (for example during a sign-in wait) reopens Chrome.
+            if attempt >= 3 or not (_transient_navigation_error(exc) or _closed_target_error(exc)):
                 raise
             print(f"  navigation failed for {url} ({exc}); retry {attempt}/3")
             _reset_browser_page()
@@ -734,28 +854,36 @@ def extract_embedded_json(url: str) -> Optional[dict]:
         return None
 
 
-def _read_cleared_content(page) -> str:
+def _read_cleared_content(page, url: str = "") -> str:
     """Return the page HTML once any Cloudflare/WAF check has cleared.
 
     In the usual case (no challenge) the HTML read for the challenge check is
-    returned as is, so the page is serialized once instead of twice.
+    returned as is, so the page is serialized once instead of twice. An ACBL
+    sign-in page is waited on until someone signs in, then ``url`` is loaded
+    again.
     """
     content = ""
     try:
         content = page.content()
     except Exception:
         pass
-    if content and not _is_plain_403(page, content) and not _is_cloudflare_challenge(page, content):
+    if (
+        content
+        and not _is_plain_403(page, content)
+        and not _is_cloudflare_challenge(page, content)
+        and not is_sign_in_url(_page_url(page))
+    ):
         return content
-    # Waits out a check or a plain 403. Raises Forbidden403Error if it never clears.
-    _wait_through_cloudflare(page)
+    # Waits out a check, a plain 403 or the sign-in page. Raises
+    # Forbidden403Error (or SignInRequiredError) if it never clears.
+    _wait_through_cloudflare(page, requested_url=url)
     page.wait_for_selector('body', timeout=10000)
     return page.content()
 
 
-def _session_json_from_page(page) -> Optional[dict]:
+def _session_json_from_page(page, url: str = "") -> Optional[dict]:
     """Parse the embedded ``var data = {...};`` JSON from a loaded details page."""
-    content = _read_cleared_content(page)
+    content = _read_cleared_content(page, url)
 
     match = re.search(r'var data = (\{.*?\});', content, re.DOTALL)
     if not match:
@@ -791,7 +919,7 @@ def extract_with_playwright(url: str) -> Optional[dict]:
         status = response.status if response else None
         print(f"Response status: {status}")
 
-        return _session_json_from_page(page)
+        return _session_json_from_page(page, url)
 
     except KeyboardInterrupt:
         print("\n\nKeyboardInterrupt detected in extract_with_playwright")
@@ -959,7 +1087,7 @@ def get_club_sessions(club_number: str, output_dir: pathlib.Path, refresh: bool 
                 # The initial response may be a Cloudflare 403 challenge
                 # page; wait for it to clear (raises Forbidden403Error if it
                 # never does).
-                _wait_through_cloudflare(page)
+                _wait_through_cloudflare(page, requested_url=url)
                 
                 page.wait_for_selector('body', timeout=10000)
                 
@@ -1147,7 +1275,7 @@ def get_player_sessions(player_id: str, sleep_seconds: Optional[float] = None) -
         
         # The initial response may be a Cloudflare 403 challenge page; wait
         # for it to clear (raises Forbidden403Error if it never does).
-        _wait_through_cloudflare(page)
+        _wait_through_cloudflare(page, requested_url=url)
         
         page.wait_for_selector('body', timeout=10000)
         
@@ -1267,7 +1395,7 @@ def get_all_clubs(sleep_seconds: Optional[float] = None) -> Optional[List[str]]:
         
         # The initial response may be a Cloudflare 403 challenge page; wait
         # for it to clear (raises Forbidden403Error if it never does).
-        _wait_through_cloudflare(page)
+        _wait_through_cloudflare(page, requested_url=url)
         
         page.wait_for_selector('body', timeout=10000)
         
@@ -1610,7 +1738,7 @@ class _SessionTab:
             return None
         print(f"Response status: {self.status} ({self.url})")
         try:
-            return _session_json_from_page(self.page)
+            return _session_json_from_page(self.page, self.url)
         except Forbidden403Error:
             raise
         except Exception as e:
@@ -1997,6 +2125,10 @@ def process_all_clubs(output_dir: pathlib.Path, start_date: Optional[str] = None
         try:
             club_ids = get_all_clubs(sleep_seconds)
             break
+        except SignInRequiredError as e:  # a Forbidden403Error: waiting 300 s would not sign anyone in
+            print(f"\nERROR: {e}")
+            print("Sign in to ACBL in the downloader's Chrome window, then run this step again.")
+            raise SystemExit(1)
         except Forbidden403Error as e:
             print(f"\n403 Forbidden while fetching club list: {e}")
             print(f"Waiting {sleep_403_seconds} seconds, then retrying...")
@@ -2043,6 +2175,10 @@ def process_all_clubs(output_dir: pathlib.Path, start_date: Optional[str] = None
                 processed = process_club_sessions(club_id, output_dir, start_date, end_date, limit, refresh, sleep_seconds, concurrency)
                 total_processed += processed
                 break
+            except SignInRequiredError as e:  # a Forbidden403Error: waiting 300 s would not sign anyone in
+                print(f"\nERROR: {e}")
+                print("Sign in to ACBL in the downloader's Chrome window, then run this step again.")
+                raise SystemExit(1)
             except Forbidden403Error as e:
                 print(f"\n403 Forbidden while processing club {club_id}: {e}")
                 print(f"Waiting {sleep_403_seconds} seconds, then reprocessing this club...")

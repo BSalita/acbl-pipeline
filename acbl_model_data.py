@@ -316,6 +316,8 @@ def _write_shard_manifest(shard_dir, shards, *, label, source_by_file=None):
             entry['source_rows'] = int(extra['source_rows'])
             if extra.get('source_date_max'):
                 entry['source_date_max'] = extra['source_date_max']
+            if extra.get('source_id'):
+                entry['source_id'] = extra['source_id']
         entries.append(entry)
         total_rows += n
     manifest = {
@@ -343,6 +345,35 @@ def _as_date(value):
     if isinstance(value, date):
         return value
     return value
+
+
+def _source_id(*, brs_file, hrs_file, columns):
+    """Fingerprint of what a shard is built from: both augmented files and the columns read.
+
+    A shard is reused only when this matches. Row counts alone missed rewritten values:
+    on 2026-11-23 step 3c had recomputed LoTT and QL (mlBridge 9855e5e) and added the
+    SuitC columns, while most months still had the row counts of the 2026-11-14 shards.
+    """
+    import hashlib
+    parts = []
+    for f in (brs_file, hrs_file):
+        st = f.stat()
+        parts.append(f"{f.name}:{st.st_size}:{st.st_mtime_ns}")
+    parts.append(hashlib.sha1("\n".join(sorted(columns)).encode("utf-8")).hexdigest()[:16])
+    return "|".join(parts)
+
+
+def _read_recorded_source_ids(shard_dir):
+    """filename -> source_id from the previous manifest, if that field exists."""
+    import json
+    path = shard_dir.joinpath('manifest.json')
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {e['file']: e['source_id'] for e in data.get('shards', []) if e.get('file') and e.get('source_id')}
 
 
 def _read_recorded_source_rows(shard_dir):
@@ -428,8 +459,17 @@ def _source_window_stats(source_file, windows):
     return stats
 
 
-def _model_shard_is_current(shard, src_n, src_mx, recorded_source_n, shard_label):
-    """True when the shard can be skipped. Unreadable or stale shards are deleted."""
+def _model_shard_is_current(shard, src_n, src_mx, recorded_source_n, shard_label,
+                            source_id=None, recorded_source_id=None):
+    """True when the shard can be skipped. Unreadable or stale shards are deleted.
+
+    With ``source_id`` given, a shard built from other source files or another column
+    list (``recorded_source_id`` differs or is missing) is rebuilt.
+    """
+    if source_id is not None and recorded_source_id != source_id:
+        print(f"[{shard_label}] built from other source files or columns; rebuilding")
+        shard.unlink()
+        return False
     try:
         pl.read_parquet_schema(shard)
         shard_n = _parquet_num_rows(shard)
@@ -609,6 +649,12 @@ def create_model_data(
         'ParContracts':pl.List(pl.Struct({'Level': pl.String, 'Strain': pl.String, 'Doubled': pl.String, 'Pair_Direction': pl.String, 'Result': pl.Int16})),
         'ParNumber':pl.Int8,
         'Probs_Trials':pl.Int64,
+        # SuitC single-suit columns of each partnership (mlBridgeSuitCLib, step 3a with
+        # ACBL_SUITC=1, on by default since 2026-11-16). Like the DD columns they need all
+        # four hands; model inputs since 2026-11-23 (user's choice).
+        'SC_(ET|DDx|Guess|Stop|Block)_(NS|EW)_[SHDC]':pl.Float32,
+        'SC_P([1-9]|1[0-3])_(NS|EW)_[SHDC]':pl.Float32,
+        'SC_(ET|Guess)_(NS|EW)':pl.Float32,
     }
 
     # known when event is sanctioned.(?)
@@ -767,6 +813,8 @@ def create_model_data(
         #'Declarer_EV_Score_L[1-7]':pl.Array(pl.Float32, shape=(14,)), # todo: use it or drop it?
         #'Declarer_EV_EVs_L[1-7]':pl.Array(pl.Float32, shape=(14,)), # todo: use it or drop it?
         #'Declarer_Tricks_DD_Diff':pl.Int8, # obsoleted by DD_Tricks_Diff
+        # SuitC guess cost of the declaring side (SC_Guess_NS or SC_Guess_EW), step 3c.
+        'SC_Guess_Declarer':pl.Float32,
     }
 
     # known during play
@@ -776,6 +824,16 @@ def create_model_data(
         # Opening-lead state is past the states step 5b reads (0-4), so these are not model inputs.
         'DD_Lead_Cost':pl.UInt8,
         'Lead_Is_DD_Best':pl.Boolean,
+        # Club only, single-dummy score of the lead (add_sd_lead_score in step 3c,
+        # ACBL_SD_LEAD_SAMPLES=20 by default since 2026-11-16). Not model inputs either.
+        'SD_Lead_Best_Card':pl.String,
+        'SD_Lead_Rank':pl.UInt8,
+        'SD_Lead_(Best_)?Tricks':pl.Float32,
+        'SD_Lead_(Best_)?Set_Pct':pl.Float32,
+        'SD_Lead_(Set_)?Cost':pl.Float32,
+        'SD_Lead_Luck':pl.Float32,
+        'SD_Lead_Samples':pl.UInt16,
+        'SD_Lead_Is_Best':pl.Boolean,
         #'Opening_Lead_Suit':pl.Categorical, # todo: same as BidSuit category
         #'Opening_Lead_Rank':pl.UInt8,
         #'Opening_Lead_Convention':pl.Categorical, # todo: 4th longest and strongest, high from doubleton, etc.
@@ -820,6 +878,8 @@ def create_model_data(
         'UnderTricks':pl.Int8,
         'Defender_Par_GE':pl.Float32,
         'DD_Tricks_Diff':pl.Int8,
+        # DD_Tricks_Diff plus the declaring side's SuitC guess cost (step 3c with SuitC).
+        'DD_Tricks_Diff_SC':pl.Float32,
         'DD_Pct_Max_Diff_(NS|EW)':pl.Float32,
         'DD_EV_Pct_Max_Diff_(NS|EW)':pl.Float32,
         # no matches: 'EV_Max_Diff':pl.Float32,
@@ -1218,6 +1278,13 @@ def create_model_data(
         shard_dir.mkdir(exist_ok=True)
         print(f"Shard dir: {shard_dir}")
         recorded_source_rows = _read_recorded_source_rows(shard_dir)
+        recorded_source_ids = _read_recorded_source_ids(shard_dir)
+        source_id = _source_id(
+            brs_file=acbl_board_results_augmented_file,
+            hrs_file=acbl_hand_records_augmented_file,
+            columns=list(brs_read_cols) + list(hrs_columns),
+        )
+        print(f"Shard source id: {source_id}")
         print("Counting source rows per month (Date column only)...")
         t_stats = time.time()
         source_stats = _source_window_stats(acbl_board_results_augmented_file, windows)
@@ -1237,9 +1304,11 @@ def create_model_data(
             source_by_file[shard.name] = {
                 'source_rows': src_n,
                 'source_date_max': None if src_mx is None else src_mx.isoformat(),
+                'source_id': source_id,
             }
             if shard.exists() and _model_shard_is_current(
                 shard, src_n, src_mx, recorded_source_rows.get(shard.name), shard_label,
+                source_id=source_id, recorded_source_id=recorded_source_ids.get(shard.name),
             ):
                 continue
 

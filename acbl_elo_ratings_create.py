@@ -8,6 +8,15 @@ Takes 6m/1m30s 50m/15m rows by 26->61/24->60 columns. input filesize 43GB->3.5GB
 Computes Elo ratings for players and pairs from board results.
 Creates lookup tables for player and pair Elo ratings.
 
+Player Elo (since 2026-11-25, elo/ELO_PLATINUM_BENCHMARK.md): one rating per
+player, fed by club AND tournament results in one date-ordered stream, so
+both board-results files are always read. A player starts from
+START_CONST + START_PER_LOG_MP * ln(1 + masterpoints)
++ START_PER_LOG_PLATINUM * ln(1 + platinum points won before that day)
+instead of 1500, with K 6 and a 6x boost for the first 200 boards. Pair Elo
+is unchanged (per side, per direction, K 24). --club / --tournament only
+choose which side's files are written.
+
 Previous steps:
     club/tournamentdownload->json->sql->board_results->augmented
 
@@ -26,12 +35,32 @@ import time
 import re
 from datetime import datetime, timezone
 
+import numpy as np
+
 import mlBridge.mlBridgeAugmentLib as mlBridgeAugmentLib
 
+from acbl_platinum_to_date import dated_platinum_awards, platinum_points_before
 from acbl_strata import club_strata_bucket, tournament_strata_bucket
 
 rootPath = pathlib.Path('e:/bridge/data')
 acblPath = rootPath.joinpath('acbl')
+
+# Player Elo settings, chosen on 2025 and earlier and tested on 2026 in
+# elo/ELO_PLATINUM_BENCHMARK.md (club 0.438 -> 0.478, tournament 0.340 ->
+# 0.430 section-rank Spearman). Starting weights fitted on pre-2025 ratings.
+PLAYER_K_BASE = 6.0
+PLAYER_BOOST = 6.0
+PLAYER_BOOST_UNTIL_BOARDS = 200
+START_CONST = 1455.15
+START_PER_LOG_MP = 10.17
+START_PER_LOG_PLATINUM = 12.29
+TOURNAMENT_AWARDS_FILENAME = 'acbl_tournament_player_awards.parquet'
+SIDES = ("club", "tournament")
+PLAYER_OUTPUT_COLS = [
+    *[f'Elo_R_{s}_Before' for s in 'NESW'], 'Elo_E_NS', 'Elo_E_EW',
+    *[f'Elo_R_{s}' for s in 'NESW'], *[f'Elo_N_{s}' for s in 'NESW'],
+    'Field_Stdev_NS_Player', 'Field_Stdev_EW_Player', 'Field_Mean_NS_Player', 'Field_Mean_EW_Player',
+]
 
 
 # Default "evidence weight" of the prior in the published (Bayesian-shrunk)
@@ -175,34 +204,35 @@ def _read_global_stdev_seeds(parquet_path: pathlib.Path) -> dict:
     return seeds
 
 
-def create_elo_ratings(club_or_tournament, out_dir=None):
-    """Create Elo ratings and lookup tables for players and pairs.
+def _read_pooled_player_seeds(paths: list[pathlib.Path]) -> dict:
+    """Player global-stdev seeds for the joint stream: the pooled stdev of the
+    previous run's club and tournament player Before columns."""
+    out = {}
+    for key, col in (("player_ns", "Elo_R_N_Before"), ("player_ew", "Elo_R_E_Before")):
+        n_tot, s1, s2 = 0, 0.0, 0.0
+        for path in paths:
+            if not path.exists() or col not in pl.scan_parquet(path).collect_schema().names():
+                continue
+            v = pl.col(col).drop_nulls().drop_nans().cast(pl.Float64)
+            row = (pl.scan_parquet(path)
+                   .select(v.len().alias("n"), v.sum().alias("s1"), (v * v).sum().alias("s2"))
+                   .collect(engine="streaming").row(0, named=True))
+            n_tot += row["n"]
+            s1 += row["s1"] or 0.0
+            s2 += row["s2"] or 0.0
+        if n_tot:
+            mean = s1 / n_tot
+            out[key] = float(np.sqrt(max(s2 / n_tot - mean * mean, 0.0)))
+    return out
 
-    out_dir: where outputs are written (default: acblPath). Inputs and the
-    previous-run seed parquet are always read from acblPath.
-    """
-    out_path = pathlib.Path(out_dir) if out_dir else acblPath
-    out_path.mkdir(parents=True, exist_ok=True)
-    print(f"Processing {club_or_tournament} Elo ratings...")
-    # Read K-dampening global-stdev seeds from a previous run's parquet (if
-    # any). First run after the field-relative math change picks up nothing
-    # and falls back to STRATUM_DAMPENING_FALLBACK_GLOBAL_STDEV (50); the
-    # next run reads the realistic empirical seed (~45 for ACBL today).
-    previous_elo_ratings_file = acblPath.joinpath(
-        f'acbl_{club_or_tournament}_elo_ratings.parquet'
-    )
-    seeds = _read_global_stdev_seeds(previous_elo_ratings_file)
-    if seeds:
-        print(f"K-dampening seeds from previous parquet: {seeds}")
-    else:
-        print("No K-dampening seeds available; using built-in fallback.")
-    
-    # Load board results schema
+
+def load_side(club_or_tournament):
+    """Board results of one side, prepared for Elo (strata, sorted, MP_Top sanitized)."""
+    print(f"Loading {club_or_tournament} board results...")
     acbl_board_results_filename = f'acbl_{club_or_tournament}_board_results_augmented.parquet'
     acbl_board_results_file = acblPath.joinpath(acbl_board_results_filename)
     df = pl.read_parquet(acbl_board_results_file, n_rows=0)
-    print(f"Loaded: {acbl_board_results_filename} shape:{df.shape} size:{acbl_board_results_file.stat().st_size}")
-    
+
     # Select only necessary columns
     regex_cols = [
             'Date', 'is_virtual_game', 'session_id', 'event_id', 'event_name',
@@ -222,11 +252,13 @@ def create_elo_ratings(club_or_tournament, out_dir=None):
             'SC_Guess_Declarer$', 'DD_Tricks_Diff_SC$',
         ]
     read_cols = [col for col in df.columns if any(re.match(regex, col) for regex in regex_cols)]
-    
+
     # load board results data
-    df = pl.read_parquet(acbl_board_results_file, columns=read_cols) #, n_rows=1000000) # temp!!!!!!!
-    print(f"Loaded: {acbl_board_results_filename} shape:{df.shape} size:{acbl_board_results_file.stat().st_size}")
-    
+    t = time.time()
+    df = pl.read_parquet(acbl_board_results_file, columns=read_cols)
+    print(f"Loaded: {acbl_board_results_filename} shape:{df.shape} "
+          f"size:{acbl_board_results_file.stat().st_size} ({time.time()-t:.0f}s)")
+
     # tournament doesn't have is_virtual_game column
     if 'is_virtual_game' not in df.columns:
         print("Adding is_virtual_game column to df...")
@@ -261,7 +293,7 @@ def create_elo_ratings(club_or_tournament, out_dir=None):
         .len()
         .sort("len", descending=True),
     )
-    
+
     # Sort temporally to calculate Elo
     print("Sorting data temporally...")
     sort_keys = ["Date", "session_id", "Round", "Board"]
@@ -269,24 +301,93 @@ def create_elo_ratings(club_or_tournament, out_dir=None):
         sort_keys.remove('Round')
     df = df.sort(sort_keys)
 
-    df = _sanitize_session_mp_top(df)
-    
-    # Compute Elo ratings
-    print("Computing matchpoint Elo ratings...")
-    df = mlBridgeAugmentLib.compute_matchpoint_elo_ratings(
+    return _sanitize_session_mp_top(df)
+
+
+def add_start_ratings(df: pl.DataFrame, plat_cum: pl.DataFrame) -> pl.DataFrame:
+    """Per-seat ``_Elo_Start_{seat}``: the rating a player starts from if this is their first board."""
+    keys = pl.concat([
+        df.select(pl.col(f"Player_ID_{s}").cast(pl.Utf8).alias("Player_ID"), "Date") for s in "NESW"
+    ]).drop_nulls("Player_ID")
+    plat = platinum_points_before(keys, plat_cum).rename({"Player_ID": "_pid", "plat_pts": "_plat"})
+    for s in "NESW":
+        df = (
+            df.with_columns(pl.col(f"Player_ID_{s}").cast(pl.Utf8).alias("_pid"))
+            .join(plat, on=["_pid", "Date"], how="left", maintain_order="left")
+            .with_columns(
+                (START_CONST
+                 + START_PER_LOG_MP * pl.col(f"MasterPoints_{s}").cast(pl.Float64).log1p()
+                 + START_PER_LOG_PLATINUM * pl.col("_plat").fill_null(0.0).log1p()
+                 ).alias(f"_Elo_Start_{s}")
+            )
+            .drop("_pid", "_plat")
+        )
+    return df
+
+
+def joint_player_elo(sides: dict, seeds: dict) -> dict:
+    """Player Elo over club and tournament together; each side's output columns, row-aligned."""
+    parts = []
+    for k, (side, df) in enumerate(sides.items()):
+        parts.append(df.select(
+            pl.lit(k, pl.Int8).alias("_side"),
+            pl.int_range(pl.len(), dtype=pl.Int64).alias("_row"),
+            "Date",
+            (pl.lit(side[0].upper()) + pl.col("session_id").cast(pl.Utf8)).alias("session_id"),
+            pl.col("Board").cast(pl.Int32),
+            pl.col("Pct_NS").cast(pl.Float32),
+            pl.col("MP_Top").cast(pl.Float32),
+            pl.col("strata_bucket").cast(pl.Utf8),
+            *[pl.col(f"Player_ID_{s}").cast(pl.Utf8) for s in "NESW"],
+            *[pl.col(f"_Elo_Start_{s}") for s in "NESW"],
+        ))
+    joint = pl.concat(parts).sort("Date", maintain_order=True)
+    print(f"Joint player stream: {joint.height:,} rows; seeds {seeds}")
+    t = time.time()
+    out = mlBridgeAugmentLib.compute_player_matchpoint_elo_ratings(
+        joint,
+        k_base=PLAYER_K_BASE,
+        boost=PLAYER_BOOST,
+        provisional_boost_until=PLAYER_BOOST_UNTIL_BOARDS,
+        merged=True,
+        start_rating_cols=tuple(f"_Elo_Start_{s}" for s in "NSEW"),
+        minimum_sessions=PERSISTED_ELO_MINIMUM_SESSIONS,
+        global_stdev_ns=seeds.get("player_ns"),
+        global_stdev_ew=seeds.get("player_ew"),
+    )
+    print(f"Joint player Elo: {time.time()-t:.0f}s")
+    return {
+        side: out.filter(pl.col("_side") == k).sort("_row").select(PLAYER_OUTPUT_COLS)
+        for k, side in enumerate(sides)
+    }
+
+
+def write_side(club_or_tournament: str, df: pl.DataFrame, player_cols: pl.DataFrame, out_path: pathlib.Path):
+    """Pair Elo for one side, attach the joint player Elo, write the Elo files and lookups."""
+    seeds = _read_global_stdev_seeds(acblPath.joinpath(f'acbl_{club_or_tournament}_elo_ratings.parquet'))
+    print(f"[{club_or_tournament}] pair K-dampening seeds: {seeds}")
+    df = df.drop([c for c in df.columns if c.startswith("_Elo_Start_")])
+    t = time.time()
+    df = mlBridgeAugmentLib.compute_pair_matchpoint_elo_ratings(
         df,
         minimum_sessions=PERSISTED_ELO_MINIMUM_SESSIONS,
-        pair_global_stdev_ns=seeds.get("pair_ns"),
-        pair_global_stdev_ew=seeds.get("pair_ew"),
-        player_global_stdev_ns=seeds.get("player_ns"),
-        player_global_stdev_ew=seeds.get("player_ew"),
+        global_stdev_ns=seeds.get("pair_ns"),
+        global_stdev_ew=seeds.get("pair_ew"),
     )
+    print(f"[{club_or_tournament}] pair Elo: {time.time()-t:.0f}s")
+    if player_cols.height != df.height:
+        raise RuntimeError(f"player Elo rows {player_cols.height:,} != {club_or_tournament} rows {df.height:,}")
+    # Player columns after the pair columns, as compute_matchpoint_elo_ratings
+    # did (the player Elo_E_NS/EW replace the pair ones).
+    df = df.drop([c for c in player_cols.columns if c in df.columns]).hstack(player_cols)
+    df = mlBridgeAugmentLib.compute_event_start_end_elo_columns(df)
+
     # Save full Elo ratings
     acbl_club_elo_ratings_filename = f'acbl_{club_or_tournament}_elo_ratings.parquet'
     acbl_club_elo_ratings_file = out_path.joinpath(acbl_club_elo_ratings_filename)
     df.write_parquet(acbl_club_elo_ratings_file)
     print(f"Saved {acbl_club_elo_ratings_filename}: shape:{df.shape} size:{acbl_club_elo_ratings_file.stat().st_size}")
-    
+
     # Create player Elo lookup table
     print("Creating player Elo lookup table...")
     player_dfs = []
@@ -375,6 +476,35 @@ def create_elo_ratings(club_or_tournament, out_dir=None):
     return df, player_elo_lookup, pair_elo_lookup
 
 
+def create_elo_ratings(modes, out_dir=None):
+    """Elo for both sides (the player Elo needs both); write the files of ``modes``.
+
+    out_dir: where outputs are written (default: acblPath). Inputs and the
+    previous-run seed parquets are always read from acblPath.
+    """
+    out_path = pathlib.Path(out_dir) if out_dir else acblPath
+    out_path.mkdir(parents=True, exist_ok=True)
+    sides = {side: load_side(side) for side in SIDES}
+    print("Dating platinum awards...")
+    plat_cum = dated_platinum_awards(
+        acblPath.joinpath(TOURNAMENT_AWARDS_FILENAME),
+        sides["tournament"].select("session_id", "Date").unique("session_id"),
+    )
+    print(f"platinum award dates: {plat_cum.height:,} player-dates, last {plat_cum['Date'].max()}")
+    sides = {side: add_start_ratings(df, plat_cum) for side, df in sides.items()}
+    seeds = _read_pooled_player_seeds([acblPath.joinpath(f'acbl_{s}_elo_ratings.parquet') for s in SIDES])
+    player = joint_player_elo(sides, seeds)
+    for side in SIDES:
+        df = sides.pop(side)
+        if side in modes:
+            t = time.time()
+            write_side(side, df, player.pop(side), out_path)
+            print(f"{side} written in {time.time() - t:.0f}s")
+            print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
+            print("-" * 70, "\n")
+        del df
+
+
 def _parse_club_tournament_args():
     import argparse
     parser = argparse.ArgumentParser(description="Create ACBL Elo ratings.")
@@ -398,12 +528,7 @@ if __name__ == "__main__":
     program_start_time = print_started()
 
     modes, out_dir = _parse_club_tournament_args()
-    for club_or_tournament in modes:
-        t = time.time()
-        create_elo_ratings(club_or_tournament, out_dir=out_dir)
-        print(f"{club_or_tournament} processing elapsed time in seconds: {time.time() - t}")
-        print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
-        print("-" * 70, "\n")
+    create_elo_ratings(modes, out_dir=out_dir)
 
     print_ended(program_start_time)
 

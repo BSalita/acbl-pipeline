@@ -65,7 +65,7 @@ PLAYER_OUTPUT_COLS = [
 
 # Default "evidence weight" of the prior in the published (Bayesian-shrunk)
 # Elo formula. The Streamlit/API can override at query time.
-SHRINKAGE_DEFAULT_PRIOR_SESSIONS = 50
+SHRINKAGE_DEFAULT_PRIOR_SESSIONS = 0  # 0 since 2026-11-25 (the API and app default)
 
 # Persist Elo from the first session. Sample-size eligibility belongs to the
 # report's min_sessions filter, while Bayesian shrinkage controls provisional

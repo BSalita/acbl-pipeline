@@ -182,6 +182,10 @@ _SCRAPE_LOCK = threading.Lock()
 # waits for a human for up to six hours; a request waits this long for the
 # browser and then answers from the caches (refresh_failed) instead of queueing.
 SCRAPE_LOCK_WAIT_S = float(os.environ.get("ACBL_SCRAPE_LOCK_WAIT_S", "10"))
+# A listing fetch that has the browser but is held by the Cloudflare check: the
+# request stops waiting after this long and answers from the caches; the fetch
+# keeps the browser (so a human can still clear the check) and ends on its own.
+SCRAPE_RESULT_WAIT_S = float(os.environ.get("ACBL_SCRAPE_RESULT_WAIT_S", "20"))
 _SESSION_DF_CACHE: Dict[Tuple[str, float], Dict[str, pl.DataFrame]] = {}
 _SESSION_DF_LOCK = threading.Lock()
 _SESSION_DF_MAX = 8
@@ -235,6 +239,44 @@ def _scrape_slot():
         yield
     finally:
         _SCRAPE_LOCK.release()
+
+
+def _bounded_scrape(fetch: Callable[[], Any]) -> Any:
+    """Run fetch with the browser; wait SCRAPE_RESULT_WAIT_S for it, then ScrapeBusyError.
+
+    The fetch runs on its own thread and releases the browser when it ends,
+    even after the request has stopped waiting.
+    """
+    if not _SCRAPE_LOCK.acquire(timeout=SCRAPE_LOCK_WAIT_S):
+        raise ScrapeBusyError(
+            f"Another live my.acbl.org fetch has held the browser for over {SCRAPE_LOCK_WAIT_S:g} s "
+            "(it may be waiting on ACBL's Cloudflare check)",
+            status_code=503,
+            hint=CLOUDFLARE_HINT,
+        )
+    outcome: Dict[str, Any] = {}
+    done = threading.Event()
+
+    def run() -> None:
+        try:
+            outcome["value"] = fetch()
+        except BaseException as exc:  # handed to the waiting request
+            outcome["error"] = exc
+        finally:
+            _SCRAPE_LOCK.release()
+            done.set()
+
+    threading.Thread(target=run, name="acbl-live-fetch", daemon=True).start()
+    if not done.wait(SCRAPE_RESULT_WAIT_S):
+        raise ScrapeBusyError(
+            f"The live my.acbl.org fetch did not finish in {SCRAPE_RESULT_WAIT_S:g} s "
+            "(it may be waiting on ACBL's Cloudflare check); it goes on in the background",
+            status_code=503,
+            hint=CLOUDFLARE_HINT,
+        )
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
 
 
 def clamp_limit(limit: Optional[int], default: int = DEFAULT_ROW_LIMIT) -> int:
@@ -738,10 +780,12 @@ def _playwright_paginated_html(
                 browser.close()
         return "\n".join(pages_html), complete
 
+    def _fetch() -> Tuple[str, bool]:
+        time.sleep(NAV_SLEEP_SECONDS)
+        return _run_in_thread_with_new_loop(_sync)
+
     try:
-        with _scrape_slot():
-            time.sleep(NAV_SLEEP_SECONDS)
-            return _run_in_thread_with_new_loop(_sync)
+        return _bounded_scrape(_fetch)
     except ClubApiError:
         raise
     except Exception as exc:

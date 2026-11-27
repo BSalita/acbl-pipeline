@@ -70,6 +70,32 @@ class ScrapeLockTests(unittest.TestCase):
         self.assertEqual(meta["refresh_attempts"][0]["status_code"], 503)
         self.assertEqual(table["rows"][0]["session_id"], "100")
 
+    def test_slow_fetch_stops_the_wait_but_keeps_the_browser_until_it_ends(self) -> None:
+        def slow(_fn, *_args, **_kwargs):
+            time.sleep(1.0)
+            return "<html></html>", True
+
+        with (
+            patch.object(svc, "SCRAPE_RESULT_WAIT_S", 0.2),
+            patch.object(svc, "_run_in_thread_with_new_loop", side_effect=slow),
+        ):
+            started = time.monotonic()
+            with self.assertRaises(svc.ScrapeBusyError):
+                svc._playwright_paginated_html("https://my.acbl.org/club-results/my-results/1")
+            self.assertLess(time.monotonic() - started, 0.8)
+            self.assertTrue(svc._SCRAPE_LOCK.locked())  # the fetch still has the browser
+            self.assertTrue(svc._SCRAPE_LOCK.acquire(timeout=3))  # and lets it go when it ends
+            svc._SCRAPE_LOCK.release()
+
+    def test_fast_fetch_returns_its_result_and_errors(self) -> None:
+        with patch.object(svc, "_run_in_thread_with_new_loop", return_value=("<html>x</html>", True)):
+            self.assertEqual(svc._playwright_paginated_html("https://x"), ("<html>x</html>", True))
+        with patch.object(svc, "_run_in_thread_with_new_loop", side_effect=RuntimeError("boom")):
+            with self.assertRaises(svc.ClubApiError) as caught:
+                svc._playwright_paginated_html("https://x")
+            self.assertEqual(caught.exception.status_code, 502)
+        self.assertFalse(svc._SCRAPE_LOCK.locked())
+
     def test_lock_is_released_after_a_fetch(self) -> None:
         with svc._scrape_slot():
             self.assertTrue(svc._SCRAPE_LOCK.locked())

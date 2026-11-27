@@ -12,6 +12,7 @@ os._exit). Playwright helpers come from mlBridge.mlBridgeAcblLib.
 from __future__ import annotations
 
 import io
+import contextlib
 import json
 import math
 import os
@@ -177,6 +178,10 @@ _PLAYER_INFO_CANDIDATES = (
 )
 
 _SCRAPE_LOCK = threading.Lock()
+# One live my.acbl.org fetch at a time. A fetch stuck on ACBL's Cloudflare check
+# waits for a human for up to six hours; a request waits this long for the
+# browser and then answers from the caches (refresh_failed) instead of queueing.
+SCRAPE_LOCK_WAIT_S = float(os.environ.get("ACBL_SCRAPE_LOCK_WAIT_S", "10"))
 _SESSION_DF_CACHE: Dict[Tuple[str, float], Dict[str, pl.DataFrame]] = {}
 _SESSION_DF_LOCK = threading.Lock()
 _SESSION_DF_MAX = 8
@@ -211,6 +216,25 @@ class ClubApiError(Exception):
         self.detail = detail
         self.status_code = status_code
         self.hint = hint
+
+
+class ScrapeBusyError(ClubApiError):
+    """Another live fetch holds the browser (often waiting on ACBL's Cloudflare check)."""
+
+
+@contextlib.contextmanager
+def _scrape_slot():
+    if not _SCRAPE_LOCK.acquire(timeout=SCRAPE_LOCK_WAIT_S):
+        raise ScrapeBusyError(
+            f"Another live my.acbl.org fetch has held the browser for over {SCRAPE_LOCK_WAIT_S:g} s "
+            "(it may be waiting on ACBL's Cloudflare check)",
+            status_code=503,
+            hint=CLOUDFLARE_HINT,
+        )
+    try:
+        yield
+    finally:
+        _SCRAPE_LOCK.release()
 
 
 def clamp_limit(limit: Optional[int], default: int = DEFAULT_ROW_LIMIT) -> int:
@@ -715,7 +739,7 @@ def _playwright_paginated_html(
         return "\n".join(pages_html), complete
 
     try:
-        with _SCRAPE_LOCK:
+        with _scrape_slot():
             time.sleep(NAV_SLEEP_SECONDS)
             return _run_in_thread_with_new_loop(_sync)
     except ClubApiError:
@@ -1561,6 +1585,8 @@ def player_games(
                     }
                 )
                 last_error = exc
+                if isinstance(exc, ScrapeBusyError):
+                    break  # a second wait would find the same fetch still running
                 if attempt + 1 < attempts:
                     time.sleep(1.0)
         if html is None:
@@ -1636,9 +1662,11 @@ def _fetch_session_json(
 
     url = f"{ACBL_ORIGIN}/club-results/details/{sid}"
     try:
-        with _SCRAPE_LOCK:
+        with _scrape_slot():
             time.sleep(NAV_SLEEP_SECONDS)
             data = get_club_results_details_data_playwright(url, headless=True, verbose=False)
+    except ScrapeBusyError:
+        raise
     except Exception as exc:
         raise ClubApiError(
             f"Failed to fetch session {sid}: {exc}",

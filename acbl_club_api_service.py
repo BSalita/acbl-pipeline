@@ -150,6 +150,12 @@ TOURNAMENT_CACHE_DIR = pathlib.Path(
     )
 )
 ACBL_API_KEY = os.environ.get("ACBL_API_KEY", "").strip()
+# ACBL will not renew the expired tournament token (2026-11-28): once the API
+# rejects it (401/403), later calls fail at once and tournament lists come
+# from history until the process restarts. ACBL_TOURNAMENT_API=off skips it.
+_TOURNAMENT_API_REJECTED: Optional[str] = (
+    "ACBL_TOURNAMENT_API=off" if os.environ.get("ACBL_TOURNAMENT_API", "").strip().lower() == "off" else None
+)
 SINGLE_DUMMY_SAMPLE_COUNT = int(
     os.environ.get("ACBL_SINGLE_DUMMY_SAMPLE_COUNT", "40"))
 
@@ -1929,7 +1935,13 @@ def _require_tournament_api_key() -> str:
 def _tournament_api_get(
     url: str, params: Optional[Dict[str, Any]] = None
 ) -> requests.Response:
-    global _LAST_TOURNAMENT_API_SUCCESS
+    global _LAST_TOURNAMENT_API_SUCCESS, _TOURNAMENT_API_REJECTED
+    if _TOURNAMENT_API_REJECTED is not None:
+        raise ClubApiError(
+            f"The ACBL tournament API is not used: {_TOURNAMENT_API_REJECTED}",
+            status_code=503,
+            hint="Tournament lists and results come from the downloaded history.",
+        )
     response = requests.get(
         url,
         params=params,
@@ -1955,6 +1967,9 @@ def _tournament_api_get(
             )
         except ValueError:
             detail = response.text[:500]
+        if response.status_code in (401, 403):
+            _TOURNAMENT_API_REJECTED = (
+                f"its token was rejected (HTTP {response.status_code}: {detail}) at {_now_iso()}")
         raise ClubApiError(
             f"ACBL tournament API returned HTTP {response.status_code}: {detail}",
             status_code=(
@@ -2331,8 +2346,19 @@ def tournament_player_sessions(
                 "live/cache" if live else "historical parquet"),
             "refresh_failed": live_error is not None,
             "refresh_error": live_error,
-            "fetched_at": _now_iso() if live else _file_mtime_iso(
-                TOURNAMENT_AUGMENTED_PARQUET_FILE),
+            "live_api_available": _TOURNAMENT_API_REJECTED is None,
+            # After a failed refresh the rows are history: date them by the
+            # newest of the last live listing and the augmented parquet.
+            "fetched_at": (
+                _now_iso() if live and live_error is None
+                else max(
+                    (stamp for stamp in (
+                        _file_mtime_iso(cache_file) if live else None,
+                        _file_mtime_iso(TOURNAMENT_AUGMENTED_PARQUET_FILE),
+                    ) if stamp),
+                    default=None,
+                )
+            ),
         },
     )
 

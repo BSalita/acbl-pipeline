@@ -19,6 +19,27 @@ from fastapi.responses import JSONResponse
 
 import acbl_club_api_service as svc
 
+
+class HistoryOnlyMiddleware:
+    """X-ACBL-History-Only: 1 -> the request is answered from saved history only."""
+
+    _HEADER = svc.HISTORY_ONLY_HEADER.lower().encode("latin-1")
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope.get("type") == "http" and any(
+            name == self._HEADER and value.strip() == b"1" for name, value in scope.get("headers") or []
+        ):
+            token = svc.HISTORY_ONLY.set(True)
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                svc.HISTORY_ONLY.reset(token)
+            return
+        await self.app(scope, receive, send)
+
 ACBL_CLUB_API_PORT = int(os.environ.get("ACBL_CLUB_API_PORT", "8508"))
 
 app = FastAPI(
@@ -37,6 +58,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(HistoryOnlyMiddleware)
 
 
 @app.exception_handler(svc.ClubApiError)

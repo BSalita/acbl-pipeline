@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import io
 import contextlib
+import contextvars
 import json
 import math
 import os
@@ -188,6 +189,11 @@ _SCRAPE_LOCK = threading.Lock()
 # waits for a human for up to six hours; a request waits this long for the
 # browser and then answers from the caches (refresh_failed) instead of queueing.
 SCRAPE_LOCK_WAIT_S = float(os.environ.get("ACBL_SCRAPE_LOCK_WAIT_S", "10"))
+# A request with the header X-ACBL-History-Only: 1 (the MCP tools' backends send
+# it) is answered from saved history only: no my.acbl.org page, no tournament API.
+# The server's middleware sets this for the request.
+HISTORY_ONLY_HEADER = "X-ACBL-History-Only"
+HISTORY_ONLY: "contextvars.ContextVar[bool]" = contextvars.ContextVar("acbl_history_only", default=False)
 # A listing fetch that has the browser but is held by the Cloudflare check: the
 # request stops waiting after this long and answers from the caches; the fetch
 # keeps the browser (so a human can still clear the check) and ends on its own.
@@ -232,8 +238,26 @@ class ScrapeBusyError(ClubApiError):
     """Another live fetch holds the browser (often waiting on ACBL's Cloudflare check)."""
 
 
+class HistoryOnlyError(ClubApiError):
+    """The request asked for saved history only and the answer would need a live fetch."""
+
+
+def _live_allowed() -> bool:
+    return not HISTORY_ONLY.get()
+
+
+def _refuse_live() -> None:
+    if not _live_allowed():
+        raise HistoryOnlyError(
+            "Not in the saved ACBL history (this request is answered from saved history only)",
+            status_code=404,
+            hint="New games appear after the next ACBL history download.",
+        )
+
+
 @contextlib.contextmanager
 def _scrape_slot():
+    _refuse_live()
     if not _SCRAPE_LOCK.acquire(timeout=SCRAPE_LOCK_WAIT_S):
         raise ScrapeBusyError(
             f"Another live my.acbl.org fetch has held the browser for over {SCRAPE_LOCK_WAIT_S:g} s "
@@ -253,6 +277,7 @@ def _bounded_scrape(fetch: Callable[[], Any]) -> Any:
     The fetch runs on its own thread and releases the browser when it ends,
     even after the request has stopped waiting.
     """
+    _refuse_live()
     if not _SCRAPE_LOCK.acquire(timeout=SCRAPE_LOCK_WAIT_S):
         raise ScrapeBusyError(
             f"Another live my.acbl.org fetch has held the browser for over {SCRAPE_LOCK_WAIT_S:g} s "
@@ -1432,7 +1457,7 @@ def club_games(
 
     # Scrape when asked to refresh, when nothing local answers, or when a
     # partial cache cannot satisfy a request for more rows than it holds.
-    if refresh or not rows or (not complete and len(rows) < cap):
+    if (refresh or not rows or (not complete and len(rows) < cap)) and _live_allowed():
         scrape_limit = min(cap, GAP_SCRAPE_LIMIT) if parquet_rows else cap
         try:
             html, live_complete = _playwright_paginated_html(
@@ -1606,7 +1631,7 @@ def player_games(
 
     # Scrape when asked to refresh, when nothing local answers, or when a
     # partial cache cannot satisfy a request for more rows than it holds.
-    if refresh or not rows or (not complete and len(rows) < cap):
+    if (refresh or not rows or (not complete and len(rows) < cap)) and _live_allowed():
         scrape_limit = min(cap, GAP_SCRAPE_LIMIT) if parquet_rows else cap
         html: Optional[str] = None
         live_complete = False
@@ -1635,7 +1660,7 @@ def player_games(
                     }
                 )
                 last_error = exc
-                if isinstance(exc, ScrapeBusyError):
+                if isinstance(exc, (ScrapeBusyError, HistoryOnlyError)):
                     break  # a second wait would find the same fetch still running
                 if attempt + 1 < attempts:
                     time.sleep(1.0)
@@ -1715,7 +1740,7 @@ def _fetch_session_json(
         with _scrape_slot():
             time.sleep(NAV_SLEEP_SECONDS)
             data = get_club_results_details_data_playwright(url, headless=True, verbose=False)
-    except ScrapeBusyError:
+    except (ScrapeBusyError, HistoryOnlyError):
         raise
     except Exception as exc:
         raise ClubApiError(
@@ -1936,6 +1961,7 @@ def _tournament_api_get(
     url: str, params: Optional[Dict[str, Any]] = None
 ) -> requests.Response:
     global _LAST_TOURNAMENT_API_SUCCESS, _TOURNAMENT_API_REJECTED
+    _refuse_live()
     if _TOURNAMENT_API_REJECTED is not None:
         raise ClubApiError(
             f"The ACBL tournament API is not used: {_TOURNAMENT_API_REJECTED}",
@@ -2258,10 +2284,12 @@ def tournament_player_sessions(
     cache_file = TOURNAMENT_CACHE_DIR / f"{pid}.sessions.json"
     live: List[Dict[str, Any]] = []
     live_error: Optional[str] = None
-    if refresh:
+    fetched_live = False
+    if refresh and _live_allowed():
         try:
             live = _live_tournament_player_sessions(pid)
             _save_json(cache_file, live)
+            fetched_live = True
         except (ClubApiError, requests.RequestException) as exc:
             live_error = str(exc)
             if cache_file.is_file():
@@ -2284,10 +2312,11 @@ def tournament_player_sessions(
                 )
                 if not row["boards"]:
                     row["score"] = None
-    if not historical and not live and not refresh:
+    if not historical and not live and not refresh and _live_allowed():
         try:
             live = _live_tournament_player_sessions(pid)
             _save_json(cache_file, live)
+            fetched_live = True
         except (ClubApiError, requests.RequestException) as exc:
             live_error = str(exc)
     merged = {str(row["session_id"]): row for row in live}
@@ -2350,7 +2379,7 @@ def tournament_player_sessions(
             # After a failed refresh the rows are history: date them by the
             # newest of the last live listing and the augmented parquet.
             "fetched_at": (
-                _now_iso() if live and live_error is None
+                _now_iso() if fetched_live
                 else max(
                     (stamp for stamp in (
                         _file_mtime_iso(cache_file) if live else None,
@@ -3517,7 +3546,7 @@ def club_list(query: Optional[str] = None, limit: Optional[int] = None, refresh:
             if rows:
                 fetched_at = _newest_mtime_iso(_iter_session_cache_files())
 
-    if refresh or not rows:
+    if (refresh or not rows) and _live_allowed():
         html, _complete = _playwright_paginated_html(source_url, limit=0)
         rows = parse_club_directory_html(html)
         if not rows:
